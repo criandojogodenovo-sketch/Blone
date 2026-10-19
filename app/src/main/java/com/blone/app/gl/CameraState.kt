@@ -41,6 +41,13 @@ class CameraState(
     /** Vertical field of view used for pan world-units-per-pixel math. */
     var fovYDegrees: Float = 45f
 
+    /**
+     * Current viewport height in pixels, set by the surface view on layout —
+     * anchors the transform-tool drag mapping (same formula as pan).
+     */
+    @Volatile
+    var viewportHeight: Float = 1f
+
     fun orbit(dxPx: Float, dyPx: Float) {
         azimuthDeg -= dxPx * orbitDegreesPerPx
         elevationDeg += dyPx * orbitDegreesPerPx

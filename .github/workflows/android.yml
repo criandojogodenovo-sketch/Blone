@@ -16,8 +16,30 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # ------------------------------------------------------------------
+  # Fase 2, condição 7: os testes do núcleo C++ correm PRIMEIRO; o APK só é
+  # compilado quando eles passam.
+  # ------------------------------------------------------------------
+  core-tests:
+    name: Testes do núcleo C++ (host)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure (host, sem Android)
+        run: cmake -S app/src/main/cpp/tests -B build-core-tests -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build-core-tests --parallel
+
+      - name: Run core tests
+        run: ctest --test-dir build-core-tests --output-on-failure
+
   build:
     name: Build, test, sign
+    needs: core-tests
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
@@ -30,7 +52,7 @@ jobs:
         run: |
           SHORT_SHA=$(git rev-parse --short=8 HEAD)
           echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
-          echo "Building Blone Fase 0+1 @ ${SHORT_SHA}"
+          echo "Building Blone Fase 2 @ ${SHORT_SHA}"
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -53,7 +75,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Blone-fase0-1-test-results-${{ steps.meta.outputs.short_sha }}
+          name: Blone-fase2-test-results-${{ steps.meta.outputs.short_sha }}
           path: app/build/reports/tests/**
           retention-days: 30
           if-no-files-found: warn
@@ -61,13 +83,13 @@ jobs:
       - name: Upload debug APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Blone-fase0-1-debug-${{ steps.meta.outputs.short_sha }}
+          name: Blone-fase2-debug-${{ steps.meta.outputs.short_sha }}
           path: app/build/outputs/apk/debug/*.apk
           retention-days: 30
           if-no-files-found: error
 
       # ---------------------------------------------------------------------
-      # Release signing.
+      # Release signing (unchanged from Fase 0/1 — secrets preserved).
       # The keystore is decoded ONLY here, into a protected temp directory,
       # and removed again in the always() cleanup step. No secret is echoed.
       # If the secrets are missing, the signed release is skipped with a
@@ -113,7 +135,7 @@ jobs:
         if: steps.release.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
-          name: Blone-fase0-1-release-assinado-${{ steps.meta.outputs.short_sha }}
+          name: Blone-fase2-release-assinado-${{ steps.meta.outputs.short_sha }}
           path: app/build/outputs/apk/release/*.apk
           retention-days: 30
           if-no-files-found: error
@@ -128,11 +150,12 @@ jobs:
         if: always()
         run: |
           {
-            echo "## Blone Android CI — Fase 0+1"
+            echo "## Blone Android CI — Fase 2"
             echo ""
             echo "| Item | Resultado |"
             echo "|------|-----------|"
-            echo "| Debug APK | ✅ publicado como artifact |"
-            echo "| Release assinado | $(if [ "${{ steps.release.outcome }}" = "success" ]; then echo '✅ publicado como artifact (assinatura verificada com apksigner)'; else echo '⚠️ omitido — configure os secrets ANDROID_KEYSTORE_* '; fi) |"
+            echo "| Testes do núcleo C++ (host) | executados no job core-tests (bloqueia este job) |"
+            echo "| Debug APK | $(if [ "${{ job.status }}" = "success" ]; then echo 'publicado como artifact'; else echo 'não publicado — job falhou'; fi) |"
+            echo "| Release assinado | $(if [ "${{ steps.release.outcome }}" = "success" ]; then echo 'publicado como artifact (assinatura verificada com apksigner)'; else echo 'omitido — configure os secrets ANDROID_KEYSTORE_* '; fi) |"
             echo "| Commit | ${{ github.sha }} |"
           } >> "$GITHUB_STEP_SUMMARY"

@@ -5,27 +5,36 @@ package com.blone.app.gl
  *
  * Threading contract: [surfaceCreated], [surfaceChanged] and [drawFrame] are
  * called from the GLSurfaceView render thread, which owns a current OpenGL ES
- * 3.0 context. [pick] is invoked through `GLSurfaceView.queueEvent` so it also
- * runs on the GL thread; it performs pure CPU math (ray/AABB intersection)
- * using the camera state stored by the last [drawFrame].
+ * 3.0 context. [pickAndSelect] is invoked through `GLSurfaceView.queueEvent`
+ * (also the GL thread). Scene mutations may be called from any thread — the
+ * native layer serializes access with a mutex.
  */
 object NativeLib {
+
+    /** Status codes returned by editing operations (map in [StatusMessages]). */
+    object Status {
+        const val OK = 0
+        const val ERR_NO_SELECTION = 1
+        const val ERR_NO_ACTIVE_OBJECT = 2
+        const val ERR_UNSUPPORTED = 3
+        const val ERR_NON_MANIFOLD = 4
+        const val ERR_BUDGET = 5
+        const val ERR_LIMIT = 6
+        const val ERR_INTERNAL = 7
+        const val ERR_INVALID_ARG = 8
+    }
 
     init {
         System.loadLibrary("blone")
     }
 
-    /** Compiles shaders, uploads static geometry. Called once per context creation. */
+    /** Compiles shaders, uploads static geometry. Called once per context. */
     external fun surfaceCreated()
 
     /** Updates viewport and projection for the given surface size in pixels. */
     external fun surfaceChanged(width: Int, height: Int)
 
-    /**
-     * Renders one frame with the current orbit camera.
-     * azimuthDeg/elevationDeg in degrees, distance in world units,
-     * (tx, ty, tz) orbit target, selected toggles the selection highlight.
-     */
+    /** Renders one frame with the given orbit camera and scene state. */
     external fun drawFrame(
         azimuthDeg: Float,
         elevationDeg: Float,
@@ -33,13 +42,79 @@ object NativeLib {
         tx: Float,
         ty: Float,
         tz: Float,
-        selected: Boolean
+        pointRadiusPx: Float,
     )
 
     /**
-     * Casts a picking ray through pixel (x, y) — coordinates in surface pixels,
-     * origin top-left — against the scene objects using the last camera state.
-     * Returns true when an object is hit.
+     * Tap picking + selection in one atomic call on the GL thread.
+     * Returns [kind, objIndex, elemId, nV, nE, nF]; kind 0 = nothing hit,
+     * 1 vertex, 2 edge, 3 face, 4 object; negative kind = selection error
+     * (value = -status).
      */
-    external fun pick(x: Float, y: Float): Boolean
+    external fun pickAndSelect(xPx: Float, yPx: Float, snapRadiusPx: Float): IntArray
+
+    /** Creates a primitive; returns the new object index or -status. */
+    external fun createPrimitive(type: Int, segsU: Int, segsV: Int): Int
+
+    external fun objectCount(): Int
+
+    external fun objectName(index: Int): String?
+
+    /** [vertices, edges, faces, isActive] or null when the index is invalid. */
+    external fun objectInfo(index: Int): IntArray?
+
+    external fun setActiveObject(index: Int): Int
+
+    external fun setEditMode(edit: Boolean)
+
+    /** 0 vertex, 1 edge, 2 face. */
+    external fun setSelectionMode(mode: Int)
+
+    external fun setMultiSelect(on: Boolean)
+
+    external fun clearSelection()
+
+    // Editing operations — return 0 (OK) or a negative status code.
+    external fun extrude(): Int
+    external fun subdivide(): Int
+    external fun deleteSelection(): Int
+    external fun deleteActiveObject(): Int
+    external fun loopCut(): Int
+
+    // Transform tool session (explicit Mover/Rodar/Escalar controls).
+    // tool: 1 move, 2 rotate, 3 scale.
+    external fun beginTool(
+        tool: Int,
+        azimuthDeg: Float,
+        elevationDeg: Float,
+        distance: Float,
+        fovYDeg: Float,
+        viewportHeightPx: Float,
+    ): Int
+
+    external fun updateTool(
+        dxPx: Float,
+        dyPx: Float,
+        azimuthDeg: Float,
+        elevationDeg: Float,
+        distance: Float,
+        fovYDeg: Float,
+        viewportHeightPx: Float,
+    ): Int
+
+    external fun endTool(): Int
+
+    // History.
+    external fun canUndo(): Boolean
+    external fun canRedo(): Boolean
+    external fun historyMemBytes(): Long
+    external fun undo(): Int
+    external fun redo(): Int
+
+    // Project: BLONEPRJ binary, validated on load.
+    external fun saveProject(): ByteArray?
+    external fun openProject(bytes: ByteArray): Int
+
+    /** Clears the scene and the history (not undoable, documented). */
+    external fun newScene(): Int
 }

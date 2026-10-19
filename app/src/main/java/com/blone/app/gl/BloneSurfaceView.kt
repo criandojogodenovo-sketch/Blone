@@ -5,16 +5,17 @@ import android.content.Context
 import android.opengl.GLSurfaceView
 import android.view.MotionEvent
 import com.blone.app.vm.BloneViewModel
+import com.blone.app.vm.Tool
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
 
 /**
  * The OpenGL ES 3.0 surface that hosts the C++ renderer, plus raw multitouch
- * handling for the viewport gestures.
- *
- * Lifecycle: callers MUST invoke [onPause]/[onResume] (inherited from
- * GLSurfaceView) with the Activity lifecycle; [com.blone.app.MainActivity]
- * wires that through a LifecycleObserver.
+ * handling (Fase 2 interaction priority, documented in ARCHITECTURE.md):
+ *  - Compose buttons consume their own touches (they sit above this view);
+ *  - 1 finger: tool drag when a transform tool is armed, orbit otherwise;
+ *  - 2 fingers: ALWAYS the camera (pan + zoom), never a tool;
+ *  - short single-finger tap: element/object picking.
  */
 class BloneSurfaceView(
     context: Context,
@@ -23,6 +24,7 @@ class BloneSurfaceView(
 
     private val density = context.resources.displayMetrics.density
     private val touchSlopPx = 10f * density
+    private val pickRadiusPx = 14f * density
 
     private val fpsMeter = FpsMeter(windowSize = 60)
     private var lastFpsPublishNanos = 0L
@@ -31,7 +33,12 @@ class BloneSurfaceView(
         touchSlopPx = touchSlopPx,
         onOrbit = { dx, dy ->
             post {
-                viewModel.camera.orbit(dx, dy)
+                if (viewModel.armedTool != Tool.NONE) {
+                    // Explicit transform drag (tool armed via its button).
+                    viewModel.onToolDrag(dx, dy)
+                } else {
+                    viewModel.camera.orbit(dx, dy)
+                }
             }
         },
         onPanZoom = { dx, dy, prevSpan, curSpan ->
@@ -47,7 +54,6 @@ class BloneSurfaceView(
 
     init {
         setEGLContextClientVersion(3)
-        // 24-bit depth buffer, no stencil — enough for this scene.
         setEGLConfigChooser(8, 8, 8, 8, 24, 0)
         preserveEGLContextOnPause = true
         setRenderer(RendererBridge())
@@ -55,7 +61,7 @@ class BloneSurfaceView(
     }
 
     /** Sends the current camera snapshot to native code (called each frame). */
-    private fun pushCameraAndDraw(selected: Boolean) {
+    private fun pushCameraAndDraw(pointRadiusPx: Float) {
         val cam = viewModel.camera
         NativeLib.drawFrame(
             azimuthDeg = cam.azimuthDeg,
@@ -64,19 +70,19 @@ class BloneSurfaceView(
             tx = cam.targetX,
             ty = cam.targetY,
             tz = cam.targetZ,
-            selected = selected,
+            pointRadiusPx = pointRadiusPx,
         )
     }
 
-    /** Runs picking on the GL thread, result delivered on the UI thread. */
+    /** Runs picking + selection on the GL thread; result to the UI thread. */
     fun performPick(xPx: Float, yPx: Float) {
         queueEvent {
-            val hit = try {
-                NativeLib.pick(xPx, yPx)
-            } catch (t: Throwable) {
-                false
+            val res = try {
+                NativeLib.pickAndSelect(xPx, yPx, pickRadiusPx)
+            } catch (_: Throwable) {
+                null
             }
-            post { viewModel.onPickResult(hit) }
+            post { viewModel.onPickResult(res) }
         }
     }
 
@@ -107,12 +113,13 @@ class BloneSurfaceView(
 
         override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
             fpsMeter.reset()
+            viewModel.camera.viewportHeight = height.toFloat().coerceAtLeast(1f)
             NativeLib.surfaceChanged(width, height)
         }
 
         override fun onDrawFrame(gl: GL10?) {
             val frameNanos = System.nanoTime()
-            pushCameraAndDraw(viewModel.selected)
+            pushCameraAndDraw(14f * density)
             fpsMeter.onFrame(frameNanos)
 
             // Publish real measured FPS at most ~2x per second.

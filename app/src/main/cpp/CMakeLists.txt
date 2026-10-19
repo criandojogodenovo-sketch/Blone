@@ -5,7 +5,13 @@ add_library(blone SHARED
         native-lib.cpp
         renderer/Renderer.cpp
         core/Mesh.cpp
-        core/Scene.cpp)
+        core/Scene.cpp
+        core/mesh/HalfEdgeMesh.cpp
+        core/mesh/Primitives.cpp
+        core/operations/Operations.cpp
+        core/history/History.cpp
+        core/scene/SceneOps.cpp
+        core/project/Project.cpp)
 
 target_include_directories(blone PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 

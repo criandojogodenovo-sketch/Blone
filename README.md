@@ -3,7 +3,7 @@
 Aplicação Android nativa de modelagem 3D — gratuita, offline e pensada para
 ecrãs táteis e telemóveis com recursos limitados.
 
-**Estado atual: Fases 0 e 1 concluídas** (base nativa + viewport tátil).
+**Estado atual: Fase 2 concluída** (base nativa + viewport tátil + modelagem de malha editável).
 
 ## Instalação
 
@@ -14,15 +14,24 @@ ecrãs táteis e telemóveis com recursos limitados.
    ficheiro e instala o APK.
 3. Requisitos: Android 8.0 (API 26) ou superior.
 
-## Funcionalidades (Fase 1)
+## Funcionalidades (Fase 2)
 
-- Viewport 3D real: renderização C++ com OpenGL ES 3.0 (cubo iluminado sobre
-  grelha, eixos X/Vermelho · Y/Verde · Z/Azul).
-- Um dedo: orbitar. Dois dedos: mover (pan) e zoom por pinça. Toque curto:
-  selecionar o cubo (contorno âmbar).
-- Contador de FPS medido a partir de timestamps reais dos frames.
-- Modos Editar/Esculpir/Pintar visíveis mas desativados (chegam em fases
-  futuras).
+- Viewport 3D real: renderização C++ com OpenGL ES 3.0 (grelha, eixos
+  X/Vermelho · Y/Verde · Z/Azul, malhas com sombreamento plano e wireframe).
+- Primitivas editáveis: Cubo, Esfera, Cilindro e Plano (núcleo half-edge com
+  topologia consistente).
+- Modo Editar com seleção de vértices, arestas e faces (respeita oclusão),
+  seleção múltipla opcional.
+- Ferramentas explícitas Mover / Rodar / Escalar (arrasto de 1 dedo com a
+  ferramenta armada; **dois dedos é sempre a câmara**).
+- Extrusão de faces, subdivisão (quads/triângulos), apagar vértices/arestas/
+  faces com validação topológica, loop cut em anéis de quads.
+- Desfazer/Refazer com orçamento de memória (24 MB) — sempre visíveis.
+- Guardar/Abrir projeto próprio (formato BLONEPRJ v1, validado com CRC32 —
+  ver docs/PROJECT_FORMAT.md) via SAF, sem permissões de armazenamento.
+- Um dedo: orbitar. Dois dedos: mover (pan) e zoom por pinça. Contador de
+  FPS medido a partir de timestamps reais.
+- Modos Esculpir/Pintar visíveis mas desativados (fases futuras).
 
 ## Compilar localmente
 
