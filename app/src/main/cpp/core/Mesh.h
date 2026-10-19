@@ -1,16 +1,14 @@
 #pragma once
 // Static mesh builders. All geometry is generated once at startup.
+// Kept for the Phase 1 demo cube; the editable topology lives in
+// core/mesh/HalfEdgeMesh.h since Phase 2.
+
+#include "Math3D.h"
 
 #include <cstdint>
 #include <vector>
 
 namespace blone {
-
-// Axis-aligned bounds of the cube, used for picking and edge highlighting.
-struct Aabb {
-    float minX, minY, minZ;
-    float maxX, maxY, maxZ;
-};
 
 struct CubeMesh {
     // Interleaved: pos(3) + normal(3), 24 vertices (4 per face).

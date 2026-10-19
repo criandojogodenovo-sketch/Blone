@@ -6,6 +6,12 @@
 
 namespace blone {
 
+// Axis-aligned bounding box (shared by picking, rendering and serialization).
+struct Aabb {
+    float minX = 0, minY = 0, minZ = 0;
+    float maxX = 0, maxY = 0, maxZ = 0;
+};
+
 struct Vec3 {
     float x = 0.0f;
     float y = 0.0f;
@@ -80,6 +86,40 @@ struct Mat4 {
         r.m[13] = ty;
         r.m[14] = tz;
         return r;
+    }
+
+    static Mat4 scale(float s) {
+        Mat4 r = identity();
+        r.m[0] = s; r.m[5] = s; r.m[10] = s;
+        return r;
+    }
+
+    // Rodrigues rotation around a unit axis, in degrees.
+    static Mat4 rotationAxisDeg(const Vec3& axis, float deg) {
+        const Vec3 a = normalize(axis);
+        const float rad = deg * static_cast<float>(M_PI) / 180.0f;
+        const float c = std::cos(rad), s = std::sin(rad), t = 1.0f - c;
+        const float x = a.x, y = a.y, z = a.z;
+        Mat4 r{};
+        r.m[0] = t * x * x + c;     r.m[4] = t * x * y - s * z; r.m[8]  = t * x * z + s * y;
+        r.m[1] = t * x * y + s * z; r.m[5] = t * y * y + c;     r.m[9]  = t * y * z - s * x;
+        r.m[2] = t * x * z - s * y; r.m[6] = t * y * z + s * x; r.m[10] = t * z * z + c;
+        return r;
+    }
+
+    static Mat4 rotationYDeg(float deg) {
+        // Right-handed CCW around +Y (delegates to Rodrigues to keep one
+        // single, tested implementation of the math).
+        return rotationAxisDeg(Vec3{0.0f, 1.0f, 0.0f}, deg);
+    }
+
+    // Transforms a point (w = 1).
+    Vec3 transformPoint(const Vec3& p) const {
+        return Vec3{
+            m[0] * p.x + m[4] * p.y + m[8]  * p.z + m[12],
+            m[1] * p.x + m[5] * p.y + m[9]  * p.z + m[13],
+            m[2] * p.x + m[6] * p.y + m[10] * p.z + m[14],
+        };
     }
 };
 
