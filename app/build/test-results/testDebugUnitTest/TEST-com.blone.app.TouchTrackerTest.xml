@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="com.blone.app.TouchTrackerTest" tests="7" skipped="0" failures="0" errors="0" timestamp="2026-10-19T15:09:20" hostname="c-6ad626a1-145cf406-7293dac82efc" time="0.019">
+  <properties/>
+  <testcase name="drag beyond slop becomes orbit and cancels tap" classname="com.blone.app.TouchTrackerTest" time="0.009"/>
+  <testcase name="releasing one of two fingers re-anchors orbit without jump" classname="com.blone.app.TouchTrackerTest" time="0.001"/>
+  <testcase name="two finger pan reports centroid movement" classname="com.blone.app.TouchTrackerTest" time="0.001"/>
+  <testcase name="short single finger tap is detected" classname="com.blone.app.TouchTrackerTest" time="0.0"/>
+  <testcase name="slow press is not a tap" classname="com.blone.app.TouchTrackerTest" time="0.001"/>
+  <testcase name="cancel clears state and emits nothing" classname="com.blone.app.TouchTrackerTest" time="0.0"/>
+  <testcase name="two finger pinch reports span ratio and centroid pan" classname="com.blone.app.TouchTrackerTest" time="0.0"/>
+  <system-out><![CDATA[]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>

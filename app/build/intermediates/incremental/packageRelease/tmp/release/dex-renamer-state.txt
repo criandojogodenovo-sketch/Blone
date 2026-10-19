@@ -1,0 +1,7 @@
+#Mon Oct 19 15:14:07 UTC 2026
+base.1=/home/z/my-project/blone/app/build/intermediates/dex/release/mergeDexRelease/classes2.dex
+path.1=classes2.dex
+base.0=/home/z/my-project/blone/app/build/intermediates/dex/release/mergeDexRelease/classes.dex
+renamed.1=classes2.dex
+renamed.0=classes.dex
+path.0=classes.dex

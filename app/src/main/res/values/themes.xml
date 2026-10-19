@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Dark theme used while Compose initializes; avoids a white flash. -->
+    <style name="Theme.Blone" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@android:color/black</item>
+        <item name="android:statusBarColor">#0E1218</item>
+        <item name="android:navigationBarColor">#0E1218</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+</resources>

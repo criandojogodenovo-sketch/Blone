@@ -1,0 +1,2 @@
+ninja: Entering directory `/home/z/my-project/blone/app/.cxx/RelWithDebInfo/484j651g/armeabi-v7a'
+ninja: no work to do.

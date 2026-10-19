@@ -1,0 +1,138 @@
+name: Android CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+# Least privilege: only read access is needed; artifacts are uploaded via
+# actions/upload-artifact and do not require extra permissions.
+permissions:
+  contents: read
+
+concurrency:
+  group: android-ci-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build, test, sign
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Expose build metadata
+        id: meta
+        run: |
+          SHORT_SHA=$(git rev-parse --short=8 HEAD)
+          echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "Building Blone Fase 0+1 @ ${SHORT_SHA}"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle (with dependency cache)
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: false
+
+      # AGP auto-installs the pinned NDK (27.1.12297006) and CMake (3.22.1)
+      # into the runner's preinstalled Android SDK; licenses are pre-accepted.
+
+      - name: Build debug APK and run unit tests
+        run: ./gradlew --no-daemon :app:assembleDebug :app:testDebugUnitTest --stacktrace
+
+      - name: Upload unit test results (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Blone-fase0-1-test-results-${{ steps.meta.outputs.short_sha }}
+          path: app/build/reports/tests/**
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Upload debug APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Blone-fase0-1-debug-${{ steps.meta.outputs.short_sha }}
+          path: app/build/outputs/apk/debug/*.apk
+          retention-days: 30
+          if-no-files-found: error
+
+      # ---------------------------------------------------------------------
+      # Release signing.
+      # The keystore is decoded ONLY here, into a protected temp directory,
+      # and removed again in the always() cleanup step. No secret is echoed.
+      # If the secrets are missing, the signed release is skipped with a
+      # clear notice — the debug artifact is never presented as a signed
+      # release.
+      # ---------------------------------------------------------------------
+      - name: Restore signing keystore from secrets
+        id: keystore
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          KEYDIR="${RUNNER_TEMP}/blone-signing"
+          if [ -z "${ANDROID_KEYSTORE_BASE64}" ] || [ -z "${ANDROID_KEYSTORE_PASSWORD}" ] || [ -z "${ANDROID_KEY_ALIAS}" ]; then
+            echo "has_secrets=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Segredos de assinatura ausentes (ANDROID_KEYSTORE_BASE64/PASSWORD/ALIAS) — o APK release ASSINADO foi omitido. Apenas o APK debug foi publicado."
+          else
+            mkdir -p "${KEYDIR}"
+            chmod 700 "${KEYDIR}"
+            printf '%s' "${ANDROID_KEYSTORE_BASE64}" | base64 -d > "${KEYDIR}/blone-release.keystore"
+            echo "has_secrets=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Keystore restaurado em diretório temporário protegido."
+          fi
+
+      - name: Build signed release APK
+        id: release
+        if: steps.keystore.outputs.has_secrets == 'true'
+        env:
+          ANDROID_KEYSTORE_PATH: ${{ runner.temp }}/blone-signing/blone-release.keystore
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          ./gradlew --no-daemon :app:assembleRelease --stacktrace
+          APK="$(ls app/build/outputs/apk/release/*.apk | head -n 1)"
+          echo "Verifying signature of ${APK} ..."
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --print-certs "$APK"
+          echo "apk=${APK}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload signed release APK artifact
+        if: steps.release.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Blone-fase0-1-release-assinado-${{ steps.meta.outputs.short_sha }}
+          path: app/build/outputs/apk/release/*.apk
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Cleanup signing material
+        if: always()
+        run: |
+          rm -rf "${RUNNER_TEMP}/blone-signing" || true
+          echo "Material de assinatura removido do runner."
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "## Blone Android CI — Fase 0+1"
+            echo ""
+            echo "| Item | Resultado |"
+            echo "|------|-----------|"
+            echo "| Debug APK | ✅ publicado como artifact |"
+            echo "| Release assinado | $(if [ "${{ steps.release.outcome }}" = "success" ]; then echo '✅ publicado como artifact (assinatura verificada com apksigner)'; else echo '⚠️ omitido — configure os secrets ANDROID_KEYSTORE_* '; fi) |"
+            echo "| Commit | ${{ github.sha }} |"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,4 @@
+/home/z/android-sdk/cmake/3.22.1/bin/ninja \
+  -C \
+  /home/z/my-project/blone/app/.cxx/RelWithDebInfo/484j651g/arm64-v8a \
+  blone
