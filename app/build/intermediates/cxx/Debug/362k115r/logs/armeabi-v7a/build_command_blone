@@ -1,4 +1,0 @@
-/home/z/android-sdk/cmake/3.22.1/bin/ninja \
-  -C \
-  /home/z/my-project/blone/app/.cxx/Debug/362k115r/armeabi-v7a \
-  blone

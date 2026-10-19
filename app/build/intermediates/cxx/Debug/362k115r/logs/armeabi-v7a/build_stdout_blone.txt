@@ -1,2 +1,0 @@
-ninja: Entering directory `/home/z/my-project/blone/app/.cxx/Debug/362k115r/armeabi-v7a'
-ninja: no work to do.
