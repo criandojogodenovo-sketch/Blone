@@ -34,7 +34,10 @@ jobs:
       - name: Build
         run: cmake --build build-core-tests --parallel
 
-      - name: Run core tests
+      - name: Run core tests (output visible in the log)
+        run: ./build-core-tests/blone_tests
+
+      - name: Re-run via ctest (standard harness)
         run: ctest --test-dir build-core-tests --output-on-failure
 
   build:
