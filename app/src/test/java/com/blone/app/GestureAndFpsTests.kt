@@ -92,6 +92,11 @@ class TouchTrackerTest {
         var taps = 0
         var lastTapX = 0f
         var lastTapY = 0f
+        var gizmoDownCalls = 0
+        var gizmoHandle = 0
+        var gizmoMoves = 0
+        var gizmoUps = 0
+        var gizmoCancels = 0
     }
 
     private fun trackerWith(rec: Recorder) = TouchTracker(
@@ -102,6 +107,13 @@ class TouchTrackerTest {
             rec.lastPrevSpan = prev; rec.lastCurSpan = cur
         },
         onTap = { x, y -> rec.taps++; rec.lastTapX = x; rec.lastTapY = y },
+        onGizmoDown = { x, y ->
+            rec.gizmoDownCalls++
+            rec.gizmoHandle
+        },
+        onGizmoMove = { _, _ -> rec.gizmoMoves++ },
+        onGizmoUp = { rec.gizmoUps++ },
+        onGizmoCancel = { rec.gizmoCancels++ },
     )
 
     @Test
@@ -190,6 +202,64 @@ class TouchTrackerTest {
         t.onUp(TouchTracker.Pointer(0, 100f, 100f), 50L)
         assertEquals(0, rec.taps)
         assertEquals(0, rec.orbitCalls)
+    }
+
+    @Test
+    fun `gizmo hit on down routes moves to the gizmo, never orbit or tap`() {
+        val rec = Recorder()
+        rec.gizmoHandle = 1 // X axis tip under the finger
+        val t = trackerWith(rec)
+        t.onDown(TouchTracker.Pointer(0, 100f, 100f), 0L)
+        t.onMove(listOf(TouchTracker.Pointer(0, 160f, 100f)))
+        t.onMove(listOf(TouchTracker.Pointer(0, 180f, 100f)))
+        t.onUp(TouchTracker.Pointer(0, 180f, 100f), 400L)
+        assertEquals(1, rec.gizmoDownCalls)
+        assertEquals(2, rec.gizmoMoves)
+        assertEquals(1, rec.gizmoUps)
+        assertEquals(0, rec.orbitCalls)
+        assertEquals(0, rec.taps) // a gizmo drag never selects
+    }
+
+    @Test
+    fun `gizmo miss keeps the normal orbit and tap path`() {
+        val rec = Recorder()
+        rec.gizmoHandle = 0 // nothing under the finger
+        val t = trackerWith(rec)
+        t.onDown(TouchTracker.Pointer(0, 100f, 100f), 0L)
+        t.onMove(listOf(TouchTracker.Pointer(0, 150f, 100f)))
+        t.onUp(TouchTracker.Pointer(0, 150f, 100f), 200L)
+        assertEquals(1, rec.gizmoDownCalls)
+        assertEquals(0, rec.gizmoMoves)
+        assertTrue(rec.orbitCalls > 0)
+        assertEquals(0, rec.taps) // it was a drag, not a tap
+    }
+
+    @Test
+    fun `second finger cancels gizmo and takes the camera`() {
+        val rec = Recorder()
+        rec.gizmoHandle = 2
+        val t = trackerWith(rec)
+        t.onDown(TouchTracker.Pointer(0, 100f, 500f), 0L)
+        assertEquals(1, rec.gizmoDownCalls)
+        t.onPointerDown(listOf(TouchTracker.Pointer(0, 100f, 500f), TouchTracker.Pointer(1, 300f, 500f)))
+        assertEquals(1, rec.gizmoCancels)
+        t.onMove(listOf(TouchTracker.Pointer(0, 120f, 500f), TouchTracker.Pointer(1, 320f, 500f)))
+        assertEquals(1, rec.panZoomCalls) // camera, not gizmo
+        assertEquals(0, rec.gizmoMoves)
+        t.onUp(TouchTracker.Pointer(0, 120f, 500f), 300L)
+        assertEquals(0, rec.gizmoUps) // already cancelled, no double end
+    }
+
+    @Test
+    fun `tap on gizmo handle is silent (no accidental selection)`() {
+        val rec = Recorder()
+        rec.gizmoHandle = 3
+        val t = trackerWith(rec)
+        t.onDown(TouchTracker.Pointer(0, 100f, 100f), 0L)
+        t.onUp(TouchTracker.Pointer(0, 100f, 100f), 80L)
+        assertEquals(1, rec.gizmoUps)
+        assertEquals(0, rec.taps)
+        assertEquals(0, rec.gizmoMoves) // no movement happened
     }
 }
 

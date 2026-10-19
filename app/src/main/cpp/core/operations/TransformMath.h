@@ -72,6 +72,45 @@ inline float scaleFromDrag(float dyPx) {
     return std::clamp(1.0f - dyPx * 0.005f, 0.05f, 20.0f);
 }
 
+// ---- gizmo mappings (correção Fase 2: eixos X/Y/Z funcionais) -------------
+//
+// The renderer/JNI projects the axis once per drag event and fills
+// AxisScreen; the functions here convert pixel drags to world amounts.
+// All are pure and pinned by host tests.
+
+struct AxisScreen {
+    float dirX = 1.0f;      // pixel-space direction of the world axis (y down)
+    float dirY = 0.0f;      // normalized with (dirX, dirY)
+    float pxPerWorld = 1.0f; // apparent pixels per world unit along the axis
+};
+
+// World units travelled ALONG the axis for a pixel drag (projected onto the
+// axis screen direction).
+inline float dragAlongAxisWorld(const AxisScreen& a, float dxPx, float dyPx) {
+    const float along = dxPx * a.dirX + dyPx * a.dirY;
+    if (a.pxPerWorld <= 1e-6f) return 0.0f;
+    return along / a.pxPerWorld;
+}
+
+// Signed angle (degrees) swept by the touch around the ring pivot between
+// the previous and current touch positions (pixel space, y down). Positive =
+// clockwise on screen. The caller applies the world-axis sign (pinned by a
+// host test: the surface point under the finger follows the finger).
+inline float ringSweepDeg(float prevX, float prevY, float curX, float curY,
+                          float pivotX, float pivotY) {
+    const float p1x = prevX - pivotX, p1y = prevY - pivotY;
+    const float p2x = curX - pivotX, p2y = curY - pivotY;
+    const float cross = p1x * p2y - p1y * p2x;
+    const float d = p1x * p2x + p1y * p2y;
+    return std::atan2(cross, d) * 180.0f / static_cast<float>(M_PI);
+}
+
+// Scale factor from an axial drag (drag towards the axis tip grows).
+inline float scaleAxisFromDrag(const AxisScreen& a, float dxPx, float dyPx) {
+    const float along = dxPx * a.dirX + dyPx * a.dirY;
+    return std::clamp(1.0f + along / 150.0f, 0.02f, 50.0f);
+}
+
 // Vertex-set application helpers (dedup is the caller's duty).
 inline void applyMove(HalfEdgeMesh& m, const std::vector<ElemId>& verts, const Vec3& d) {
     for (const ElemId v : verts) {
@@ -95,6 +134,17 @@ inline void applyScale(HalfEdgeMesh& m, const std::vector<ElemId>& verts,
         if (!m.vertexAlive(v)) continue;
         const Vec3 rel = m.vrt(v).pos - pivot;
         m.vrt(v).pos = pivot + rel * factor;
+    }
+}
+
+// Axial scale: only the component of (pos - pivot) along `axis` is scaled.
+inline void applyAxisScale(HalfEdgeMesh& m, const std::vector<ElemId>& verts,
+                           const Vec3& pivot, const Vec3& axis, float factor) {
+    for (const ElemId v : verts) {
+        if (!m.vertexAlive(v)) continue;
+        const Vec3 rel = m.vrt(v).pos - pivot;
+        const float along = dot(rel, axis);
+        m.vrt(v).pos = pivot + rel + axis * (along * (factor - 1.0f));
     }
 }
 

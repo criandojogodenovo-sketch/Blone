@@ -1,7 +1,6 @@
 package com.blone.app.ui
 
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -12,6 +11,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.systemBarsPadding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -44,14 +44,6 @@ private val DisabledBg = Color(0x661C2534)
 private val Danger = Color(0xFF8C2F39)
 
 @Composable
-private fun toolButtonColors(selected: Boolean) = ButtonDefaults.buttonColors(
-    containerColor = if (selected) AccentDark else DisabledBg,
-    contentColor = ChromeFg,
-    disabledContainerColor = DisabledBg,
-    disabledContentColor = ChromeDim,
-)
-
-@Composable
 private fun ToolButton(
     label: String,
     selected: Boolean,
@@ -67,14 +59,17 @@ private fun ToolButton(
         contentPadding = androidx.compose.foundation.layout.PaddingValues(
             horizontal = 6.dp, vertical = 10.dp
         ),
-        colors = if (selected) toolButtonColors(true) else ButtonDefaults.buttonColors(
+        colors = if (selected) ButtonDefaults.buttonColors(
+            containerColor = AccentDark,
+            contentColor = Accent,
+        ) else ButtonDefaults.buttonColors(
             containerColor = container,
             contentColor = ChromeFg,
             disabledContainerColor = DisabledBg,
             disabledContentColor = ChromeDim,
         ),
         modifier = modifier
-            .height(48.dp)
+            .height(44.dp)
             .padding(horizontal = 2.dp),
     ) {
         Text(text = label, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
@@ -82,11 +77,14 @@ private fun ToolButton(
 }
 
 /**
- * Compose chrome over the dominant viewport:
- *  - top: title, FPS, Desfazer/Refazer (sempre visíveis), Guardar/Abrir;
- *  - bottom: status, barra de modos, e em Editar: seleção V/A/F, ferramentas
- *    explícitas (Mover/Rodar/Escalar + Concluir) e ações de modelação;
+ * Compose chrome over the dominant viewport (correção Fase 2 — interface
+ * limpa, sem cobrir a viewport):
+ *  - topo: título, FPS, Desfazer/Refazer, Guardar/Abrir, Avançado;
+ *  - fundo: estado, barra de modos e, no Editar, UMA barra contextual
+ *    compacta (seleção V/A/F + gizmo Mover/Rodar/Escalar) com um painel
+ *    secundário EXPANSÍVEL ("Mais") para as operações de modelação;
  *  - Avançado: primitivas, lista de objetos, nova cena, apagar objeto.
+ *  Nenhuma funcionalidade foi removida — apenas reorganizada por contexto.
  */
 @Composable
 fun BloneOverlay(
@@ -147,11 +145,11 @@ private fun TopBar(viewModel: BloneViewModel, onSave: () -> Unit, onLoad: () -> 
         }
         Spacer(modifier = Modifier.height(6.dp))
         Row(modifier = Modifier.fillMaxWidth()) {
-            ToolButton("↶ Desfazer", false, viewModel.canUndo && !viewModel.busy) { viewModel.undo() }
-            ToolButton("↷ Refazer", false, viewModel.canRedo && !viewModel.busy) { viewModel.redo() }
+            ToolButton("↶", false, viewModel.canUndo && !viewModel.busy) { viewModel.undo() }
+            ToolButton("↷", false, viewModel.canRedo && !viewModel.busy) { viewModel.redo() }
+            Spacer(modifier = Modifier.weight(1f))
             ToolButton("Guardar", false, !viewModel.busy) { onSave() }
             ToolButton("Abrir", false, !viewModel.busy) { onLoad() }
-            Spacer(modifier = Modifier.weight(1f))
             ToolButton("Avançado", viewModel.advancedOpen, !viewModel.busy) { viewModel.toggleAdvanced() }
         }
     }
@@ -204,20 +202,6 @@ private fun AdvancedPanel(viewModel: BloneViewModel) {
 @Composable
 private fun BottomBar(viewModel: BloneViewModel) {
     Column(horizontalAlignment = Alignment.CenterHorizontally) {
-        if (viewModel.armedTool != Tool.NONE) {
-            Text(
-                text = "${viewModel.armedTool.label} ATIVO — 1 dedo transforma · 2 dedos = câmara",
-                color = Amber,
-                fontSize = 12.sp,
-                fontWeight = FontWeight.Bold,
-                textAlign = TextAlign.Center,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .background(AccentDark, RoundedCornerShape(8.dp))
-                    .padding(horizontal = 12.dp, vertical = 6.dp)
-            )
-            Spacer(modifier = Modifier.height(6.dp))
-        }
         Text(
             text = viewModel.statusText,
             color = ChromeDim,
@@ -268,6 +252,7 @@ private fun BottomBar(viewModel: BloneViewModel) {
             }
         }
 
+        // Contextual bar — ONLY the tools relevant to the active mode.
         if (viewModel.mode == ViewportMode.EDIT) {
             Spacer(modifier = Modifier.height(6.dp))
             Row(
@@ -277,51 +262,60 @@ private fun BottomBar(viewModel: BloneViewModel) {
                     .padding(6.dp)
             ) {
                 SelectionMode.entries.forEach { sm ->
-                    ToolButton(sm.label, viewModel.selectionMode == sm) {
-                        viewModel.selectSelectionMode(sm)
+                    ToolButton(
+                        if (sm == SelectionMode.VERTEX) "V" else if (sm == SelectionMode.EDGE) "A" else "F",
+                        viewModel.selectionMode == sm,
+                    ) { viewModel.selectSelectionMode(sm) }
+                }
+                Spacer(modifier = Modifier.width(4.dp))
+                ToolButton("Mover", viewModel.gizmoTool == Tool.MOVE, !viewModel.busy) {
+                    viewModel.chooseGizmoTool(Tool.MOVE)
+                }
+                ToolButton("Rodar", viewModel.gizmoTool == Tool.ROTATE, !viewModel.busy) {
+                    viewModel.chooseGizmoTool(Tool.ROTATE)
+                }
+                ToolButton("Escalar", viewModel.gizmoTool == Tool.SCALE, !viewModel.busy) {
+                    viewModel.chooseGizmoTool(Tool.SCALE)
+                }
+                Spacer(modifier = Modifier.weight(1f))
+                ToolButton("Mais ▾", viewModel.toolsOpen, !viewModel.busy) {
+                    viewModel.toggleTools()
+                }
+            }
+            if (viewModel.toolsOpen) {
+                Spacer(modifier = Modifier.height(4.dp))
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(ChromeBg, RoundedCornerShape(14.dp))
+                        .padding(6.dp)
+                ) {
+                    ToolButton("Extrudir", false, !viewModel.busy) { viewModel.extrude() }
+                    ToolButton("Subdiv.", false, !viewModel.busy) { viewModel.subdivide() }
+                    ToolButton("Apagar", false, !viewModel.busy, container = Danger) {
+                        viewModel.deleteSelection()
                     }
+                    ToolButton("Loop cut", false, !viewModel.busy) { viewModel.loopCut() }
                 }
-                ToolButton(
-                    if (viewModel.multiSelect) "+ múltipla" else "+ única",
-                    viewModel.multiSelect,
-                ) { viewModel.toggleMultiSelect() }
-                ToolButton("Limpar", false, !viewModel.busy) { viewModel.clearSelection() }
-            }
-            Spacer(modifier = Modifier.height(6.dp))
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .background(ChromeBg, RoundedCornerShape(14.dp))
-                    .padding(6.dp)
-            ) {
-                ToolButton(Tool.MOVE.label, viewModel.armedTool == Tool.MOVE, !viewModel.busy) {
-                    viewModel.armTool(Tool.MOVE)
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 6.dp)
+                ) {
+                    ToolButton(
+                        if (viewModel.multiSelect) "+ múltipla" else "+ única",
+                        viewModel.multiSelect,
+                    ) { viewModel.toggleMultiSelect() }
+                    ToolButton("Limpar", false, !viewModel.busy) { viewModel.clearSelection() }
+                    Text(
+                        text = "Gizmo: arraste um eixo/anel · fora dele a câmara orbita · 2 dedos = câmara",
+                        color = ChromeDim,
+                        fontSize = 10.sp,
+                        modifier = Modifier
+                            .weight(1f)
+                            .padding(start = 8.dp)
+                    )
                 }
-                ToolButton(Tool.ROTATE.label, viewModel.armedTool == Tool.ROTATE, !viewModel.busy) {
-                    viewModel.armTool(Tool.ROTATE)
-                }
-                ToolButton(Tool.SCALE.label, viewModel.armedTool == Tool.SCALE, !viewModel.busy) {
-                    viewModel.armTool(Tool.SCALE)
-                }
-                ToolButton(
-                    "Concluir", false,
-                    viewModel.armedTool != Tool.NONE,
-                    container = AccentDark,
-                ) { viewModel.concludeTool() }
-            }
-            Spacer(modifier = Modifier.height(6.dp))
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .background(ChromeBg, RoundedCornerShape(14.dp))
-                    .padding(6.dp)
-            ) {
-                ToolButton("Extrudir", false, !viewModel.busy) { viewModel.extrude() }
-                ToolButton("Subdiv.", false, !viewModel.busy) { viewModel.subdivide() }
-                ToolButton("Apagar", false, !viewModel.busy, container = Danger) {
-                    viewModel.deleteSelection()
-                }
-                ToolButton("Loop cut", false, !viewModel.busy) { viewModel.loopCut() }
             }
         }
     }

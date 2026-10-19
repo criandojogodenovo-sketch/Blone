@@ -59,7 +59,9 @@ genéricas além do que as fases exigem.
   `next`/`prev` (sem face exterior fantasma). Malhas abertas (plano,
   extrusões) são cidadãos de primeira classe.
 - **Faces poligonais** (3..256 lados). A triangulação é derivada na
-  renderização (fan) — a estrutura editável nunca é "apenas triângulos".
+  renderização e no picking pela MESMA função (`renderdata::faceTriangles`,
+  *ear clipping* preservando o winding; ver §3) — a estrutura editável
+  nunca é "apenas triângulos".
 - Índice dirigido `(origem, destino) → half-edge` (hash map) para
   resolução O(1) em `addFace`.
 
@@ -128,16 +130,24 @@ operação deixa a malha parcialmente alterada.
   Faces atravessadas são divididas em 2 quads ligados por uma aresta nova
   entre os pontos médios; vértices que morrem com a divisão (malha só com
   a face do anel) são recriados uma vez na posição registada.
-- **Transformações** (`TransformMath` + sessão de ferramenta em
-  `SceneOps`): mapeamentos puros e testados —
-  Mover: a seleção segue o dedo (`right·dx + up·(-dy)` × unidades/px à
-  distância da câmara); Rodar: arrasto horizontal = rotação em torno do Y
-  do mundo (-0,4°/px), vertical = em torno do right da câmara (+0,4°/px),
-  pivô = centroide da seleção; Escalar: fator uniforme
-  `clamp(1 - 0,005·dy, 0,05, 20)` em torno do centroide. A sessão
-  (início → movimentos → conclusão) aplica os deltas acumulados desde as
-  posições iniciais (determinístico, sem deriva) e grava UMA entrada de
-  histórico no fim.
+- **Transformações** (gizmo, `TransformMath` + sessão em `SceneOps`):
+  correção Fase 2 — as transformações são dirigidas pelo GIZMO no écran
+  (eixos/anéis desenhados no pivô da seleção, hit-test em espaço de ecrã):
+  - **Mover** (arrasto de ponta de eixo X/Y/Z): deslocamento ao longo do
+    eixo do mundo; o eixo é projetado por evento (`GizmoMapping`: direção
+    em px, px por unidade de mundo) e o arrasto é projetado nessa direção;
+  - **Rodar** (arrasto de anel X/Y/Z): ângulo varrido pelo dedo em torno do
+    pivô projetado (`ringSweepDeg`); o sinal depende do eixo apontar para
+    ou contra a câmara (`ringSign`, fixado por teste — o ponto sob o dedo
+    segue o dedo);
+  - **Escalar**: arrasto de eixo = fator axial (só o componente ao longo
+    do eixo, em torno do pivô); arrasto do centro = fator uniforme
+    `clamp(1 - 0,005·dy, 0,05, 20)`;
+  - seleção vazia ⇒ o alvo é o objeto inteiro (o modo Editar nunca
+    "bloqueia"); a sessão aplica transformações ACUMULADAS desde as
+    posições iniciais (determinístico, sem deriva) e grava UMA entrada de
+    histórico no fim; 2 dedos durante um arrasto cancelam a sessão e
+    assumem a câmara.
 
 ### 2.4 Histórico (`core/history/History`) — memória verificável
 
@@ -177,36 +187,47 @@ temporária; erro algum destrói o projeto aberto. Ver tabela de erros em
 
 ## 3. Renderização (`renderer/Renderer`)
 
-- Grelha/eixos estáticos (Fase 1) + **um conjunto de buffers por objeto**:
-  triângulos com sombreamento plano (fan + normais por face, duplicação de
-  vértices), wireframe de linhas, pontos nos vértices reais.
-- Buffers reconstruídos quando `Scene::version` muda (troca conhecida e
-  documentada: malhas limitadas ⇒ reconstrução barata e sempre coerente;
-  otimizações incrementais só com medições, conforme a regra de
-  desempenho).
-- Overlays do objeto ativo em modo Editar: faces selecionadas tingidas
-  (com `polygonOffset`), arestas selecionadas + contornos de faces
-  selecionadas em âmbar, todos os vértices como pontos pequenos e os
-  selecionados como pontos maiores. Modo Objeto: contorno âmbar da caixa
-  do objeto ativo.
-- **Picking CPU** (`pickAtPixel`): raio por pixel com as matrizes do último
-  frame; interseção raio-triângulo (Möller–Trumbore) em todos os objetos
-  (em espaço local: origem − posição do objeto); fica o hit MAIS PRÓXIMO
-  (oclusão respeitada). Vértices/arestas candidatos vêm da face atingida,
-  escolhidos por distância em espaço de ecrã (raio ~14 dp) e aceites só se
-  não estiverem atrás da superfície visível (comparação de profundidade ao
-  longo do raio). Elementos escondidos não são selecionados.
+- **Fonte geométrica única** (`core/render/RenderData`): a geometria
+  desenhada, a malha editável e o picking derivam da MESMA função —
+  `faceTriangles()` triangula cada face com **ear clipping** (robusto para
+  polígonos CÔNCAVOS; o fan antigo criava laços cruzados — "setas/Z" —
+  após fusões de arestas), preservando o winding; para quads o contrato
+  `[a,b,c,d] → (a,b,c)+(a,c,d)` é exato e fixado por teste.
+- Sombreamento plano: vértices DUPLICADOS por face (buffer de render ≠
+  vértices editáveis; 24 vs 8 no cubo), normal por face recalculada
+  (Newell) a cada reconstrução. O shader tem luz principal + **luz de
+  preenchimento oposta** (correção "faces invisíveis": as faces viradas
+  para longe da luz mantêm leitura — sem desativar o culling).
+- Grelha/eixos estáticos + um conjunto de buffers por objeto (fill,
+  wireframe, pontos) + contorno do modo Objeto EM CACHE (sem alocação
+  por frame). Buffers reconstruídos quando `Scene::version` muda (troca
+  documentada: malhas limitadas ⇒ reconstrução barata e coerente).
+- Overlays do objeto ativo em Editar: faces selecionadas tingidas,
+  arestas em âmbar e pontos — todos com `polygonOffset` (correção de
+  z-fighting dos marcadores).
+- **GIZMO** (Editar): desenhado por cima (depth test off) no pivô da
+  seleção — setas X/Y/Z (Mover), anéis (Rodar), eixos + centro (Escalar),
+  com tamanho constante no ecrã. Hit-test CPU (`gizmoHitAt`) por
+  distância em px (pontas 26 px, anéis 16 px amostrados, centro 22 px).
+- **Picking CPU** (`pickAtPixel`): raio por pixel com as matrizes do
+  último frame; interseção raio-triângulo (Möller–Trumbore) sobre a
+  MESMA triangulação do render; hit mais próximo (oclusão). Vértices e
+  arestas candidatos são procurados em TODOS os elementos vivos do
+  objeto atingido (correção: antes só os da face tocada), arestas por
+  distância ponto-segmento no ecrã (correção: antes só o ponto médio),
+  com verificação de profundidade ao longo do raio — elementos
+  escondidos não são selecionados.
 
 ## 4. Kotlin (UI e gestos)
 
 | Ficheiro | Responsabilidade |
 |---|---|
 | `MainActivity.kt` | Activity única; SAF (`CreateDocument`/`OpenDocument`) para Guardar/Abrir — sem permissões de armazenamento abrangentes; liga o ciclo de vida do Activity à superfície GL. |
-| `ui/BloneOverlay.kt` | Chrome Compose: topo (título, FPS, Desfazer/Refazer sempre visíveis, Guardar/Abrir, Avançado); barra de modos (Objeto/Editar ativos; Esculpir/Pintar desativados "em breve"); em Editar: seleção Vértice/Aresta/Face + multisseleção + Limpar, ferramentas Mover/Rodar/Escalar + Concluir, ações Extrudir/Subdividir/Apagar/Loop cut; painel Avançado com primitivas, lista de objetos, apagar objeto e nova cena. Botões ≥ 48 dp. |
+| `ui/BloneOverlay.kt` | Chrome Compose (correção "interface poluída"): topo (título, FPS, Desfazer/Refazer, Guardar/Abrir, Avançado); barra de modos; em Editar UMA barra contextual compacta — seleção V/A/F + gizmo Mover/Rodar/Escalar + "Mais ▾" — com painel secundário EXPANSÍVEL (Extrudir/Subdividir/Apagar/Loop cut, multisseleção, Limpar). Nada foi removido; apenas reorganizado por contexto. |
 | `vm/BloneViewModel.kt` | Estado que sobrevive a rotação; operações nativas em `Dispatchers.Default` (nunca bloqueiam a UI nem a thread GL); mensagens de estado em PT mapeadas dos códigos nativos. |
-| `gl/BloneSurfaceView.kt` | GLSurfaceView ES 3.0; prioridade de interação: botões Compose > arrasto da ferramenta armada (1 dedo) > tap de seleção (1 dedo curto) > órbita (1 dedo); **2 dedos é SEMPRE câmara** (pan+zoom), em qualquer modo — nenhum gesto rouba a câmara. |
+| `gl/BloneSurfaceView.kt` | GLSurfaceView ES 3.0; prioridade: botões Compose > **arrasto de alça do gizmo** (1 dedo em alça) > órbita (1 dedo fora do gizmo) > tap de seleção (1 dedo curto); **2 dedos é SEMPRE câmara** (pan+zoom) e cancela qualquer arrasto de gizmo. |
 | `gl/NativeLib.kt` | Declarações JNI + códigos de estado; documenta o contrato de threads. |
-| `gl/TouchTracker.kt` / `CameraState.kt` / `FpsMeter.kt` | Inalterados da Fase 1 (testados): máquina multitoque, câmara orbital com clamps, FPS real por timestamps. |
+| `gl/TouchTracker.kt` / `CameraState.kt` / `FpsMeter.kt` | TouchTracker com modo GIZMO (alça detetada no ACTION_DOWN por callback; arrasto vai ao gizmo; 2.º dedo cancela e assume a câmara; tap em alça não seleciona) — 100% JVM-testável; câmara orbital com clamps; FPS real por timestamps. |
 
 ## 5. Limites de geometria e memória
 
@@ -258,7 +279,7 @@ correm fora da thread principal e a UI nunca bloqueia.
 ## 7. Testes
 
 - **Núcleo C++ em host** (`app/src/main/cpp/tests`, CMake + ctest no CI):
-  1107 verificações em 5 suítes — invariantes topológicas após cada
+  1302 verificações em 6 suítes — invariantes topológicas após cada
   operação; estrutura e normais das 4 primitivas + rejeições de parâmetros;
   extrusão (contagens exatas V12/E20/F10 no cubo, paredes para fora,
   região fechada rejeitada, extrusão do plano); subdivisão (cubo inteiro
@@ -276,7 +297,20 @@ correm fora da thread principal e a UI nunca bloqueia.
   (round-trip byte-exato; rejeição de magic/versão/truncatura/CRC com a
   cena atual intacta); sequência-mestre (criar cubo → selecionar face →
   extrudir → desfazer → refazer → guardar → nova cena → abrir → igual).
-- **JVM Kotlin** (CI): 21 testes de câmara, gestos e FPS (Fase 1, mantidos).
+  **Suíte nova da correção** (`test_render_gizmo.cpp`): contagens
+  8V/12E/6F do cubo, posições exatas do enunciado, 6 normais exteriores
+  unitárias, triangulação 12 triângulos com contrato de quad
+  `(a,b,c)+(a,c,d)` e winding consistente, vértices editáveis (8) vs
+  duplicados no buffer (24), ear clipping num polígono CÔNCAVO sem
+  bowties (soma das áreas dos triângulos = área do polígono), normais e
+  buffers atualizados após mover vértice/extrudir/desfazer, ciclo de
+  seleção (pick V/A/F, multisseleção, prune), gizmo ponta-a-ponta com
+  histórico (mover por eixo só mexe esse eixo; escala axial em torno do
+  pivô; sinal do anel: o ponto sob o dedo segue o dedo) e desfazer
+  byte-exato.
+- **JVM Kotlin** (CI): 26 testes de câmara, gestos (incl. modo gizmo:
+  alça→gizmo, falha→órbita, 2.º dedo cancela, tap em alça silencioso) e
+  FPS.
 - **Dispositivo físico** (responsabilidade do proprietário): sequência-mestre
   no app, gestos, rotação, FPS real no contador. O objetivo de 60 FPS é
   avaliado no dispositivo, nunca prometido por padrão.

@@ -130,11 +130,21 @@ void testTransformToolSession() {
     dp.fovYDeg = 45.0f;
     dp.viewportHeightPx = 1000.0f;
 
+    // Gizmo mapping equivalent to that camera: +X projects to +x_px.
+    sceneops::GizmoMapping map;
+    map.axisDirX = 1.0f;
+    map.axisDirY = 0.0f;
+    map.pxPerWorld = 1.0f / ops::worldPerPx(dp);
+    map.pivotScreenX = 500.0f;
+    map.pivotScreenY = 500.0f;
+    map.ringSign = 1.0f;
+
     // Track a vertex that actually belongs to the selected (top) face.
     const ElemId topVert = *obj.mesh.faceVertices(top).begin();
     const Vec3 before0 = obj.mesh.vrt(topVert).pos;
-    CHECK(sceneops::beginTool(s, h, t, sceneops::Tool::Move, dp) == ops::Status::OK);
-    CHECK(sceneops::updateTool(s, t, dp, 100.0f, 0.0f) == ops::Status::OK);
+    CHECK(sceneops::beginTool(s, h, t, sceneops::Tool::Move, 1, 0, 500.0f, 500.0f) ==
+          ops::Status::OK);
+    CHECK(sceneops::updateTool(s, t, map, 600.0f, 500.0f) == ops::Status::OK);
     CHECK(sceneops::endTool(s, h, t) == ops::Status::OK);
     // Face moved +X by 100 px * worldPerPx; vertices outside untouched.
     const float wpp = ops::worldPerPx(dp);

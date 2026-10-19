@@ -111,4 +111,24 @@ inline ElemId edgeBetween(const HalfEdgeMesh& m, ElemId a, ElemId b) {
     return kNull;
 }
 
+// Position of a vertex inside a Raw snapshot (id -> slot -> pool).
+inline Vec3 rawPos(const HalfEdgeMesh::Raw& r, ElemId id) {
+    return r.verts[r.vSlot[id]].pos;
+}
+
+// Every alive face must carry a unit-length (non-degenerate) normal.
+inline bool assertNormalsOk(const HalfEdgeMesh& m) {
+    bool ok = true;
+    for (const ElemId f : m.aliveFaceIds()) {
+        const Vec3 n = m.faceNormal(f);
+        if (std::fabs(length(n) - 1.0f) > 1e-4f) ok = false;
+    }
+    ++g_checks;
+    if (!ok) {
+        ++g_failures;
+        std::printf("FALHOU normais não unitárias/degeneradas\n");
+    }
+    return ok;
+}
+
 } // namespace blone::test

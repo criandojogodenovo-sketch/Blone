@@ -5,17 +5,18 @@ import android.content.Context
 import android.opengl.GLSurfaceView
 import android.view.MotionEvent
 import com.blone.app.vm.BloneViewModel
-import com.blone.app.vm.Tool
+import com.blone.app.vm.ViewportMode
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
 
 /**
  * The OpenGL ES 3.0 surface that hosts the C++ renderer, plus raw multitouch
- * handling (Fase 2 interaction priority, documented in ARCHITECTURE.md):
+ * handling (correção Fase 2 — gizmo funcional, sem bloqueios):
  *  - Compose buttons consume their own touches (they sit above this view);
- *  - 1 finger: tool drag when a transform tool is armed, orbit otherwise;
- *  - 2 fingers: ALWAYS the camera (pan + zoom), never a tool;
- *  - short single-finger tap: element/object picking.
+ *  - touch-down on a GIZMO handle: drag transforms the selection/object;
+ *  - 1 finger anywhere else: camera orbit;
+ *  - 2 fingers: ALWAYS the camera (pan + zoom), cancelling a gizmo drag;
+ *  - short single-finger tap (not on the gizmo): element/object picking.
  */
 class BloneSurfaceView(
     context: Context,
@@ -33,12 +34,9 @@ class BloneSurfaceView(
         touchSlopPx = touchSlopPx,
         onOrbit = { dx, dy ->
             post {
-                if (viewModel.armedTool != Tool.NONE) {
-                    // Explicit transform drag (tool armed via its button).
-                    viewModel.onToolDrag(dx, dy)
-                } else {
-                    viewModel.camera.orbit(dx, dy)
-                }
+                // 1 finger outside the gizmo is ALWAYS the camera orbit —
+                // the gizmo drag owns its own gesture path.
+                viewModel.camera.orbit(dx, dy)
             }
         },
         onPanZoom = { dx, dy, prevSpan, curSpan ->
@@ -49,6 +47,32 @@ class BloneSurfaceView(
         },
         onTap = { x, y ->
             performPick(x, y)
+        },
+        onGizmoDown = { x, y ->
+            // Runs on the UI thread; the native hit-test is CPU-only and
+            // mutex-guarded (one frame of contention at most).
+            if (viewModel.mode == ViewportMode.EDIT) {
+                val handle = try {
+                    NativeLib.gizmoHitTest(x, y)
+                } catch (_: Throwable) {
+                    0
+                }
+                if (handle != 0) {
+                    viewModel.beginGizmoDrag(handle, x, y)
+                }
+                handle
+            } else {
+                0
+            }
+        },
+        onGizmoMove = { x, y ->
+            viewModel.onGizmoDragMove(x, y)
+        },
+        onGizmoUp = {
+            viewModel.onGizmoDragEnd()
+        },
+        onGizmoCancel = {
+            viewModel.onGizmoDragCancel()
         },
     )
 
@@ -114,6 +138,7 @@ class BloneSurfaceView(
         override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
             fpsMeter.reset()
             viewModel.camera.viewportHeight = height.toFloat().coerceAtLeast(1f)
+            viewModel.camera.viewportWidth = width.toFloat().coerceAtLeast(1f)
             NativeLib.surfaceChanged(width, height)
         }
 

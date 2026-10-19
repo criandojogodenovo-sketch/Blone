@@ -86,7 +86,8 @@ class BloneViewModel : ViewModel() {
     var selectionMode by mutableStateOf(SelectionMode.FACE)
         private set
 
-    var armedTool by mutableStateOf(Tool.NONE)
+    /** Gizmo tool currently displayed in edit mode (never blocks gestures). */
+    var gizmoTool by mutableStateOf(Tool.MOVE)
         private set
 
     var multiSelect by mutableStateOf(false)
@@ -107,6 +108,10 @@ class BloneViewModel : ViewModel() {
     var advancedOpen by mutableStateOf(false)
         private set
 
+    /** Expandable secondary tool panel in Edit mode (contextual bar). */
+    var toolsOpen by mutableStateOf(false)
+        private set
+
     /** True while a mutating native operation is in flight. */
     var busy by mutableStateOf(false)
         private set
@@ -115,16 +120,14 @@ class BloneViewModel : ViewModel() {
         when (m) {
             ViewportMode.OBJECT -> {
                 mode = m
-                armedTool = Tool.NONE
                 NativeLib.setEditMode(false)
-                statusText = "Modo Objeto — toque num objeto para o ativar"
+                statusText = "Modo Objeto — toque num objeto para o ativar · 1 dedo orbita · 2 dedos câmara"
                 refresh()
             }
             ViewportMode.EDIT -> {
                 mode = m
-                armedTool = Tool.NONE
                 NativeLib.setEditMode(true)
-                statusText = "Modo Editar — toque para selecionar ${selectionMode.label.lowercase()}"
+                statusText = "Editar — toque: selecionar · arraste um eixo do gizmo: transformar · fora: câmara"
                 refresh()
             }
             else ->
@@ -168,63 +171,63 @@ class BloneViewModel : ViewModel() {
         refresh()
     }
 
-    // ---- explicit transform tools -------------------------------------------
+    // ---- gizmo (correção Fase 2) ---------------------------------------------
 
-    fun armTool(t: Tool) {
-        if (mode != ViewportMode.EDIT) {
-            statusText = "As ferramentas funcionam no modo Editar."
-            return
-        }
-        if (t == armedTool) {
-            concludeTool()
-            return
-        }
-        busy = true
-        viewModelScope.launch(Dispatchers.Default) {
-            val code = NativeLib.beginTool(
-                t.native,
-                camera.azimuthDeg, camera.elevationDeg, camera.distance,
-                camera.fovYDegrees, camera.viewportHeight,
-            )
-            withContext(Dispatchers.Main) {
-                busy = false
-                if (code == NativeLib.Status.OK) {
-                    armedTool = t
-                    statusText = when (t) {
-                        Tool.MOVE -> "Mover ativo — arraste com 1 dedo · 2 dedos = câmara · Concluir p/ sair"
-                        Tool.ROTATE -> "Rodar ativo — arraste com 1 dedo · 2 dedos = câmara · Concluir p/ sair"
-                        Tool.SCALE -> "Escalar ativo — arraste com 1 dedo · 2 dedos = câmara · Concluir p/ sair"
-                        Tool.NONE -> ""
-                    }
-                } else {
-                    statusText = StatusMessages.forCode(code, "Armar ${t.label.lowercase()}")
-                }
-            }
+    /** True between beginGizmoDrag and end/cancel (plain field, not UI state). */
+    private var gizmoDragActive = false
+
+    fun chooseGizmoTool(t: Tool) {
+        if (t == Tool.NONE) return
+        gizmoTool = t
+        NativeLib.setGizmoTool(t.native)
+        statusText = when (t) {
+            Tool.MOVE -> "Gizmo: Mover — arraste um eixo X/Y/Z · fora do gizmo: câmara"
+            Tool.ROTATE -> "Gizmo: Rodar — arraste um anel · fora do gizmo: câmara"
+            Tool.SCALE -> "Gizmo: Escalar — arraste um eixo ou o centro (uniforme)"
+            Tool.NONE -> ""
         }
     }
 
-    /** One-finger drag while a tool is armed (routed by the surface view). */
-    fun onToolDrag(dxPx: Float, dyPx: Float) {
-        if (armedTool == Tool.NONE) return
-        NativeLib.updateTool(
-            dxPx, dyPx,
-            camera.azimuthDeg, camera.elevationDeg, camera.distance,
-            camera.fovYDegrees, camera.viewportHeight,
+    /** Touch-down hit a gizmo handle (UI thread; cheap CPU call). */
+    fun beginGizmoDrag(handle: Int, xPx: Float, yPx: Float) {
+        val cam = camera
+        val code = NativeLib.beginGizmoDrag(
+            handle, xPx, yPx,
+            cam.azimuthDeg, cam.elevationDeg, cam.distance,
+            cam.targetX, cam.targetY, cam.targetZ,
+            cam.viewportWidth, cam.viewportHeight,
+        )
+        gizmoDragActive = code == NativeLib.Status.OK
+        if (!gizmoDragActive) {
+            statusText = StatusMessages.forCode(code, "Gizmo")
+        }
+    }
+
+    fun onGizmoDragMove(xPx: Float, yPx: Float) {
+        if (!gizmoDragActive) return
+        val cam = camera
+        NativeLib.updateGizmoDrag(
+            xPx, yPx,
+            cam.azimuthDeg, cam.elevationDeg, cam.distance,
+            cam.targetX, cam.targetY, cam.targetZ,
+            cam.viewportWidth, cam.viewportHeight,
         )
     }
 
-    fun concludeTool() {
-        if (armedTool == Tool.NONE) return
-        busy = true
-        viewModelScope.launch(Dispatchers.Default) {
-            val code = NativeLib.endTool()
-            withContext(Dispatchers.Main) {
-                busy = false
-                armedTool = Tool.NONE
-                statusText = StatusMessages.forCode(code, "Transformação")
-                refresh()
-            }
-        }
+    fun onGizmoDragEnd() {
+        if (!gizmoDragActive) return
+        gizmoDragActive = false
+        val code = NativeLib.endGizmoDrag()
+        statusText = StatusMessages.forCode(code, "Transformação")
+        refresh()
+    }
+
+    fun onGizmoDragCancel() {
+        if (!gizmoDragActive) return
+        gizmoDragActive = false
+        NativeLib.cancelGizmoDrag()
+        statusText = "Transformação cancelada (câmara assumiu)"
+        refresh()
     }
 
     // ---- modeling operations ------------------------------------------------
@@ -264,9 +267,12 @@ class BloneViewModel : ViewModel() {
         advancedOpen = !advancedOpen
     }
 
+    fun toggleTools() {
+        toolsOpen = !toolsOpen
+    }
+
     fun newScene() = runOp("Nova cena", onOk = {
         mode = ViewportMode.OBJECT
-        armedTool = Tool.NONE
         activeObject = -1
         statusText = "Cena nova — adicione uma primitiva no painel Avançado"
     }, op = { NativeLib.newScene() })
@@ -285,7 +291,6 @@ class BloneViewModel : ViewModel() {
             // The UI always restarts in Object mode after opening a project;
             // the saved edit state stays inside the file.
             mode = ViewportMode.OBJECT
-            armedTool = Tool.NONE
             NativeLib.setEditMode(false)
         }
         refresh()

@@ -10,6 +10,7 @@ add_library(blone SHARED
         core/mesh/Primitives.cpp
         core/operations/Operations.cpp
         core/history/History.cpp
+        core/render/RenderData.cpp
         core/scene/SceneOps.cpp
         core/project/Project.cpp)
 

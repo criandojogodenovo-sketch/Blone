@@ -2,6 +2,7 @@
 
 #include "../core/Log.h"
 #include "../core/Scene.h"
+#include "../core/render/RenderData.h"
 #include "../core/scene/Scene.h"
 
 #include <algorithm>
@@ -28,6 +29,10 @@ void main() {
 }
 )";
 
+// Correção "faces invisíveis": além da luz principal existe um termo de
+// preenchimento (fill) oposto — faces viradas para longe da luz mantêm
+// leitura clara em vez de afundar no fundo (#0E1218). Sem desativar o
+// culling: a correção é de iluminação, não de winding.
 const char* kFillFragmentShader = R"(#version 300 es
 precision mediump float;
 in vec3 vNormal;
@@ -42,11 +47,12 @@ void main() {
     vec3 n = normalize(vNormal);
     vec3 l = normalize(uLightDir);
     float diff = max(dot(n, l), 0.0);
-    float ambient = 0.28;
+    float fill = max(dot(n, -l), 0.0);       // luz de preenchimento oposta
+    float ambient = 0.34;
     vec3 viewDir = normalize(uEyePos - vWorldPos);
     vec3 halfV = normalize(l + viewDir);
-    float spec = pow(max(dot(n, halfV), 0.0), 32.0) * 0.35;
-    vec3 color = base * (ambient + diff * 0.78) + vec3(spec);
+    float spec = pow(max(dot(n, halfV), 0.0), 32.0) * 0.30;
+    vec3 color = base * (ambient + diff * 0.70 + fill * 0.26) + vec3(spec);
     color = mix(color, uTint, uTintMix);
     fragColor = vec4(color, 1.0);
 }
@@ -140,17 +146,8 @@ struct FillVertex {
 };
 // LineVertex comes from core/Scene.h (pos + rgba).
 
-// Fan triangulation of a polygon loop (loops from our primitives and
-// operations are convex or near-convex; documented Phase 2 policy).
-void triangulateFan(const std::vector<ElemId>& loop,
-                    std::vector<GLuint>& indices) {
-    for (size_t i = 1; i + 1 < loop.size(); ++i) {
-        indices.push_back(static_cast<GLuint>(loop[0]));
-        indices.push_back(static_cast<GLuint>(loop[i]));
-        indices.push_back(static_cast<GLuint>(loop[i + 1]));
-    }
-}
-
+// Cached object-mode outline in LOCAL space (built once per object; drawn
+// with vp*model — no per-frame VAO/VBO allocation anymore).
 std::vector<LineVertex> boxEdgesLines(const Aabb& b) {
     const float x0 = b.minX, y0 = b.minY, z0 = b.minZ;
     const float x1 = b.maxX, y1 = b.maxY, z1 = b.maxZ;
@@ -191,7 +188,19 @@ float rayTriangle(const Vec3& orig, const Vec3& dir, const Vec3& v0,
     return (tt > 0.0f) ? tt : -1.0f;
 }
 
-constexpr float kMaxPickDistance = 200.0f;
+constexpr float kMaxPickDepthSlack = 0.25f; // occlusion slack along the ray
+
+// Gizmo palette (X red, Y green, Z blue).
+constexpr float kAxisColor[3][3] = {
+        {0.95f, 0.30f, 0.32f},
+        {0.35f, 0.80f, 0.40f},
+        {0.35f, 0.60f, 0.98f},
+};
+constexpr float kGizmoArrowPx = 78.0f;  // axis length on screen
+constexpr float kGizmoRingPx = 54.0f;   // rotation ring radius on screen
+constexpr float kGizmoTipRadiusPx = 26.0f;
+constexpr float kGizmoRingRadiusPx = 16.0f;
+constexpr float kGizmoCenterRadiusPx = 22.0f;
 
 } // namespace
 
@@ -201,6 +210,10 @@ void Renderer::init() {
     if (pointProgram_ != 0) glDeleteProgram(pointProgram_);
     if (sceneVao_ != 0) glDeleteVertexArrays(1, &sceneVao_);
     if (sceneVbo_ != 0) glDeleteBuffers(1, &sceneVbo_);
+    if (gizmoLineVao_ != 0) glDeleteVertexArrays(1, &gizmoLineVao_);
+    if (gizmoLineVbo_ != 0) glDeleteBuffers(1, &gizmoLineVbo_);
+    if (gizmoPtVao_ != 0) glDeleteVertexArrays(1, &gizmoPtVao_);
+    if (gizmoPtVbo_ != 0) glDeleteBuffers(1, &gizmoPtVbo_);
     for (ObjectGpu& g : gpu_) destroyObjectGpu(g);
     gpu_.clear();
     sceneVersion_ = 0;
@@ -229,6 +242,28 @@ void Renderer::init() {
     }
 
     buildSceneLines();
+
+    // Gizmo dynamic buffers (small, orphaned per frame; scratch reused).
+    glGenVertexArrays(1, &gizmoLineVao_);
+    glGenBuffers(1, &gizmoLineVbo_);
+    glBindVertexArray(gizmoLineVao_);
+    glBindBuffer(GL_ARRAY_BUFFER, gizmoLineVbo_);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(LineVertex),
+                          reinterpret_cast<void*>(0));
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, sizeof(LineVertex),
+                          reinterpret_cast<void*>(3 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+    glBindVertexArray(0);
+
+    glGenVertexArrays(1, &gizmoPtVao_);
+    glGenBuffers(1, &gizmoPtVbo_);
+    glBindVertexArray(gizmoPtVao_);
+    glBindBuffer(GL_ARRAY_BUFFER, gizmoPtVbo_);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float),
+                          reinterpret_cast<void*>(0));
+    glEnableVertexAttribArray(0);
+    glBindVertexArray(0);
 
     glEnable(GL_DEPTH_TEST);
     glDepthFunc(GL_LEQUAL);
@@ -273,6 +308,8 @@ void Renderer::destroyObjectGpu(ObjectGpu& g) {
     glDeleteBuffers(1, &g.wireVbo);
     glDeleteVertexArrays(1, &g.ptVao);
     glDeleteBuffers(1, &g.ptVbo);
+    glDeleteVertexArrays(1, &g.boxVao);
+    glDeleteBuffers(1, &g.boxVbo);
     glDeleteVertexArrays(1, &g.selFaceVao);
     glDeleteBuffers(1, &g.selFaceVbo);
     glDeleteBuffers(1, &g.selFaceEbo);
@@ -286,38 +323,19 @@ void Renderer::destroyObjectGpu(ObjectGpu& g) {
 void Renderer::buildObjectGeometry(ObjectGpu& g, const SceneObject& obj) {
     destroyObjectGpu(g);
 
+    // Single geometric source (render == edit mesh == picking).
+    renderdata::RenderData rd;
+    renderdata::buildObject(obj, rd);
+    g.bounds = rd.bounds;
+
+    // Interleave pos+normal for the fill pass.
     std::vector<FillVertex> verts;
-    std::vector<GLuint> indices;
-    std::vector<LineVertex> wire;
-
-    const size_t faceGuess = obj.mesh.aliveFaceCount();
-    verts.reserve(faceGuess * 4);
-    indices.reserve(faceGuess * 6);
-    wire.reserve(obj.mesh.aliveEdgeCount() * 2);
-
-    for (const ElemId f : obj.mesh.aliveFaceIds()) {
-        const std::vector<ElemId> loop = obj.mesh.faceVertices(f);
-        if (loop.size() < 3) continue;
-        const GLuint base = static_cast<GLuint>(verts.size());
-        const Vec3 n = obj.mesh.faceNormal(f);
-        for (const ElemId v : loop) {
-            const Vec3& p = obj.mesh.vrt(v).pos;
-            verts.push_back({p.x, p.y, p.z, n.x, n.y, n.z});
-        }
-        std::vector<GLuint> local;
-        local.reserve((loop.size() - 2) * 3);
-        triangulateFan(loop, local);
-        for (const GLuint idx : local) indices.push_back(base + idx);
+    verts.reserve(rd.fillVertexCount);
+    for (size_t i = 0; i < rd.fillVertexCount; ++i) {
+        verts.push_back({rd.fillPos[i * 3 + 0], rd.fillPos[i * 3 + 1],
+                         rd.fillPos[i * 3 + 2], rd.fillNrm[i * 3 + 0],
+                         rd.fillNrm[i * 3 + 1], rd.fillNrm[i * 3 + 2]});
     }
-    for (const auto& e : obj.mesh.edges()) {
-        if (!e.alive) continue;
-        const ElemId h = e.he;
-        const Vec3& a = obj.mesh.vrt(obj.mesh.heg(h).origin).pos;
-        const Vec3& b = obj.mesh.vrt(obj.mesh.heg(obj.mesh.heg(h).twin).origin).pos;
-        wire.push_back({a.x, a.y, a.z, 0.08f, 0.09f, 0.11f, 0.9f});
-        wire.push_back({b.x, b.y, b.z, 0.08f, 0.09f, 0.11f, 0.9f});
-    }
-    g.bounds = obj.mesh.computeBounds();
 
     // Fill buffers.
     glGenVertexArrays(1, &g.vao);
@@ -330,8 +348,8 @@ void Renderer::buildObjectGeometry(ObjectGpu& g, const SceneObject& obj) {
                  verts.data(), GL_STATIC_DRAW);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g.ebo);
     glBufferData(GL_ELEMENT_ARRAY_BUFFER,
-                 static_cast<GLsizeiptr>(indices.size() * sizeof(GLuint)),
-                 indices.data(), GL_STATIC_DRAW);
+                 static_cast<GLsizeiptr>(rd.fillIdx.size() * sizeof(uint32_t)),
+                 rd.fillIdx.data(), GL_STATIC_DRAW);
     const GLsizei stride = sizeof(FillVertex);
     glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, stride, reinterpret_cast<void*>(0));
     glEnableVertexAttribArray(0);
@@ -339,9 +357,15 @@ void Renderer::buildObjectGeometry(ObjectGpu& g, const SceneObject& obj) {
                           reinterpret_cast<void*>(3 * sizeof(float)));
     glEnableVertexAttribArray(1);
     glBindVertexArray(0);
-    g.indexCount = static_cast<GLsizei>(indices.size());
+    g.indexCount = static_cast<GLsizei>(rd.fillIdx.size());
 
     // Wireframe.
+    std::vector<LineVertex> wire;
+    wire.reserve(rd.wirePos.size() / 3);
+    for (size_t i = 0; i + 2 < rd.wirePos.size(); i += 3) {
+        wire.push_back({rd.wirePos[i], rd.wirePos[i + 1], rd.wirePos[i + 2],
+                        0.08f, 0.09f, 0.11f, 0.9f});
+    }
     glGenVertexArrays(1, &g.wireVao);
     glGenBuffers(1, &g.wireVbo);
     glBindVertexArray(g.wireVao);
@@ -358,27 +382,37 @@ void Renderer::buildObjectGeometry(ObjectGpu& g, const SceneObject& obj) {
     glBindVertexArray(0);
     g.wireCount = static_cast<GLsizei>(wire.size());
 
-    // Vertex points (true mesh vertices).
-    std::vector<float> pts;
-    pts.reserve(obj.mesh.aliveVertexCount() * 3);
-    for (const auto& v : obj.mesh.vertices()) {
-        if (!v.alive) continue;
-        pts.push_back(v.pos.x);
-        pts.push_back(v.pos.y);
-        pts.push_back(v.pos.z);
-    }
+    // Vertex points (true editable vertices).
     glGenVertexArrays(1, &g.ptVao);
     glGenBuffers(1, &g.ptVbo);
     glBindVertexArray(g.ptVao);
     glBindBuffer(GL_ARRAY_BUFFER, g.ptVbo);
     glBufferData(GL_ARRAY_BUFFER,
-                 static_cast<GLsizeiptr>(pts.size() * sizeof(float)),
-                 pts.data(), GL_STATIC_DRAW);
+                 static_cast<GLsizeiptr>(rd.pointPos.size() * sizeof(float)),
+                 rd.pointPos.data(), GL_STATIC_DRAW);
     glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float),
                           reinterpret_cast<void*>(0));
     glEnableVertexAttribArray(0);
     glBindVertexArray(0);
-    g.ptCount = static_cast<GLsizei>(pts.size() / 3);
+    g.ptCount = static_cast<GLsizei>(rd.pointPos.size() / 3);
+
+    // Object-mode outline, cached in local space.
+    std::vector<LineVertex> box = boxEdgesLines(rd.bounds);
+    glGenVertexArrays(1, &g.boxVao);
+    glGenBuffers(1, &g.boxVbo);
+    glBindVertexArray(g.boxVao);
+    glBindBuffer(GL_ARRAY_BUFFER, g.boxVbo);
+    glBufferData(GL_ARRAY_BUFFER,
+                 static_cast<GLsizeiptr>(box.size() * sizeof(LineVertex)),
+                 box.data(), GL_STATIC_DRAW);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(LineVertex),
+                          reinterpret_cast<void*>(0));
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, sizeof(LineVertex),
+                          reinterpret_cast<void*>(3 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+    glBindVertexArray(0);
+    g.boxCount = static_cast<GLsizei>(box.size());
 }
 
 void Renderer::buildSelectionOverlays(ObjectGpu& g, const SceneObject& obj) {
@@ -394,26 +428,16 @@ void Renderer::buildSelectionOverlays(ObjectGpu& g, const SceneObject& obj) {
     g.selPtVao = g.selPtVbo = 0;
     g.selFaceIndexCount = g.selEdgeCount = g.selPtCount = 0;
 
-    // Faces: duplicated flat vertices per selected face.
-    std::vector<FillVertex> fv;
-    std::vector<GLuint> fi;
-    for (const ElemId f : obj.sel.faces) {
-        if (!obj.mesh.faceAlive(f)) continue;
-        const std::vector<ElemId> loop = obj.mesh.faceVertices(f);
-        if (loop.size() < 3) continue;
-        const GLuint base = static_cast<GLuint>(fv.size());
-        const Vec3 n = obj.mesh.faceNormal(f);
-        for (const ElemId v : loop) {
-            const Vec3& p = obj.mesh.vrt(v).pos;
-            fv.push_back({p.x, p.y, p.z, n.x, n.y, n.z});
-        }
-        std::vector<GLuint> local;
-        local.reserve((loop.size() - 2) * 3);
-        triangulateFan(loop, local);
-        for (const GLuint idx : local) fi.push_back(base + idx);
-    }
+    renderdata::SelectionData sd;
+    renderdata::buildSelection(obj, sd);
 
-    if (!fi.empty()) {
+    if (!sd.faceIdx.empty()) {
+        std::vector<FillVertex> fv;
+        fv.reserve(sd.facePos.size() / 3);
+        for (size_t i = 0; i + 2 < sd.facePos.size(); i += 3) {
+            fv.push_back({sd.facePos[i], sd.facePos[i + 1], sd.facePos[i + 2],
+                          sd.faceNrm[i], sd.faceNrm[i + 1], sd.faceNrm[i + 2]});
+        }
         glGenVertexArrays(1, &g.selFaceVao);
         glGenBuffers(1, &g.selFaceVbo);
         glGenBuffers(1, &g.selFaceEbo);
@@ -424,8 +448,8 @@ void Renderer::buildSelectionOverlays(ObjectGpu& g, const SceneObject& obj) {
                      fv.data(), GL_STATIC_DRAW);
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g.selFaceEbo);
         glBufferData(GL_ELEMENT_ARRAY_BUFFER,
-                     static_cast<GLsizeiptr>(fi.size() * sizeof(GLuint)),
-                     fi.data(), GL_STATIC_DRAW);
+                     static_cast<GLsizeiptr>(sd.faceIdx.size() * sizeof(uint32_t)),
+                     sd.faceIdx.data(), GL_STATIC_DRAW);
         const GLsizei stride = sizeof(FillVertex);
         glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, stride,
                               reinterpret_cast<void*>(0));
@@ -434,31 +458,16 @@ void Renderer::buildSelectionOverlays(ObjectGpu& g, const SceneObject& obj) {
                               reinterpret_cast<void*>(3 * sizeof(float)));
         glEnableVertexAttribArray(1);
         glBindVertexArray(0);
-        g.selFaceIndexCount = static_cast<GLsizei>(fi.size());
+        g.selFaceIndexCount = static_cast<GLsizei>(sd.faceIdx.size());
     }
 
-    // Edges.
-    std::vector<LineVertex> el;
-    for (const ElemId e : obj.sel.edges) {
-        if (!obj.mesh.edgeAlive(e)) continue;
-        const ElemId h = obj.mesh.edg(e).he;
-        const Vec3& a = obj.mesh.vrt(obj.mesh.heg(h).origin).pos;
-        const Vec3& b = obj.mesh.vrt(obj.mesh.heg(obj.mesh.heg(h).twin).origin).pos;
-        el.push_back({a.x, a.y, a.z, 1.0f, 0.72f, 0.20f, 1.0f});
-        el.push_back({b.x, b.y, b.z, 1.0f, 0.72f, 0.20f, 1.0f});
-    }
-    // Face-selection boundary edges (so selected faces read clearly).
-    for (const ElemId f : obj.sel.faces) {
-        if (!obj.mesh.faceAlive(f)) continue;
-        for (const ElemId e : obj.mesh.faceEdges(f)) {
-            const ElemId h = obj.mesh.edg(e).he;
-            const Vec3& a = obj.mesh.vrt(obj.mesh.heg(h).origin).pos;
-            const Vec3& b = obj.mesh.vrt(obj.mesh.heg(obj.mesh.heg(h).twin).origin).pos;
-            el.push_back({a.x, a.y, a.z, 1.0f, 0.72f, 0.20f, 1.0f});
-            el.push_back({b.x, b.y, b.z, 1.0f, 0.72f, 0.20f, 1.0f});
+    if (!sd.edgePos.empty()) {
+        std::vector<LineVertex> el;
+        el.reserve(sd.edgePos.size() / 3);
+        for (size_t i = 0; i + 2 < sd.edgePos.size(); i += 3) {
+            el.push_back({sd.edgePos[i], sd.edgePos[i + 1], sd.edgePos[i + 2],
+                          1.0f, 0.72f, 0.20f, 1.0f});
         }
-    }
-    if (!el.empty()) {
         glGenVertexArrays(1, &g.selEdgeVao);
         glGenBuffers(1, &g.selEdgeVbo);
         glBindVertexArray(g.selEdgeVao);
@@ -476,28 +485,19 @@ void Renderer::buildSelectionOverlays(ObjectGpu& g, const SceneObject& obj) {
         g.selEdgeCount = static_cast<GLsizei>(el.size());
     }
 
-    // Selected vertices.
-    std::vector<float> pv;
-    for (const ElemId v : obj.sel.verts) {
-        if (!obj.mesh.vertexAlive(v)) continue;
-        const Vec3& p = obj.mesh.vrt(v).pos;
-        pv.push_back(p.x);
-        pv.push_back(p.y);
-        pv.push_back(p.z);
-    }
-    if (!pv.empty()) {
+    if (!sd.vertPos.empty()) {
         glGenVertexArrays(1, &g.selPtVao);
         glGenBuffers(1, &g.selPtVbo);
         glBindVertexArray(g.selPtVao);
         glBindBuffer(GL_ARRAY_BUFFER, g.selPtVbo);
         glBufferData(GL_ARRAY_BUFFER,
-                     static_cast<GLsizeiptr>(pv.size() * sizeof(float)),
-                     pv.data(), GL_STATIC_DRAW);
+                     static_cast<GLsizeiptr>(sd.vertPos.size() * sizeof(float)),
+                     sd.vertPos.data(), GL_STATIC_DRAW);
         glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float),
                               reinterpret_cast<void*>(0));
         glEnableVertexAttribArray(0);
         glBindVertexArray(0);
-        g.selPtCount = static_cast<GLsizei>(pv.size() / 3);
+        g.selPtCount = static_cast<GLsizei>(sd.vertPos.size() / 3);
     }
 }
 
@@ -522,7 +522,7 @@ void Renderer::resize(int width, int height) {
 }
 
 void Renderer::render(const OrbitCamera& camera, const Scene& scene,
-                      float pointRadiusPx) {
+                      float pointRadiusPx, GizmoTool gizmoTool) {
     if (fillProgram_ == 0 || lineProgram_ == 0 || pointProgram_ == 0) {
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
         return;
@@ -588,13 +588,17 @@ void Renderer::render(const OrbitCamera& camera, const Scene& scene,
                                nullptr);
                 glDisable(GL_POLYGON_OFFSET_FILL);
             }
-            // Selected edges + face-boundary highlight.
+            // Selected edges + face-boundary highlight — drawn with depth
+            // test OFF: selected elements always read on top (standard
+            // modeling-app behaviour; kills z-fighting entirely).
             if (g.selEdgeCount > 0) {
+                glDisable(GL_DEPTH_TEST);
                 glUseProgram(lineProgram_);
                 glUniformMatrix4fv(lineMvpLoc_, 1, GL_FALSE, mvp.m);
                 glUniform1f(lineUseOverrideLoc_, 0.0f);
                 glBindVertexArray(g.selEdgeVao);
                 glDrawArrays(GL_LINES, 0, g.selEdgeCount);
+                glEnable(GL_DEPTH_TEST);
             }
             // All vertices as small points; selected vertices bigger/amber.
             if (g.ptCount > 0) {
@@ -606,70 +610,276 @@ void Renderer::render(const OrbitCamera& camera, const Scene& scene,
                 glDrawArrays(GL_POINTS, 0, g.ptCount);
             }
             if (g.selPtCount > 0) {
+                glDisable(GL_DEPTH_TEST);
                 glUseProgram(pointProgram_);
                 glUniformMatrix4fv(pointMvpLoc_, 1, GL_FALSE, mvp.m);
                 glUniform4f(pointColorLoc_, 1.0f, 0.72f, 0.20f, 1.0f);
                 glUniform1f(pointSizeLoc_, pointRadiusPx);
                 glBindVertexArray(g.selPtVao);
                 glDrawArrays(GL_POINTS, 0, g.selPtCount);
+                glEnable(GL_DEPTH_TEST);
             }
         } else if (active) {
-            // Object mode: amber box outline around the active object.
-            std::vector<LineVertex> box = boxEdgesLines(g.bounds);
-            for (LineVertex& lv : box) {
-                lv.x += obj.position.x;
-                lv.y += obj.position.y;
-                lv.z += obj.position.z;
-                lv.r = 1.0f;
-                lv.g = 0.72f;
-                lv.b = 0.20f;
-                lv.a = 1.0f;
-            }
-            GLuint vao, vbo;
-            glGenVertexArrays(1, &vao);
-            glGenBuffers(1, &vbo);
-            glBindVertexArray(vao);
-            glBindBuffer(GL_ARRAY_BUFFER, vbo);
-            glBufferData(GL_ARRAY_BUFFER,
-                         static_cast<GLsizeiptr>(box.size() * sizeof(LineVertex)),
-                         box.data(), GL_DYNAMIC_DRAW);
-            glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(LineVertex),
-                                  reinterpret_cast<void*>(0));
-            glEnableVertexAttribArray(0);
-            glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, sizeof(LineVertex),
-                                  reinterpret_cast<void*>(3 * sizeof(float)));
-            glEnableVertexAttribArray(1);
+            // Object mode: cached amber box outline (no per-frame allocation).
             glUseProgram(lineProgram_);
-            glUniformMatrix4fv(lineMvpLoc_, 1, GL_FALSE, vp.m);
+            glUniformMatrix4fv(lineMvpLoc_, 1, GL_FALSE, mvp.m);
             glUniform1f(lineUseOverrideLoc_, 0.0f);
-            glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(box.size()));
-            glBindVertexArray(0);
-            glDeleteBuffers(1, &vbo);
-            glDeleteVertexArrays(1, &vao);
+            glBindVertexArray(g.boxVao);
+            glDrawArrays(GL_LINES, 0, g.boxCount);
         }
     }
     glBindVertexArray(0);
+
+    // Gizmo overlay (edit mode, active object) — always readable on top.
+    if (scene.editMode) {
+        drawGizmo(scene, vp, gizmoTool);
+    }
 }
 
-Vec3 Renderer::projectToScreen(const Vec3& world) const {
+// ------------------------------------------------------------------ gizmo --
+
+bool Renderer::projectToScreenPx(const Vec3& world, float& sx, float& sy) const {
     const Mat4 vp = proj_ * view_;
     const float cx = vp.m[0] * world.x + vp.m[4] * world.y + vp.m[8] * world.z + vp.m[12];
     const float cy = vp.m[1] * world.x + vp.m[5] * world.y + vp.m[9] * world.z + vp.m[13];
     const float cw = vp.m[3] * world.x + vp.m[7] * world.y + vp.m[11] * world.z + vp.m[15];
+    if (cw <= 1e-6f) return false; // behind the camera
     const float ndcX = cx / cw;
     const float ndcY = cy / cw;
-    return Vec3{(ndcX * 0.5f + 0.5f) * static_cast<float>(width_),
-                (1.0f - (ndcY * 0.5f + 0.5f)) * static_cast<float>(height_), 0.0f};
-}
-
-bool Renderer::screenSpaceDistance(const Vec3& world, float xPx, float yPx,
-                                   float& distOut) const {
-    const Vec3 s = projectToScreen(world);
-    const float dx = s.x - xPx;
-    const float dy = s.y - yPx;
-    distOut = std::sqrt(dx * dx + dy * dy);
+    sx = (ndcX * 0.5f + 0.5f) * static_cast<float>(width_);
+    sy = (1.0f - (ndcY * 0.5f + 0.5f)) * static_cast<float>(height_);
     return true;
 }
+
+namespace {
+
+// Selection pivot in WORLD space: centroid of the selected elements, or of
+// the whole object when the selection is empty (gizmo transforms the whole
+// object then — the edit mode is never "locked").
+Vec3 gizmoPivot(const Scene& scene, int& objIndexOut) {
+    objIndexOut = scene.active;
+    const SceneObject* obj = scene.activeObject();
+    if (!obj || obj->mesh.empty()) return Vec3{};
+    Vec3 acc{};
+    size_t count = 0;
+    for (const ElemId v : obj->sel.verts) {
+        if (!obj->mesh.vertexAlive(v)) continue;
+        acc = acc + obj->mesh.vrt(v).pos;
+        ++count;
+    }
+    for (const ElemId e : obj->sel.edges) {
+        if (!obj->mesh.edgeAlive(e)) continue;
+        const ElemId h = obj->mesh.edg(e).he;
+        acc = acc + obj->mesh.vrt(obj->mesh.heg(h).origin).pos;
+        acc = acc + obj->mesh.vrt(obj->mesh.heg(obj->mesh.heg(h).twin).origin).pos;
+        count += 2;
+    }
+    for (const ElemId f : obj->sel.faces) {
+        if (!obj->mesh.faceAlive(f)) continue;
+        for (const ElemId v : obj->mesh.faceVertices(f)) {
+            acc = acc + obj->mesh.vrt(v).pos;
+            ++count;
+        }
+    }
+    if (count == 0) {
+        for (const auto& v : obj->mesh.vertices()) {
+            if (!v.alive) continue;
+            acc = acc + v.pos;
+            ++count;
+        }
+    }
+    if (count == 0) return Vec3{};
+    const Vec3 local = acc * (1.0f / static_cast<float>(count));
+    return local + obj->position;
+}
+
+} // namespace
+
+void Renderer::drawGizmo(const Scene& scene, const Mat4& vp, GizmoTool tool) {
+    int objIndex = -1;
+    const Vec3 pivot = gizmoPivot(scene, objIndex);
+    if (objIndex < 0) return;
+
+    const Vec3 toPivot = pivot - eye_;
+    const float distPivot = std::max(length(toPivot), 0.5f);
+    const float wpp = 2.0f * distPivot *
+                      std::tan(cam_.fovYDeg * static_cast<float>(M_PI) / 180.0f * 0.5f) /
+                      static_cast<float>(std::max(height_, 1));
+    const float axisLen = wpp * kGizmoArrowPx;
+    const float ringR = wpp * kGizmoRingPx;
+
+    gizmoLineScratch_.clear();
+    gizmoPtScratch_.clear();
+
+    auto pushLine = [&](const Vec3& a, const Vec3& b, const float* c) {
+        gizmoLineScratch_.push_back({a.x, a.y, a.z, c[0], c[1], c[2], 1.0f});
+        gizmoLineScratch_.push_back({b.x, b.y, b.z, c[0], c[1], c[2], 1.0f});
+    };
+
+    const Vec3 axes[3] = {Vec3{1, 0, 0}, Vec3{0, 1, 0}, Vec3{0, 0, 1}};
+    Vec3 tips[3] = {pivot, pivot, pivot};
+
+    if (tool == GizmoTool::Move) {
+        for (int a = 0; a < 3; ++a) {
+            tips[a] = pivot + axes[a] * axisLen;
+            pushLine(pivot, tips[a], kAxisColor[a]);
+        }
+    } else if (tool == GizmoTool::Rotate) {
+        for (int a = 0; a < 3; ++a) {
+            const Vec3 helper = (std::fabs(axes[a].y) < 0.9f) ? Vec3{0, 1, 0}
+                                                              : Vec3{1, 0, 0};
+            const Vec3 u = normalize(cross(axes[a], helper));
+            const Vec3 v = normalize(cross(axes[a], u));
+            constexpr int kSegs = 48;
+            Vec3 prev = pivot + (u * (ringR * std::cos(0.0f)) + v * (ringR * std::sin(0.0f)));
+            for (int s = 1; s <= kSegs; ++s) {
+                const float ang = static_cast<float>(M_PI) * 2.0f * static_cast<float>(s) /
+                                  static_cast<float>(kSegs);
+                const Vec3 cur = pivot + (u * (ringR * std::cos(ang)) + v * (ringR * std::sin(ang)));
+                pushLine(prev, cur, kAxisColor[a]);
+                prev = cur;
+            }
+        }
+    } else { // Scale
+        for (int a = 0; a < 3; ++a) {
+            tips[a] = pivot + axes[a] * (axisLen * 0.85f);
+            pushLine(pivot, tips[a], kAxisColor[a]);
+        }
+    }
+
+    // Draw lines (depth test off — the gizmo always reads on top).
+    if (!gizmoLineScratch_.empty()) {
+        glDisable(GL_DEPTH_TEST);
+        glBindVertexArray(gizmoLineVao_);
+        glBindBuffer(GL_ARRAY_BUFFER, gizmoLineVbo_);
+        glBufferData(GL_ARRAY_BUFFER,
+                     static_cast<GLsizeiptr>(gizmoLineScratch_.size() * sizeof(LineVertex)),
+                     gizmoLineScratch_.data(), GL_DYNAMIC_DRAW);
+        glUseProgram(lineProgram_);
+        glUniformMatrix4fv(lineMvpLoc_, 1, GL_FALSE, vp.m);
+        glUniform1f(lineUseOverrideLoc_, 0.0f);
+        glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(gizmoLineScratch_.size()));
+        glBindVertexArray(0);
+        glEnable(GL_DEPTH_TEST);
+    }
+
+    // Handle dots: one per axis tip (axis color) — readable touch targets.
+    if (tool != GizmoTool::Rotate) {
+        glDisable(GL_DEPTH_TEST);
+        glBindVertexArray(gizmoPtVao_);
+        glBindBuffer(GL_ARRAY_BUFFER, gizmoPtVbo_);
+        glUseProgram(pointProgram_);
+        glUniformMatrix4fv(pointMvpLoc_, 1, GL_FALSE, vp.m);
+        glUniform1f(pointSizeLoc_, 12.0f);
+        for (int a = 0; a < 3; ++a) {
+            gizmoPtScratch_.clear();
+            gizmoPtScratch_.push_back(tips[a].x);
+            gizmoPtScratch_.push_back(tips[a].y);
+            gizmoPtScratch_.push_back(tips[a].z);
+            glBufferData(GL_ARRAY_BUFFER,
+                         static_cast<GLsizeiptr>(3 * sizeof(float)),
+                         gizmoPtScratch_.data(), GL_DYNAMIC_DRAW);
+            glUniform4f(pointColorLoc_, kAxisColor[a][0], kAxisColor[a][1],
+                        kAxisColor[a][2], 1.0f);
+            glDrawArrays(GL_POINTS, 0, 1);
+        }
+        if (tool == GizmoTool::Scale) {
+            // Uniform-scale center handle (white dot).
+            gizmoPtScratch_.clear();
+            gizmoPtScratch_.push_back(pivot.x);
+            gizmoPtScratch_.push_back(pivot.y);
+            gizmoPtScratch_.push_back(pivot.z);
+            glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(3 * sizeof(float)),
+                         gizmoPtScratch_.data(), GL_DYNAMIC_DRAW);
+            glUniform4f(pointColorLoc_, 1.0f, 1.0f, 1.0f, 1.0f);
+            glUniform1f(pointSizeLoc_, 10.0f);
+            glDrawArrays(GL_POINTS, 0, 1);
+        }
+        glBindVertexArray(0);
+        glEnable(GL_DEPTH_TEST);
+    }
+}
+
+Renderer::GizmoHit Renderer::gizmoHitAt(float xPx, float yPx, const Scene& scene,
+                                        GizmoTool tool) const {
+    GizmoHit out;
+    int objIndex = -1;
+    const Vec3 pivot = gizmoPivot(scene, objIndex);
+    if (objIndex < 0) return out;
+
+    float psx = 0.0f, psy = 0.0f;
+    if (!projectToScreenPx(pivot, psx, psy)) return out;
+
+    const Vec3 toPivot = pivot - eye_;
+    const float distPivot = std::max(length(toPivot), 0.5f);
+    const float wpp = 2.0f * distPivot *
+                      std::tan(cam_.fovYDeg * static_cast<float>(M_PI) / 180.0f * 0.5f) /
+                      static_cast<float>(std::max(height_, 1));
+    const float axisLen = wpp * kGizmoArrowPx;
+    const float ringR = wpp * kGizmoRingPx;
+
+    const Vec3 axes[3] = {Vec3{1, 0, 0}, Vec3{0, 1, 0}, Vec3{0, 0, 1}};
+    float best = std::numeric_limits<float>::max();
+
+    auto consider = [&](float sx, float sy, int handle, int axis, int kind) {
+        const float dx = sx - xPx;
+        const float dy = sy - yPx;
+        const float d = std::sqrt(dx * dx + dy * dy);
+        if (d < best) {
+            best = d;
+            out.hit = true;
+            out.handle = handle;
+            out.axis = axis;
+            out.kind = kind;
+        }
+    };
+
+    if (tool == GizmoTool::Move || tool == GizmoTool::Scale) {
+        for (int a = 0; a < 3; ++a) {
+            const float scaleF = (tool == GizmoTool::Scale) ? 0.85f : 1.0f;
+            const Vec3 tip = pivot + axes[a] * (axisLen * scaleF);
+            float sx = 0.0f, sy = 0.0f;
+            if (!projectToScreenPx(tip, sx, sy)) continue;
+            const float dx = sx - xPx, dy = sy - yPx;
+            if (std::sqrt(dx * dx + dy * dy) <= kGizmoTipRadiusPx) {
+                consider(sx, sy, a + 1, a, 1);
+            }
+        }
+        if (tool == GizmoTool::Scale) {
+            const float dx = psx - xPx, dy = psy - yPx;
+            if (std::sqrt(dx * dx + dy * dy) <= kGizmoCenterRadiusPx) {
+                consider(psx, psy, 4, 3, 3);
+            }
+        }
+    } else { // Rotate rings: sample each ring, min screen distance wins.
+        for (int a = 0; a < 3; ++a) {
+            const Vec3 helper = (std::fabs(axes[a].y) < 0.9f) ? Vec3{0, 1, 0}
+                                                              : Vec3{1, 0, 0};
+            const Vec3 u = normalize(cross(axes[a], helper));
+            const Vec3 v = normalize(cross(axes[a], u));
+            constexpr int kSamples = 64;
+            for (int s = 0; s < kSamples; ++s) {
+                const float ang = static_cast<float>(M_PI) * 2.0f * static_cast<float>(s) /
+                                  static_cast<float>(kSamples);
+                const Vec3 p = pivot + (u * (ringR * std::cos(ang)) + v * (ringR * std::sin(ang)));
+                float sx = 0.0f, sy = 0.0f;
+                if (!projectToScreenPx(p, sx, sy)) continue;
+                const float dx = sx - xPx, dy = sy - yPx;
+                const float d = std::sqrt(dx * dx + dy * dy);
+                if (d <= kGizmoRingRadiusPx && d < best) {
+                    best = d;
+                    out.hit = true;
+                    out.handle = 11 + a;
+                    out.axis = a;
+                    out.kind = 2;
+                }
+            }
+        }
+    }
+    return out;
+}
+
+// ----------------------------------------------------------------- picking --
 
 Renderer::PickHit Renderer::pickAtPixel(float xPx, float yPx, const Scene& scene,
                                         float snapRadiusPx) const {
@@ -683,29 +893,29 @@ Renderer::PickHit Renderer::pickAtPixel(float xPx, float yPx, const Scene& scene
                                cam_.right() * (ndcX * tanHalf * aspect_) +
                                cam_.up() * (ndcY * tanHalf));
 
-    // 1) Nearest face hit across all objects (occlusion-respecting).
+    // 1) Nearest face hit across all objects — SAME triangulation the
+    //    renderer draws (renderdata::faceTriangles), so what you tap is what
+    //    you see (single geometric source).
     float bestT = std::numeric_limits<float>::max();
     int bestObj = -1;
     ElemId bestFace = kNull;
-    std::vector<ElemId> bestLoop;
     for (size_t i = 0; i < scene.objects.size(); ++i) {
         const SceneObject& obj = scene.objects[i];
         if (obj.mesh.empty()) continue;
         const Vec3 local = Vec3{eye_.x - obj.position.x, eye_.y - obj.position.y,
                                 eye_.z - obj.position.z};
         for (const ElemId f : obj.mesh.aliveFaceIds()) {
-            const std::vector<ElemId> loop = obj.mesh.faceVertices(f);
-            if (loop.size() < 3) continue;
-            const Vec3& v0 = obj.mesh.vrt(loop[0]).pos;
-            for (size_t k = 1; k + 1 < loop.size(); ++k) {
-                const float t = rayTriangle(local, dir, v0,
-                                            obj.mesh.vrt(loop[k]).pos,
-                                            obj.mesh.vrt(loop[k + 1]).pos);
+            std::vector<ElemId> tris;
+            renderdata::faceTriangles(obj.mesh, f, tris);
+            for (size_t k = 0; k + 2 < tris.size(); k += 3) {
+                const float t = rayTriangle(local, dir,
+                                            obj.mesh.vrt(tris[k + 0]).pos,
+                                            obj.mesh.vrt(tris[k + 1]).pos,
+                                            obj.mesh.vrt(tris[k + 2]).pos);
                 if (t > 0.0f && t < bestT) {
                     bestT = t;
                     bestObj = static_cast<int>(i);
                     bestFace = f;
-                    bestLoop = loop;
                 }
             }
         }
@@ -714,51 +924,75 @@ Renderer::PickHit Renderer::pickAtPixel(float xPx, float yPx, const Scene& scene
 
     const SceneObject& obj = scene.objects[static_cast<size_t>(bestObj)];
 
-    // 2) Vertex/edge snapping around the hit, depth-checked (occlusion).
+    // 2) Vertex/edge snapping across ALL alive elements of the object (fix:
+    //    previously only the hit face's vertices/midpoints were considered),
+    //    depth-checked against the visible surface (occlusion).
     if (scene.editMode) {
-        float bestScreen = snapRadiusPx;
-        ElemId bestElem = kNull;
-        int bestKind = 0;
-        if (scene.selectionMode == SelMode::Vertex) {
-            for (const ElemId cand : bestLoop) {
-                const Vec3 w = obj.mesh.vrt(cand).pos + obj.position;
-                float d;
-                if (!screenSpaceDistance(w, xPx, yPx, d)) continue;
-                const Vec3 rel = w - eye_;
-                const float depth = dot(rel, dir);
-                if (depth > bestT + 0.25f) continue; // hidden behind surface
-                if (d < bestScreen) {
-                    bestScreen = d;
-                    bestElem = cand;
-                    bestKind = 1;
-                }
-            }
-        } else if (scene.selectionMode == SelMode::Edge) {
-            for (const ElemId e : obj.mesh.faceEdges(bestFace)) {
-                const ElemId h = obj.mesh.edg(e).he;
-                const Vec3 a = obj.mesh.vrt(obj.mesh.heg(h).origin).pos + obj.position;
-                const Vec3 b = obj.mesh.vrt(obj.mesh.heg(obj.mesh.heg(h).twin).origin).pos +
-                               obj.position;
-                const Vec3 mid = (a + b) * 0.5f;
-                float d;
-                if (!screenSpaceDistance(mid, xPx, yPx, d)) continue;
-                const Vec3 rel = mid - eye_;
-                const float depth = dot(rel, dir);
-                if (depth > bestT + 0.25f) continue;
-                if (d < bestScreen) {
-                    bestScreen = d;
-                    bestElem = e;
-                    bestKind = 2;
-                }
-            }
+        auto depthAlong = [&](const Vec3& world) {
+            return dot(world - eye_, dir);
+        };
+
+        // Vertices first (priority).
+        float bestScreenV = snapRadiusPx;
+        ElemId bestVert = kNull;
+        for (const auto& v : obj.mesh.vertices()) {
+            if (!v.alive) continue;
+            const Vec3 w = v.pos + obj.position;
+            float sx = 0.0f, sy = 0.0f;
+            if (!projectToScreenPx(w, sx, sy)) continue;
+            const float dx = sx - xPx, dy = sy - yPx;
+            const float d = std::sqrt(dx * dx + dy * dy);
+            if (d >= bestScreenV) continue;
+            if (depthAlong(w) > bestT + kMaxPickDepthSlack) continue;
+            bestScreenV = d;
+            bestVert = v.id;
         }
-        if (bestKind != 0) {
+        if (bestVert != kNull) {
             out.hit = true;
-            out.kind = bestKind;
+            out.kind = 1;
             out.objectIndex = bestObj;
-            out.elemId = bestElem;
+            out.elemId = bestVert;
             return out;
         }
+
+        // Edges: closest point ON THE SEGMENT in screen space (fix: the old
+        // code only tested the midpoint, so tapping near an edge end missed).
+        float bestScreenE = snapRadiusPx;
+        ElemId bestEdge = kNull;
+        for (const auto& e : obj.mesh.edges()) {
+            if (!e.alive) continue;
+            const ElemId h = e.he;
+            const Vec3 a = obj.mesh.vrt(obj.mesh.heg(h).origin).pos + obj.position;
+            const Vec3 b = obj.mesh.vrt(obj.mesh.heg(obj.mesh.heg(h).twin).origin).pos +
+                           obj.position;
+            float ax = 0.0f, ay = 0.0f, bx = 0.0f, by = 0.0f;
+            if (!projectToScreenPx(a, ax, ay)) continue;
+            if (!projectToScreenPx(b, bx, by)) continue;
+            const float ex = bx - ax, ey = by - ay;
+            const float len2 = ex * ex + ey * ey;
+            float t = 0.0f;
+            if (len2 > 1e-9f) {
+                t = ((xPx - ax) * ex + (yPx - ay) * ey) / len2;
+                t = std::clamp(t, 0.0f, 1.0f);
+            }
+            const float cxp = ax + ex * t;
+            const float cyp = ay + ey * t;
+            const float dx = cxp - xPx, dy = cyp - yPx;
+            const float d = std::sqrt(dx * dx + dy * dy);
+            if (d >= bestScreenE) continue;
+            const Vec3 world = a + (b - a) * t;
+            if (depthAlong(world) > bestT + kMaxPickDepthSlack) continue;
+            bestScreenE = d;
+            bestEdge = e.id;
+        }
+        if (bestEdge != kNull) {
+            out.hit = true;
+            out.kind = 2;
+            out.objectIndex = bestObj;
+            out.elemId = bestEdge;
+            return out;
+        }
+
         out.hit = true;
         out.kind = 3; // face
         out.objectIndex = bestObj;

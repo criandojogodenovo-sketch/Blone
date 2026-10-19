@@ -16,10 +16,12 @@ add_executable(blone_tests
         test_ops.cpp
         test_transforms.cpp
         test_history_project.cpp
+        test_render_gizmo.cpp
         ${CPP_DIR}/core/mesh/HalfEdgeMesh.cpp
         ${CPP_DIR}/core/mesh/Primitives.cpp
         ${CPP_DIR}/core/operations/Operations.cpp
         ${CPP_DIR}/core/history/History.cpp
+        ${CPP_DIR}/core/render/RenderData.cpp
         ${CPP_DIR}/core/scene/SceneOps.cpp
         ${CPP_DIR}/core/project/Project.cpp)
 

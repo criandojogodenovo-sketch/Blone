@@ -81,28 +81,51 @@ object NativeLib {
     external fun deleteActiveObject(): Int
     external fun loopCut(): Int
 
-    // Transform tool session (explicit Mover/Rodar/Escalar controls).
-    // tool: 1 move, 2 rotate, 3 scale.
-    external fun beginTool(
-        tool: Int,
+    // ---- gizmo (correção Fase 2) --------------------------------------------
+    /** Selects the gizmo tool shown in edit mode: 1 move, 2 rotate, 3 scale. */
+    external fun setGizmoTool(tool: Int)
+
+    /**
+     * CPU hit-test against the gizmo handles at the given pixel. Returns the
+     * handle: 0 none, 1..3 axis tips (X/Y/Z), 4 uniform-scale center,
+     * 11..13 rotation rings around X/Y/Z. Cheap (no GL work).
+     */
+    external fun gizmoHitTest(xPx: Float, yPx: Float): Int
+
+    /** Starts a gizmo drag on [handle]; returns 0 (OK) or -status. */
+    external fun beginGizmoDrag(
+        handle: Int,
+        xPx: Float,
+        yPx: Float,
         azimuthDeg: Float,
         elevationDeg: Float,
         distance: Float,
-        fovYDeg: Float,
+        tx: Float,
+        ty: Float,
+        tz: Float,
+        viewportWidthPx: Float,
         viewportHeightPx: Float,
     ): Int
 
-    external fun updateTool(
-        dxPx: Float,
-        dyPx: Float,
+    /** Continues the gizmo drag with the ABSOLUTE touch pixel position. */
+    external fun updateGizmoDrag(
+        xPx: Float,
+        yPx: Float,
         azimuthDeg: Float,
         elevationDeg: Float,
         distance: Float,
-        fovYDeg: Float,
+        tx: Float,
+        ty: Float,
+        tz: Float,
+        viewportWidthPx: Float,
         viewportHeightPx: Float,
     ): Int
 
-    external fun endTool(): Int
+    /** Ends the drag; commits the history entry when something moved. */
+    external fun endGizmoDrag(): Int
+
+    /** Cancels the drag (second finger landed — the camera takes over). */
+    external fun cancelGizmoDrag()
 
     // History.
     external fun canUndo(): Boolean

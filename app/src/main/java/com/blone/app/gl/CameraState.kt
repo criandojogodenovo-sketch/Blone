@@ -48,6 +48,10 @@ class CameraState(
     @Volatile
     var viewportHeight: Float = 1f
 
+    /** Current viewport width in pixels (gizmo projection mapping). */
+    @Volatile
+    var viewportWidth: Float = 1f
+
     fun orbit(dxPx: Float, dyPx: Float) {
         azimuthDeg -= dxPx * orbitDegreesPerPx
         elevationDeg += dyPx * orbitDegreesPerPx

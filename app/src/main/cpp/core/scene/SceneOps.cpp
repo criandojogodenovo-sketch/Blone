@@ -24,15 +24,6 @@ Selection::Set& setFor(SceneObject& obj, SelMode mode) {
     return obj.sel.faces;
 }
 
-const Selection::Set& setFor(const SceneObject& obj, SelMode mode) {
-    switch (mode) {
-        case SelMode::Vertex: return obj.sel.verts;
-        case SelMode::Edge: return obj.sel.edges;
-        case SelMode::Face: return obj.sel.faces;
-    }
-    return obj.sel.faces;
-}
-
 std::vector<ElemId> toVector(const Selection::Set& set) {
     return std::vector<ElemId>(set.begin(), set.end());
 }
@@ -271,24 +262,45 @@ Status loopCut(Scene& s, History& h) {
 
 // -------------------------------------------------------- transform tools --
 
-Status beginTool(Scene& s, History& h, ToolSession& t, Tool tool, const DragParams& p) {
+namespace {
+
+Vec3 axisUnit(int a) {
+    switch (a) {
+        case 0: return Vec3{1.0f, 0.0f, 0.0f};
+        case 1: return Vec3{0.0f, 1.0f, 0.0f};
+        default: return Vec3{0.0f, 0.0f, 1.0f};
+    }
+}
+
+} // namespace
+
+Status beginTool(Scene& s, History& h, ToolSession& t, Tool tool, int kind,
+                 int axis, float touchX, float touchY) {
     (void)h;
     if (t.active) cancelTool(s, h, t);
     SceneObject* obj = s.activeObject();
     if (!obj) return Status::ErrNoActiveObject;
     if (!s.editMode) return Status::ErrInvalidArg;
+    if (kind < 1 || kind > 3 || axis < 0 || axis > 3) return Status::ErrInvalidArg;
 
     // Deduplicated vertex set from the current selection.
     std::set<ElemId> verts;
     for (const ElemId v : obj->sel.verts) verts.insert(v);
     for (const ElemId e : obj->sel.edges) {
         if (!obj->mesh.edgeAlive(e)) continue;
-        const ElemId h = obj->mesh.edg(e).he;
-        verts.insert(obj->mesh.heg(h).origin);
-        verts.insert(obj->mesh.heg(obj->mesh.heg(h).twin).origin);
+        const ElemId he = obj->mesh.edg(e).he;
+        verts.insert(obj->mesh.heg(he).origin);
+        verts.insert(obj->mesh.heg(obj->mesh.heg(he).twin).origin);
     }
     for (const ElemId f : obj->sel.faces) {
         for (const ElemId v : obj->mesh.faceVertices(f)) verts.insert(v);
+    }
+    if (verts.empty()) {
+        // No selection: the WHOLE object is the transform target — the edit
+        // mode never locks up (touch a gizmo axis, the object moves).
+        for (const auto& v : obj->mesh.vertices()) {
+            if (v.alive) verts.insert(v.id);
+        }
     }
     if (verts.empty()) return Status::ErrNoSelection;
 
@@ -297,9 +309,16 @@ Status beginTool(Scene& s, History& h, ToolSession& t, Tool tool, const DragPara
     session.tool = tool;
     session.objIndex = s.active;
     session.verts.assign(verts.begin(), verts.end());
-    session.params = p;
-    session.accumDx = 0.0f;
-    session.accumDy = 0.0f;
+    session.kind = kind;
+    session.axis = axis;
+    session.beginTouchX = touchX;
+    session.beginTouchY = touchY;
+    session.lastTouchX = touchX;
+    session.lastTouchY = touchY;
+    session.lastTouchValid = true;
+    session.accumMove = Vec3{};
+    session.accumFactor = 1.0f;
+    session.accumDeg = 0.0f;
     Vec3 centroid{};
     for (const ElemId v : session.verts) centroid = centroid + obj->mesh.vrt(v).pos;
     session.pivot = centroid * (1.0f / static_cast<float>(session.verts.size()));
@@ -314,43 +333,77 @@ Status beginTool(Scene& s, History& h, ToolSession& t, Tool tool, const DragPara
     return Status::OK;
 }
 
-Status updateTool(Scene& s, ToolSession& t, const DragParams& p, float dxPx, float dyPx) {
+Status updateTool(Scene& s, ToolSession& t, const GizmoMapping& map,
+                  float touchX, float touchY) {
     if (!t.active) return Status::ErrInvalidArg;
     if (t.objIndex < 0 || t.objIndex >= static_cast<int>(s.objects.size())) {
         return Status::ErrNoActiveObject;
     }
+    if (!t.lastTouchValid) {
+        t.lastTouchX = touchX;
+        t.lastTouchY = touchY;
+        t.lastTouchValid = true;
+        return Status::OK;
+    }
     SceneObject& obj = s.objects[static_cast<size_t>(t.objIndex)];
-    t.accumDx += dxPx;
-    t.accumDy += dyPx;
-    t.params = p; // camera may move between events; deltas are cumulative
+    const float dx = touchX - t.lastTouchX;
+    const float dy = touchY - t.lastTouchY;
+    t.lastTouchX = touchX;
+    t.lastTouchY = touchY;
+    if (dx == 0.0f && dy == 0.0f) return Status::OK;
 
-    const Vec3 delta = ops::moveWorldDelta(t.params, t.accumDx, t.accumDy);
     switch (t.tool) {
         case Tool::Move: {
+            // Axis drag: absolute offset from the start positions.
+            const ops::AxisScreen as{map.axisDirX, map.axisDirY, map.pxPerWorld};
+            const float world = ops::dragAlongAxisWorld(as, dx, dy);
+            t.accumMove = t.accumMove + axisUnit(t.axis) * world;
             for (size_t i = 0; i < t.verts.size(); ++i) {
                 const ElemId v = t.verts[i];
-                if (obj.mesh.vertexAlive(v)) obj.mesh.vrt(v).pos = t.startPos[i] + delta;
+                if (obj.mesh.vertexAlive(v)) {
+                    obj.mesh.vrt(v).pos = t.startPos[i] + t.accumMove;
+                }
             }
             break;
         }
         case Tool::Rotate: {
-            const ops::DragRotation r = ops::rotationFromDrag(t.params, t.accumDx, t.accumDy);
+            // Ring drag: absolute accumulated rotation from the start pose.
+            const float sweep = ops::ringSweepDeg(t.lastTouchX - dx, t.lastTouchY - dy,
+                                                  touchX, touchY,
+                                                  map.pivotScreenX, map.pivotScreenY);
+            t.accumDeg += map.ringSign * sweep;
+            const Mat4 r = Mat4::rotationAxisDeg(axisUnit(t.axis), t.accumDeg);
             for (size_t i = 0; i < t.verts.size(); ++i) {
                 const ElemId v = t.verts[i];
                 if (!obj.mesh.vertexAlive(v)) continue;
-                Vec3 rel = t.startPos[i] - t.pivot;
-                rel = Mat4::rotationAxisDeg(r.axisRight, r.degRight).transformPoint(rel);
-                rel = Mat4::rotationAxisDeg(r.axisY, r.degY).transformPoint(rel);
-                obj.mesh.vrt(v).pos = t.pivot + rel;
+                const Vec3 rel = t.startPos[i] - t.pivot;
+                obj.mesh.vrt(v).pos = t.pivot + r.transformPoint(rel);
             }
             break;
         }
         case Tool::Scale: {
-            const float f = ops::scaleFromDrag(t.accumDy);
-            for (size_t i = 0; i < t.verts.size(); ++i) {
-                const ElemId v = t.verts[i];
-                if (obj.mesh.vertexAlive(v)) {
-                    obj.mesh.vrt(v).pos = t.pivot + (t.startPos[i] - t.pivot) * f;
+            if (t.kind == 3) { // center handle: uniform, absolute from begin
+                const float f = ops::scaleFromDrag(touchY - t.beginTouchY);
+                t.accumFactor = f;
+                for (size_t i = 0; i < t.verts.size(); ++i) {
+                    const ElemId v = t.verts[i];
+                    if (obj.mesh.vertexAlive(v)) {
+                        obj.mesh.vrt(v).pos =
+                                t.pivot + (t.startPos[i] - t.pivot) * t.accumFactor;
+                    }
+                }
+            } else { // axial scale (kind 1)
+                const ops::AxisScreen as{map.axisDirX, map.axisDirY, map.pxPerWorld};
+                const float f = ops::scaleAxisFromDrag(as, dx, dy);
+                t.accumFactor *= f;
+                const Vec3 axis = axisUnit(t.axis);
+                for (size_t i = 0; i < t.verts.size(); ++i) {
+                    const ElemId v = t.verts[i];
+                    if (!obj.mesh.vertexAlive(v)) continue;
+                    const Vec3 rel0 = t.startPos[i] - t.pivot;
+                    const float along = dot(rel0, axis);
+                    obj.mesh.vrt(v).pos =
+                            t.pivot + rel0 + axis * (along * (t.accumFactor - 1.0f));
                 }
             }
             break;
