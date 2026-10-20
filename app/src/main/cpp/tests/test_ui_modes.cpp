@@ -313,6 +313,92 @@ void testGizmoPivotRule() {
     CHECK(objIndex == -1);
 }
 
+// ---- Scale gizmo handles 21..23: axial scale session (bug fix) -------------
+// The renderer returns handle ids 21..23 for the Scale X/Y/Z axis tips (bug:
+// they used to be 1..3 like Move, and beginGizmoDrag rejected the drag with
+// ErrInvalidArg — "Gizmo: seleção inválida"). beginGizmoDrag maps 21..23 to
+// beginTool(Tool::Scale, kind=1, axis=0..2) — THIS session shape is the
+// host-testable contract pinned below: axial scale changes ONLY the grabbed
+// axis, keeps topology, and round-trips the history.
+void testAxialScaleGizmoSession() {
+    History h;
+    Scene s = oneCubeScene(h);
+    auto& mesh = s.objects[0].mesh;
+    s.editMode = false; // OBJECT mode: whole active object is the target
+    const auto pre = mesh.captureRaw();
+
+    // Handle 21 (Scale X) === Tool::Scale + kind 1 + axis 0.
+    sceneops::ToolSession t;
+    REQUIRE(sceneops::beginTool(s, h, t, sceneops::Tool::Scale, 1, 0,
+                                500.0f, 500.0f) == ops::Status::OK);
+    CHECK(t.tool == sceneops::Tool::Scale);
+    CHECK(t.kind == 1);
+    CHECK(t.axis == 0);
+
+    sceneops::GizmoMapping map; // axis X on screen: +x px, 100 px per world unit
+    map.axisDirX = 1.0f;
+    map.axisDirY = 0.0f;
+    map.pxPerWorld = 100.0f;
+    // Drag +150 px along the axis: scaleAxisFromDrag -> factor 2.0.
+    REQUIRE(sceneops::updateTool(s, t, map, 650.0f, 500.0f) == ops::Status::OK);
+    CHECK_NEAR(t.accumFactor, 2.0f, 1e-5f);
+    REQUIRE(sceneops::endTool(s, h, t) == ops::Status::OK);
+
+    // ONLY X doubled around the pivot; Y and Z are untouched; topology intact.
+    for (const auto& v : mesh.vertices()) {
+        if (!v.alive) continue;
+        CHECK_NEAR(v.pos.x, test::rawPos(pre, v.id).x * 2.0f, 1e-5f);
+        CHECK_NEAR(v.pos.y, test::rawPos(pre, v.id).y, 1e-6f);
+        CHECK_NEAR(v.pos.z, test::rawPos(pre, v.id).z, 1e-6f);
+    }
+    CHECK(mesh.aliveVertexCount() == 8);
+    CHECK(mesh.aliveFaceCount() == 6);
+    CHECK(mesh.validate());
+
+    // Undo restores the pre-drag mesh; redo re-applies the axial scale.
+    const auto scaled = mesh.captureRaw();
+    REQUIRE(sceneops::undo(s, h) == ops::Status::OK);
+    CHECK(test::sameMesh(mesh, test::meshFromRaw(pre)));
+    REQUIRE(sceneops::redo(s, h) == ops::Status::OK);
+    CHECK(test::sameMesh(mesh, test::meshFromRaw(scaled)));
+
+    // Handle 22 (Scale Y) uses axis 1: only Y changes (drag along the Y
+    // axis screen direction this time). Axial scale is applied AROUND THE
+    // SESSION PIVOT (the vertex centroid, y=1 for the default cube), not the
+    // world origin — the expectation below uses that pivot explicitly.
+    sceneops::ToolSession ty;
+    REQUIRE(sceneops::beginTool(s, h, ty, sceneops::Tool::Scale, 1, 1,
+                                500.0f, 500.0f) == ops::Status::OK);
+    CHECK(ty.axis == 1);
+    CHECK_NEAR(ty.pivot.y, 1.0f, 1e-5f); // centroid of the cube (cy=1)
+    // endTool() RESETS the session — capture the pivot while it is alive.
+    const float pivotY = ty.pivot.y;
+    map.axisDirX = 0.0f;
+    map.axisDirY = 1.0f;
+    REQUIRE(sceneops::updateTool(s, ty, map, 500.0f, 650.0f) == ops::Status::OK);
+    CHECK_NEAR(ty.accumFactor, 2.0f, 1e-5f);
+    REQUIRE(sceneops::endTool(s, h, ty) == ops::Status::OK);
+    for (const auto& v : mesh.vertices()) {
+        if (!v.alive) continue;
+        CHECK_NEAR(v.pos.y,
+                   pivotY + (test::rawPos(pre, v.id).y - pivotY) * 2.0f,
+                   1e-5f);
+        CHECK_NEAR(v.pos.x, test::rawPos(pre, v.id).x * 2.0f, 1e-5f);
+    }
+    CHECK(mesh.validate());
+
+    // A session rejected at begin leaves no active session behind (no stuck
+    // transform session, no double session on the next drag).
+    sceneops::ToolSession bad;
+    CHECK(sceneops::beginTool(s, h, bad, sceneops::Tool::Scale, 4, 0,
+                              500.0f, 500.0f) == ops::Status::ErrInvalidArg);
+    CHECK(!bad.active);
+    sceneops::ToolSession ok;
+    REQUIRE(sceneops::beginTool(s, h, ok, sceneops::Tool::Move, 1, 0,
+                                500.0f, 500.0f) == ops::Status::OK);
+    CHECK(ok.active);
+}
+
 } // namespace
 
 namespace test {
@@ -322,6 +408,7 @@ void runUiModeTests() {
     testDuplicateActiveObject();
     testTransformDirectSteps();
     testGizmoPivotRule();
+    testAxialScaleGizmoSession();
 }
 } // namespace test
 

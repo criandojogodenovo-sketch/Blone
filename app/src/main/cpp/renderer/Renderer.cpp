@@ -703,7 +703,31 @@ void Renderer::render(const OrbitCamera& camera, const Scene& scene,
                                  !scene.activeObject()->mesh.empty();
     const bool editModeGizmo = scene.editMode && sceneops::hasValidSelection(scene);
     if (gizmoTool != GizmoTool::None && (objectModeGizmo || editModeGizmo)) {
+        // TEMP diagnostic (BLONE_SELECTION): log only STATE CHANGES — never
+        // per frame (no Logcat flooding).
+        static bool s_lastGizmoDrawn = false;
+        static GizmoTool s_lastTool = GizmoTool::None;
+        if (!s_lastGizmoDrawn || s_lastTool != gizmoTool) {
+            BLONE_LOGSEL("Gizmo desenhado: objetoAtivo=%d editMode=%d tool=%d",
+                         scene.active, scene.editMode ? 1 : 0,
+                         static_cast<int>(gizmoTool));
+        }
+        s_lastGizmoDrawn = true;
+        s_lastTool = gizmoTool;
         drawGizmo(scene, vp, gizmoTool);
+    } else {
+        static bool s_lastGizmoDrawnOff = true;
+        if (s_lastGizmoDrawnOff) {
+            BLONE_LOGSEL("Gizmo NAO desenhado: objetoAtivo=%d editMode=%d tool=%d "
+                         "objModeOk=%d editSelOk=%d",
+                         scene.active, scene.editMode ? 1 : 0,
+                         static_cast<int>(gizmoTool),
+                         (scene.activeObject() != nullptr &&
+                          !scene.activeObject()->mesh.empty()) ? 1 : 0,
+                         sceneops::hasValidSelection(scene) ? 1 : 0);
+        }
+        s_lastGizmoDrawnOff = !(gizmoTool != GizmoTool::None &&
+                                (objectModeGizmo || editModeGizmo));
     }
 }
 
@@ -827,7 +851,9 @@ void Renderer::drawGizmo(const Scene& scene, const Mat4& vp, GizmoTool tool) {
             glDrawArrays(GL_POINTS, 0, 1);
         }
         // Visible CENTER dot at the pivot (DECISÃO D: "gizmo de mover com
-        // eixos identificáveis e centro visível") — white, no hit.
+        // eixos identificáveis e centro visível") — white. With the Scale
+        // tool this dot is the UNIFORM scale handle (id 4 in gizmoHitAt);
+        // with Move it is purely visual.
         gizmoPtScratch_.clear();
         gizmoPtScratch_.push_back(pivot.x);
         gizmoPtScratch_.push_back(pivot.y);
@@ -871,7 +897,8 @@ Renderer::GizmoHit Renderer::gizmoHitAt(float xPx, float yPx, const Scene& scene
     const float visual = std::min(gizmoTouchScale_, 1.6f);
     const float axisLen = wpp * kGizmoArrowPx * visual;
     const float ringR = wpp * kGizmoRingPx * visual;
-    // Hit radii scale 1:1 with density (44 dp rule — DECISÃO D).
+    // Hit radii scale 1:1 with density (44 dp rule — DECISÃO D). Handle ids
+    // are per-tool (see the mapping table in the axis branch below).
     const float hitTip = kHitTipPx * gizmoTouchScale_;
     const float hitRing = kHitRingPx * gizmoTouchScale_;
     const float hitCenter = kHitCenterPx * gizmoTouchScale_;
@@ -894,14 +921,21 @@ Renderer::GizmoHit Renderer::gizmoHitAt(float xPx, float yPx, const Scene& scene
     };
 
     if (tool == GizmoTool::Move || tool == GizmoTool::Scale) {
+        // Handle ids are DISJOINT per tool so the JNI layer can map every id
+        // to exactly one (tool, operation, axis) triple (bug: Scale used to
+        // return 1..3 like Move, and beginGizmoDrag rejected it with
+        // ErrInvalidArg — "Gizmo: seleção inválida"):
+        //   Move  axes X/Y/Z -> 1..3;  Scale uniform center -> 4;
+        //   Rotate rings X/Y/Z -> 11..13;  Scale axes X/Y/Z -> 21..23.
         for (int a = 0; a < 3; ++a) {
             const float scaleF = (tool == GizmoTool::Scale) ? 0.85f : 1.0f;
+            const int axisHandle = (tool == GizmoTool::Scale) ? 21 + a : a + 1;
             const Vec3 tip = pivot + axes[a] * (axisLen * scaleF);
             float sx = 0.0f, sy = 0.0f;
             if (!projectToScreenPx(tip, sx, sy)) continue;
             const float dx = sx - xPx, dy = sy - yPx;
             if (std::sqrt(dx * dx + dy * dy) <= hitTip) {
-                consider(sx, sy, a + 1, a, 1);
+                consider(sx, sy, axisHandle, a, 1);
             }
             // Axis BODY: closest point on the pivot->tip screen segment so a
             // touch anywhere along the arrow grabs that axis (hit target far
@@ -918,7 +952,7 @@ Renderer::GizmoHit Renderer::gizmoHitAt(float xPx, float yPx, const Scene& scene
             const float cxp = bx + ex * t, cyp = by + ey * t;
             const float ddx = cxp - xPx, ddy = cyp - yPx;
             if (std::sqrt(ddx * ddx + ddy * ddy) <= hitSegment) {
-                consider(cxp, cyp, a + 1, a, 1);
+                consider(cxp, cyp, axisHandle, a, 1);
             }
         }
         if (tool == GizmoTool::Scale) {

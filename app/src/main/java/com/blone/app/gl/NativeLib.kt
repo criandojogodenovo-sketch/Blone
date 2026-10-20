@@ -62,8 +62,20 @@ object NativeLib {
      *  nVerts, nEdges, nFaces, hasValidSelection].
      * Dead ids are never counted; hasValidSelection distinguishes an EMPTY
      * selection (all counts zero) from an INVALID one (stale ids dropped).
+     * The active object INDEX is NOT part of this snapshot — read it with
+     * [getSelectedId] (kept separate so the snapshot layout stays stable).
      */
     external fun selectionSnapshot(): IntArray?
+
+    /**
+     * INDEX of the active object in the engine's object list, or -1 when
+     * nothing is active. SEMANTICS: this is the vector INDEX (the same one
+     * [objectName]/[objectInfo]/[setActiveObject] take) — 0 is a VALID first
+     * object; only -1 means "no active object". NEVER validate with `> 0`.
+     * It is not the persistent ElemId used inside the mesh topology.
+     * The C++ engine is the single source of truth for this value.
+     */
+    external fun getSelectedId(): Int
 
     /** Renders one frame with the given orbit camera and scene state. */
     external fun drawFrame(
@@ -134,12 +146,20 @@ object NativeLib {
 
     /**
      * CPU hit-test against the gizmo handles at the given pixel. Returns the
-     * handle: 0 none, 1..3 axis tips (X/Y/Z), 4 uniform-scale center,
-     * 11..13 rotation rings around X/Y/Z. Cheap (no GL work).
+     * handle — ids are DISJOINT PER TOOL and map 1:1 to beginGizmoDrag:
+     * 0 none, 1..3 Move axis tip/body (X/Y/Z), 4 Scale uniform center,
+     * 11..13 rotation rings around X/Y/Z, 21..23 Scale axis X/Y/Z.
+     * Cheap (no GL work).
      */
     external fun gizmoHitTest(xPx: Float, yPx: Float): Int
 
-    /** Starts a gizmo drag on [handle]; returns 0 (OK) or -status. */
+    /**
+     * Starts a gizmo drag on [handle]. Handle ids (see [gizmoHitTest]) map
+     * to exactly one (tool, operation, axis): 1..3 Move axis, 4 Scale
+     * uniform, 11..13 Rotate ring, 21..23 Scale axial X/Y/Z. Rejected with
+     * -ERR_INVALID_ARG when the handle does not belong to the ACTIVE gizmo
+     * tool. Returns 0 (OK) or -status.
+     */
     external fun beginGizmoDrag(
         handle: Int,
         xPx: Float,

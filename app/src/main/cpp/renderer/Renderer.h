@@ -71,10 +71,16 @@ public:
     // ---- gizmo ------------------------------------------------------------
     struct GizmoHit {
         bool hit = false;
-        int handle = 0; // 0 none; 1..3 axis tip; 4 center (uniform scale);
-                        // 11..13 rotation ring around X/Y/Z
+        // Handle ids are DISJOINT PER TOOL — each id maps to exactly one
+        // (tool, operation, axis) triple in the JNI beginGizmoDrag:
+        //   0     none;
+        //   1..3  Move axis tip/body X/Y/Z;
+        //   4     Scale uniform (center handle);
+        //   11..13 Rotate ring around X/Y/Z;
+        //   21..23 Scale axis X/Y/Z (axial scale).
+        int handle = 0;
         int axis = -1;  // 0=X, 1=Y, 2=Z; 3 for uniform center
-        int kind = 0;   // 0 none, 1 axis tip, 2 ring, 3 center
+        int kind = 0;   // 0 none, 1 axis tip/body, 2 ring, 3 center
     };
     // Screen-space hit-test against the gizmo of the given tool. Uses the
     // camera snapshot of the last rendered frame. Pure CPU (no GL calls).

@@ -255,6 +255,16 @@ Java_com_blone_app_gl_NativeLib_selectionSnapshot(JNIEnv* env, jobject /*thiz*/)
     return toJIntArray(env, selectionSnapshotLocked());
 }
 
+// Index of the ACTIVE object in Scene::objects, or -1 when there is none.
+// SEMANTICS (documented, do not confuse): this is the VECTOR INDEX used by
+// objectName/objectInfo/setActiveObject — 0 is a VALID first object, -1 means
+// no active object. It is NOT the persistent ElemId used inside the mesh.
+extern "C" JNIEXPORT jint JNICALL
+Java_com_blone_app_gl_NativeLib_getSelectedId(JNIEnv* /*env*/, jobject /*thiz*/) {
+    std::lock_guard<std::mutex> lock(gMutex);
+    return static_cast<jint>(gScene.active);
+}
+
 extern "C" JNIEXPORT void JNICALL
 Java_com_blone_app_gl_NativeLib_drawFrame(JNIEnv* /*env*/, jobject /*thiz*/,
                                           jfloat azimuthDeg, jfloat elevationDeg,
@@ -272,6 +282,8 @@ Java_com_blone_app_gl_NativeLib_pickAndSelect(JNIEnv* env, jobject /*thiz*/,
                                               jfloat xPx, jfloat yPx,
                                               jfloat snapRadiusPx) {
     std::lock_guard<std::mutex> lock(gMutex);
+    BLONE_LOGSEL("pickAndSelect: pixel=(%.0f,%.0f) objetoAtivoANTES=%d",
+                 xPx, yPx, static_cast<int>(gScene.active));
     blone::Renderer::PickHit hit = gRenderer.pickAtPixel(xPx, yPx, gScene, snapRadiusPx);
     std::vector<jint> out{0, -1, 0, 0, 0, 0};
     if (hit.hit) {
@@ -286,6 +298,13 @@ Java_com_blone_app_gl_NativeLib_pickAndSelect(JNIEnv* env, jobject /*thiz*/,
         out[3] = counts[0];
         out[4] = counts[1];
         out[5] = counts[2];
+        BLONE_LOGSEL("pickAndSelect: resultado kind=%d objIndex=%d status=%d "
+                     "objetoAtivoDEPOIS=%d",
+                     out[0], out[1], st == blone::ops::Status::OK ? 0 : -static_cast<int>(st),
+                     static_cast<int>(gScene.active));
+    } else {
+        BLONE_LOGSEL("pickAndSelect: nada atingido (objetoAtivo=%d mantido)",
+                     static_cast<int>(gScene.active));
     }
     return toJIntArray(env, out);
 }
@@ -299,17 +318,28 @@ Java_com_blone_app_gl_NativeLib_setGizmoTool(JNIEnv* /*env*/, jobject /*thiz*/, 
     }
 }
 
-// CPU hit-test against the gizmo handles. Returns the handle id
-// (0 none, 1..3 axis tips, 4 uniform-scale center, 11..13 rotation rings).
+// CPU hit-test against the gizmo handles. Handle ids are DISJOINT PER TOOL:
+// 0 none; 1..3 Move axis tip/body; 4 Scale uniform center; 11..13 Rotate
+// ring; 21..23 Scale axis X/Y/Z.
 extern "C" JNIEXPORT jint JNICALL
 Java_com_blone_app_gl_NativeLib_gizmoHitTest(JNIEnv* /*env*/, jobject /*thiz*/,
                                              jfloat xPx, jfloat yPx) {
     std::lock_guard<std::mutex> lock(gMutex);
     const blone::Renderer::GizmoHit hit = gRenderer.gizmoHitAt(xPx, yPx, gScene, gGizmoTool);
+    if (hit.hit) {
+        BLONE_LOGSEL("gizmoHitTest: pixel=(%.0f,%.0f) tool=%d -> handle=%d eixo=%d",
+                     xPx, yPx, static_cast<int>(gGizmoTool), hit.handle, hit.axis);
+    }
     return hit.hit ? hit.handle : 0;
 }
 
-// Starts a gizmo drag. handle: 1..3 axis tip, 4 center, 11..13 ring.
+// Starts a gizmo drag. Every handle range maps to EXACTLY one (tool, kind,
+// axis) triple — the active gizmo tool must match, otherwise the drag is
+// rejected (no cross-tool handle reuse):
+//   1..3  -> Move,   kind 1 (axis),  axis 0..2;
+//   4     -> Scale,  kind 3 (uniform), axis 3;
+//   11..13 -> Rotate, kind 2 (ring),   axis 0..2;
+//   21..23 -> Scale,  kind 1 (axial),   axis 0..2.
 extern "C" JNIEXPORT jint JNICALL
 Java_com_blone_app_gl_NativeLib_beginGizmoDrag(JNIEnv* /*env*/, jobject /*thiz*/,
                                                jint handle, jfloat xPx, jfloat yPx,
@@ -317,7 +347,7 @@ Java_com_blone_app_gl_NativeLib_beginGizmoDrag(JNIEnv* /*env*/, jobject /*thiz*/
                                                jfloat tx, jfloat ty, jfloat tz,
                                                jfloat viewportW, jfloat viewportH) {
     std::lock_guard<std::mutex> lock(gMutex);
-    if (handle < 1 || handle > 13) return static_cast<jint>(blone::ops::Status::ErrInvalidArg);
+    if (handle < 1 || handle > 23) return static_cast<jint>(blone::ops::Status::ErrInvalidArg);
     int tool = 0;
     int kind = 0;
     int axis = -1;
@@ -333,13 +363,27 @@ Java_com_blone_app_gl_NativeLib_beginGizmoDrag(JNIEnv* /*env*/, jobject /*thiz*/
         tool = static_cast<int>(blone::GizmoTool::Rotate);
         kind = 2;
         axis = handle - 11;
+    } else if (handle >= 21 && handle <= 23) {
+        // Axial scale (the same updateTool path the properties-panel steps
+        // use): scales only along the grabbed axis.
+        tool = static_cast<int>(blone::GizmoTool::Scale);
+        kind = 1;
+        axis = handle - 21;
     }
     const blone::sceneops::Tool t = static_cast<blone::sceneops::Tool>(tool);
     if (static_cast<int>(gGizmoTool) != tool) {
+        BLONE_LOGSEL("beginGizmoDrag REJEITADO: handle=%d pede tool=%d mas a "
+                     "ferramenta ativa é %d",
+                     handle, tool, static_cast<int>(gGizmoTool));
         return static_cast<jint>(blone::ops::Status::ErrInvalidArg);
     }
-    return static_cast<jint>(blone::sceneops::beginTool(
-            gScene, gHistory, gTool, t, kind, axis, xPx, yPx));
+    const blone::ops::Status st = blone::sceneops::beginTool(
+            gScene, gHistory, gTool, t, kind, axis, xPx, yPx);
+    BLONE_LOGSEL("beginGizmoDrag: handle=%d tool=%d kind=%d eixo=%d "
+                 "objetoAtivo=%d -> status=%d",
+                 handle, tool, kind, axis, static_cast<int>(gScene.active),
+                 st == blone::ops::Status::OK ? 0 : -static_cast<int>(st));
+    return static_cast<jint>(st);
 }
 
 // Continues a gizmo drag with ABSOLUTE touch pixels.

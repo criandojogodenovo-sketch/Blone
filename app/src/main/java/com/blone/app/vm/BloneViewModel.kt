@@ -1,5 +1,6 @@
 package com.blone.app.vm
 
+import android.util.Log
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -10,6 +11,9 @@ import com.blone.app.gl.NativeLib
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+
+/** TEMPORARY diagnostic tag (bug hunt: viewport/selection/gizmo). */
+private const val SEL_TAG = "BLONE_SELECTION"
 
 /** Viewport tool modes. Sculpt and Paint stay visibly unavailable. */
 enum class ViewportMode(val label: String) {
@@ -218,7 +222,11 @@ class BloneViewModel : ViewModel() {
         if (res == null || res.size < 6) return
         val kind = res[0]
         if (kind < 0) {
+            Log.d(SEL_TAG, "onPickResult: ERRO de seleção kind=$kind")
             statusText = StatusMessages.forCode(-kind, "Seleção")
+            // The scene may still have changed (or the panel may hold stale
+            // data) — re-sync the mirror from the engine either way.
+            refresh()
             return
         }
         when (kind) {
@@ -227,6 +235,7 @@ class BloneViewModel : ViewModel() {
             3 -> statusText = "Face selecionada (${res[5]})"
             4 -> statusText = if (res[1] >= 0) "Objeto ${res[1] + 1} ativo" else "Nada selecionado"
         }
+        Log.d(SEL_TAG, "onPickResult: kind=$kind objIndex=${res[1]}")
         refresh()
     }
 
@@ -256,6 +265,8 @@ class BloneViewModel : ViewModel() {
             cam.viewportWidth, cam.viewportHeight,
         )
         gizmoDragActive = code == NativeLib.Status.OK
+        Log.d(SEL_TAG, "beginGizmoDrag: handle=$handle tool=${gizmoTool.name} -> código=$code " +
+                "(sessão ativa=$gizmoDragActive)")
         if (!gizmoDragActive) {
             statusText = StatusMessages.forCode(code, "Gizmo")
         }
@@ -314,9 +325,10 @@ class BloneViewModel : ViewModel() {
 
     /** Duplicates the ACTIVE object; the copy becomes active (engine side). */
     fun duplicateActiveObject() = runOp("Duplicar objeto") {
+        // The engine activates the copy — refresh() reads the new index back
+        // from NativeLib.getSelectedId() (no second source of truth here).
         val idx = NativeLib.duplicateActiveObject()
         if (idx >= 0) {
-            activeObject = idx // the engine activated the copy
             NativeLib.Status.OK
         } else {
             -idx // positive status code -> readable StatusMessages entry
@@ -339,6 +351,7 @@ class BloneViewModel : ViewModel() {
 
     fun activateObject(index: Int) {
         NativeLib.setActiveObject(index)
+        Log.d(SEL_TAG, "activateObject: índice=$index pedido ao motor")
         statusText = "Objeto ${index + 1} ativo"
         refresh()
     }
@@ -348,7 +361,26 @@ class BloneViewModel : ViewModel() {
     }
 
     fun toggleProperties() {
-        propertiesOpen = !propertiesOpen
+        setPropertiesPanel(!propertiesOpen)
+    }
+
+    /**
+     * SINGLE entry point for opening/closing the Properties panel (bug fix:
+     * the panel used to leave a stale measured right inset behind — the
+     * overlay resets its insets when this flips). Opening re-reads the
+     * engine state first so the readout is NEVER stale on appearance.
+     * (Named setPropertiesPanel to avoid the JVM setter clash with the
+     * [propertiesOpen] property — same reason as chooseGizmoTool.)
+     */
+    fun setPropertiesPanel(open: Boolean) {
+        if (propertiesOpen == open) return
+        propertiesOpen = open
+        Log.d(SEL_TAG, "setPropertiesPanel: propertiesOpen=$open")
+        if (open) {
+            // Fresh readout the moment the panel appears (no stale "Nenhum
+            // objeto" from a previous selection round-trip).
+            refresh()
+        }
     }
 
     fun toggleTools() {
@@ -385,7 +417,13 @@ class BloneViewModel : ViewModel() {
         canUndo = NativeLib.canUndo()
         canRedo = NativeLib.canRedo()
         objectCount = NativeLib.objectCount()
-        if (activeObject >= objectCount) activeObject = objectCount - 1
+        // SINGLE SOURCE OF TRUTH: the active object index comes from the
+        // C++ engine every time (toque no viewport, lista Avançado, duplicar,
+        // undo/redo e apagar todos mudam `Scene::active` no motor). The old
+        // mirror-only logic showed "Nenhum objeto" while the gizmo was drawn
+        // on a real selection. INDEX semantics: 0 is valid, -1 = none.
+        activeObject = NativeLib.getSelectedId()
+        Log.d(SEL_TAG, "refresh: getSelectedId=$activeObject objectCount=$objectCount")
         // ONE atomic native read for every selection-derived UI state — the
         // Kotlin layer never derives selection state on its own.
         applySnapshot(NativeLib.selectionSnapshot())

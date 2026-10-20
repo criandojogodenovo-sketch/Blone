@@ -1,5 +1,6 @@
 package com.blone.app.ui
 
+import android.util.Log
 import androidx.compose.foundation.background
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -47,6 +48,9 @@ import com.blone.app.vm.SelectionMode
 import com.blone.app.vm.Tool
 import com.blone.app.vm.ViewportMode
 
+/** TEMPORARY diagnostic tag (bug hunt: viewport/selection/gizmo). */
+private const val SEL_TAG = "BLONE_SELECTION"
+
 // Dark, focused chrome colors — tuned to sit on top of the GL viewport.
 private val ChromeBg = Color(0xCC101623)
 private val ChromeSolid = Color(0xFF101623) // fully opaque (bars/panels)
@@ -87,7 +91,16 @@ private fun ToolButton(
             .height(44.dp)
             .padding(horizontal = 2.dp),
     ) {
-        Text(text = label, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
+        // Explicit lineHeight: single glyph fallback arrows (↶ ↷) render with
+        // taller metrics than the default line box — without the extra room
+        // their ink is CLIPPED at the top of the button (reported bug).
+        Text(
+            text = label,
+            fontSize = 12.sp,
+            lineHeight = 18.sp,
+            fontWeight = FontWeight.SemiBold,
+            maxLines = 1,
+        )
     }
 }
 
@@ -228,12 +241,32 @@ fun BloneOverlay(
             var leftEdge by remember { mutableIntStateOf(-1) }
             var rightEdge by remember { mutableIntStateOf(-1) }
             LaunchedEffect(topEdge, bottomEdge, leftEdge, rightEdge) {
+                Log.d(
+                    SEL_TAG,
+                    "viewport útil aplicado: top=$topEdge bottom=$bottomEdge " +
+                            "left=$leftEdge right=$rightEdge",
+                )
                 onUsableViewportChanged(
                     if (topEdge > 0) topEdge else 0,
                     if (bottomEdge > 0) bottomEdge else 0,
                     if (leftEdge > 0) leftEdge else 0,
                     if (rightEdge > 0) rightEdge else 0,
                 )
+            }
+
+            // BUG FIX (viewport encolhe): rightEdge is measured ONLY while the
+            // Properties panel is composed. When the panel leaves composition
+            // its measurement callback dies with it and the LAST measured
+            // value used to persist forever — the viewport stayed a narrow
+            // strip after closing. The single open/close entry point is
+            // ViewModel.setPropertiesPanel(); this effect guarantees the stale
+            // inset is explicitly reset to 0 the moment the panel closes, so
+            // the LaunchedEffect above re-applies the full usable rect.
+            LaunchedEffect(viewModel.propertiesOpen) {
+                if (!viewModel.propertiesOpen && rightEdge != 0) {
+                    Log.d(SEL_TAG, "Properties fechou: rightInset $rightEdge -> 0")
+                    rightEdge = 0
+                }
             }
 
             Column(modifier = Modifier.fillMaxSize().padding(8.dp)) {
@@ -256,6 +289,15 @@ fun BloneOverlay(
                             .horizontalScroll(rememberScrollState()),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
+                        // Undo/Redo FIRST: on narrow screens the row scrolls,
+                        // so the most frequent actions must sit at the initial
+                        // scroll position (fully visible without scrolling).
+                        ToolButton("↶", false, viewModel.canUndo && !viewModel.busy) {
+                            viewModel.undo()
+                        }
+                        ToolButton("↷", false, viewModel.canRedo && !viewModel.busy) {
+                            viewModel.redo()
+                        }
                         Text(
                             text = "BLONE",
                             color = ChromeFg,
@@ -283,12 +325,6 @@ fun BloneOverlay(
                                 .background(DisabledBg, RoundedCornerShape(8.dp))
                                 .padding(horizontal = 8.dp, vertical = 4.dp),
                         )
-                        ToolButton("↶", false, viewModel.canUndo && !viewModel.busy) {
-                            viewModel.undo()
-                        }
-                        ToolButton("↷", false, viewModel.canRedo && !viewModel.busy) {
-                            viewModel.redo()
-                        }
                         ToolButton("Guardar", false, !viewModel.busy) { onSaveRequest() }
                         ToolButton("Abrir", false, !viewModel.busy) { onLoadRequest() }
                         ToolButton("Avançado", viewModel.advancedOpen, !viewModel.busy) {
@@ -338,8 +374,18 @@ fun BloneOverlay(
                             modifier = Modifier
                                 .fillMaxHeight()
                                 .onGloballyPositioned { c ->
-                                    val edge = (rootWidthPx - c.positionInWindow().x).toInt()
-                                    if (edge != rightEdge) rightEdge = edge
+                                    // REPLACE (never accumulate): the panel's
+                                    // real distance from the right window edge
+                                    // in the CURRENT layout pass.
+                                    val edge =
+                                        (rootWidthPx - c.positionInWindow().x).toInt()
+                                    if (edge != rightEdge) {
+                                        Log.d(
+                                            SEL_TAG,
+                                            "Properties medido: rightInset $rightEdge -> $edge",
+                                        )
+                                        rightEdge = edge
+                                    }
                                 },
                         )
                     }
@@ -508,10 +554,13 @@ private fun StepRow(
 private fun PropertiesPanel(viewModel: BloneViewModel, modifier: Modifier = Modifier) {
     Column(
         modifier = modifier
-            .width(216.dp)
+            // Narrower + semi-transparent (ChromeBg): fewer viewport pixels
+            // hidden, the model still reads through the panel; buttons keep
+            // their own backgrounds, so the controls stay legible.
+            .width(200.dp)
             .heightIn(max = 480.dp)
             .verticalScroll(rememberScrollState())
-            .background(ChromeSolid, RoundedCornerShape(14.dp))
+            .background(ChromeBg, RoundedCornerShape(14.dp))
             .padding(8.dp),
     ) {
         Text(

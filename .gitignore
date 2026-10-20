@@ -13,3 +13,6 @@ local.properties
 *.jks
 *.keystore
 keystore.properties
+
+# Host test build dirs (local CMake runs, not part of the Android build).
+/build-core-*/

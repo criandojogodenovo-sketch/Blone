@@ -39,14 +39,20 @@ viewport centrada na área útil).
 - **GIZMO no écran**: eixos X/Y/Z para mover (com centro visível), anéis
   para rodar, eixos + centro para escalar — arrastar uma alça transforma o
   alvo; **alvos de toque adaptados à densidade (regra dos 44 dp) e o corpo
-  do eixo inteiro também agarra**; em Edição, com a seleção VAZIA o gizmo
+  do eixo inteiro também agarra**; **Escalar X/Y/Z escala só o eixo
+  agarrado, o centro escala uniforme** (ids de alça disjuntos por
+  ferramenta — o arrasto de Escalar nunca é rejeitado como "seleção
+  inválida"); em Edição, com a seleção VAZIA o gizmo
   desaparece (sem alças invisíveis); arrastar FORA do gizmo orbita a
   câmara; **dois dedos é sempre a câmara** e cancela o arrasto do gizmo;
   a ferramenta "Sel." desliga o gizmo (toque = só selecionar).
-- **Painel de propriedades** (recolhível): nome real do motor ("Cubo 1"),
+- **Painel de propriedades** (recolhível, mais estreito e
+  semitransparente): nome real do motor ("Cubo 1"),
   contagens V/A/F, centro do objeto e transformações por passos fixos
   (mover ±0.25, rodar ±15°, escalar ×1.25/÷1.25) com histórico —
-  acessibilidade sem arrastos precisos.
+  acessibilidade sem arrastos precisos. Abrir/fechar o painel NUNCA
+  altera o tamanho da viewport 3D (o inset direito é reposto ao fechar)
+  e o conteúdo é re-lido do motor a cada abertura.
 - Extrusão de faces, subdivisão (quads/triângulos), apagar vértices/arestas/
   faces com validação topológica (rejeição sem mutação parcial), loop cut
   em anéis de quads.
@@ -58,7 +64,8 @@ viewport centrada na área útil).
   ver docs/PROJECT_FORMAT.md) via SAF, sem permissões de armazenamento.
 - Interface em QUATRO ZONAS nas duas orientações (barra inferior deixa de
   ser o lar das ferramentas): **barra superior compacta** com uma linha
-  (undo/refazer, Guardar/Abrir, modo atual, FPS, Avançado, Propriedades);
+  (undo/refazer PRIMEIRO — visíveis sem scroll, Guardar/Abrir, modo atual,
+  FPS, Avançado, Propriedades);
   **barra lateral de ferramentas** à esquerda (Sel./Mover/Rodar/Escalar
   mais as operações contextuais de cada modo); **painel de propriedades**
   à direita; **barra inferior compacta** (Objeto/Edição + V/A/F + estado
