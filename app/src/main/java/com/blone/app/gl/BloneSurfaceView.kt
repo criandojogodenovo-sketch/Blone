@@ -72,6 +72,21 @@ class BloneSurfaceView(
         onGizmoCancel = {
             viewModel.onGizmoDragCancel()
         },
+        // Fase 3: brush stroke path (sculpt/paint modes only). The probe
+        // returns false when nothing is under the finger -> the gesture
+        // falls through to the camera orbit/tap path.
+        onBrushDown = { x, y ->
+            viewModel.beginBrushAt(x, y)
+        },
+        onBrushMove = { x, y ->
+            viewModel.onBrushMove(x, y)
+        },
+        onBrushUp = {
+            viewModel.onBrushEnd()
+        },
+        onBrushCancel = {
+            viewModel.onBrushCancel()
+        },
     )
 
     init {
@@ -148,6 +163,9 @@ class BloneSurfaceView(
 
     @SuppressLint("ClickableViewAccessibility")
     override fun onTouchEvent(event: MotionEvent): Boolean {
+        // Brush probes only in the sculpt/paint modes (read per event — the
+        // mode can change between gestures, never mid-gesture).
+        tracker.brushProbeEnabled = viewModel.brushModeActive
         val active = (0 until event.pointerCount).map { i ->
             TouchTracker.Pointer(event.getPointerId(i), event.getX(i), event.getY(i))
         }

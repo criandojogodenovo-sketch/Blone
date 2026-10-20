@@ -38,6 +38,11 @@ namespace blone {
 using ElemId = uint32_t;
 inline constexpr ElemId kNull = 0;
 
+// Base material color carried by every NEW vertex (and by vertices loaded
+// from v1 project files). It matches the historical fill-shader base color,
+// so unpainted meshes render exactly as before the vertex-color extension.
+inline constexpr Vec3 kDefaultVertexColor{0.58f, 0.66f, 0.78f};
+
 struct MeshLimits {
     static constexpr size_t maxVertices  = 200000;
     static constexpr size_t maxEdges     = 400000;
@@ -51,6 +56,10 @@ public:
     struct Vertex {
         ElemId id = kNull;
         Vec3 pos{};
+        // Paint color (Fase 3). Positions are LOCAL; colors are albedo RGB
+        // in [0,1]. Default keeps the historical shader base color so old
+        // scenes and unpainted meshes look unchanged.
+        Vec3 color = kDefaultVertexColor;
         ElemId outgoing = kNull;
         bool alive = false;
     };

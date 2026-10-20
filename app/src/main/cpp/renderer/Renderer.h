@@ -68,6 +68,29 @@ public:
     PickHit pickAtPixel(float xPx, float yPx, const Scene& scene,
                         float snapRadiusPx) const;
 
+    // ---- brush (Fase 3) ---------------------------------------------------
+    // Raw surface hit WITHOUT any selection side effect: nearest triangle
+    // across all objects under the pixel (same ray + triangulation as
+    // pickAtPixel). Returns the hit point in WORLD and LOCAL space.
+    struct SurfaceHit {
+        bool hit = false;
+        int objectIndex = -1;
+        ElemId faceId = kNull;
+        Vec3 world{}; // world-space hit point
+        Vec3 local{}; // world - object.position (mesh local space)
+    };
+    bool surfaceHitAt(float xPx, float yPx, const Scene& scene,
+                      SurfaceHit& out) const;
+
+    // Brush aiming ring: billboard circle at `world` with the REAL brush
+    // radius (world units). Active only while a stroke is running (set/clear
+    // by the JNI stroke functions). rgba = ring color (alpha blended).
+    void setBrushOverlay(bool active, const Vec3& world, float radiusWorld,
+                         float r, float g, float b, float a);
+
+    // Draws the brush ring if active (called at the end of render()).
+    void drawBrushRing();
+
     // ---- gizmo ------------------------------------------------------------
     struct GizmoHit {
         bool hit = false;
@@ -118,6 +141,10 @@ private:
     void buildObjectGeometry(ObjectGpu& g, const SceneObject& obj);
     void buildSelectionOverlays(ObjectGpu& g, const SceneObject& obj);
 
+    // Shared ray builder for picking AND the brush surface hit (single
+    // projection source — they can never diverge).
+    bool buildPickRay(float xPx, float yPx, Vec3& dirOut) const;
+
     // Gizmo drawing (depth-test off overlay) + shared scratch buffers.
     void drawGizmo(const Scene& scene, const Mat4& vp, GizmoTool tool);
     void drawLineList(const std::vector<LineVertex>& lines, const Mat4& mvp);
@@ -131,6 +158,7 @@ private:
     GLuint fillProgram_ = 0, lineProgram_ = 0, pointProgram_ = 0;
     GLint fillMvpLoc_ = -1, fillModelLoc_ = -1, fillLightLoc_ = -1;
     GLint fillEyeLoc_ = -1, fillTintLoc_ = -1, fillTintMixLoc_ = -1;
+    GLint fillUseVColLoc_ = -1;
     GLint lineMvpLoc_ = -1, lineOverrideLoc_ = -1, lineUseOverrideLoc_ = -1;
     GLint pointMvpLoc_ = -1, pointColorLoc_ = -1, pointSizeLoc_ = -1;
 
@@ -151,6 +179,13 @@ private:
     Vec3 eye_{};
     int width_ = 0, height_ = 0;
     float aspect_ = 1.0f;
+
+    // Brush overlay state (Fase 3) — plain members, mutex-guarded by the JNI
+    // layer; drawn by drawBrushRing() at the end of render().
+    bool brushOverlayActive_ = false;
+    Vec3 brushOverlayWorld_{};
+    float brushRadiusWorld_ = 0.0f;
+    float brushRingRgba_[4] = {1.0f, 0.72f, 0.20f, 0.9f};
     // Usable (chrome-free) viewport rect inside the surface. The projection,
     // picking and the gizmo mapping all use THIS rect, so the model is
     // centered in the visible area and what you tap is what you see.

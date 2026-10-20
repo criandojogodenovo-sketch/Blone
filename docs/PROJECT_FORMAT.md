@@ -1,13 +1,20 @@
-# Formato de Projeto Blone — "BLONEPRJ" (versão 1)
+# Formato de Projeto Blone — "BLONEPRJ" (versão atual: 2)
+
+> **Versão 2 (Fase 3):** acrescenta **cor por vértice** (albedo RGB) para a
+> ferramenta Pintar. O leitor aceita ficheiros **v1 e v2**; um ficheiro v1
+> abre com a cor por vértice predefinida (idêntica ao aspeto anterior à
+> extensão). O escritor grava sempre a versão corrente (2). Uma aplicação
+> antiga (leitor v1) rejeita um ficheiro v2 com o erro `-2` e uma mensagem
+> clara — nunca interpreta às cegas.
 
 Este documento define o formato binário próprio com que o Blone guarda e
 abre projetos. Implementação: `app/src/main/cpp/core/project/Project.{h,cpp}`.
 
 ## 1. Garantias
 
-- **Versionado**: o cabeçalho contém `formatVersion`. Um leitor aceita
-  exclusivamente a versão que conhece (1); versões mais recentes produzem o
-  erro `-2` com mensagem clara — nunca são interpretadas às cegas.
+- **Versionado**: o cabeçalho contém `formatVersion`. O leitor aceita as
+  versões que conhece (1 e 2); versões mais recentes produzem o erro `-2`
+  com mensagem clara — nunca são interpretadas às cegas.
 - **Integridade**: CRC32 (IEEE, polinómio 0xEDB88320) sobre o payload.
   Ficheiros corrompidos são rejeitados com o erro `-4`.
 - **Atomicidade na abertura**: o ficheiro é lido e validado num objeto `Scene`
@@ -23,7 +30,7 @@ abre projetos. Implementação: `app/src/main/cpp/core/project/Project.{h,cpp}`.
 ```
 Deslocamento  Tamanho  Campo
 0             8        Magic "BLONEPRJ"
-8             4        formatVersion (u32; atualmente 1)
+8             4        formatVersion (u32; atualmente 2 — v1 continua a abrir)
 12            8        payloadLength (u64)
 20            4        CRC32 (u32) do payload
 24            ...      payload
@@ -58,6 +65,10 @@ como `id`, não como posições — a topologia sobrevive intacta.
 ```
 u32 vertexCount
     por vértice:  u32 id; f32 x, y, z
+                  v2 APENAS: f32 r, g, b   (cor albedo em [0,1]; na abertura,
+                  valores não finitos são rejeitados com o erro -8 e valores
+                  fora do intervalo são restringidos a [0,1]; ficheiros v1
+                  recebem a cor predefinida kDefaultVertexColor)
 u32 halfEdgeCount
     por half-edge: u32 id, origin, twin, next, prev, face (0 = fronteira), edge
 u32 edgeCount
@@ -105,3 +116,13 @@ Regras para versões futuras (≥ 2):
    explícitas são implementadas caso a caso, nunca "adivinhadas";
 4. Testes de round-trip (guardar → abrir → comparar byte a byte a geometria
    e a topologia) continuam obrigatórios a cada alteração.
+
+## 8. Histórico das versões
+
+- **v1 (Fase 2)** — geometria, topologia, seleção. Sem cores.
+- **v2 (Fase 3)** — cor por vértice (3 × f32 por vértice, albedo RGB em
+  [0,1]) para a ferramenta Pintar. Compatível: o leitor atual abre v1 (cores
+  predefinidas) e v2; o leitor antigo rejeita v2 com erro claro.
+
+Testes que fixam este contrato: `tests/test_brush.cpp`
+(`testPersistenceV2RoundTrip`, `testV1FileCompatibility`).

@@ -64,6 +64,26 @@ bool History::pushVerticesDelta(uint32_t objIndex,
     return true;
 }
 
+bool History::pushColorDelta(uint32_t objIndex,
+                             std::vector<std::pair<ElemId, Vec3>> before,
+                             std::vector<std::pair<ElemId, Vec3>> after) {
+    if (pending_ == 0) return false;
+    Entry e;
+    e.kind = Entry::Kind::ColorDelta;
+    e.objIndex = objIndex;
+    e.beforeCol = std::move(before);
+    e.afterCol = std::move(after);
+    e.bytes = static_cast<uint64_t>(e.beforeCol.size() + e.afterCol.size()) *
+                  16ull +
+              sizeof(Entry);
+    undo_.push_back(std::move(e));
+    used_ += undo_.back().bytes; // exact cost replaces the reserved bound
+    pending_ = 0;
+    lastEntryBytes_ = undo_.back().bytes;
+    while (undo_.size() > kMaxEntries) dropOldestUndo();
+    return true;
+}
+
 bool History::pushMeshSwap(uint32_t objIndex, HalfEdgeMesh::Raw before,
                            HalfEdgeMesh::Raw after) {
     if (pending_ == 0) return false;
@@ -149,6 +169,11 @@ bool History::applyUndoToScene(Scene& scene, Entry& e) {
                 if (obj.mesh.vertexAlive(id)) obj.mesh.vrt(id).pos = pos;
             }
             break;
+        case Entry::Kind::ColorDelta:
+            for (const auto& [id, col] : e.beforeCol) {
+                if (obj.mesh.vertexAlive(id)) obj.mesh.vrt(id).color = col;
+            }
+            break;
         case Entry::Kind::MeshSwap:
             obj.mesh.restoreRaw(e.beforeMesh);
             if (e.hasSelections) obj.sel = e.selBefore; // pruned by undo()
@@ -172,6 +197,14 @@ bool History::applyRedoToScene(Scene& scene, Entry& e) {
             SceneObject& obj = scene.objects[e.objIndex];
             for (const auto& [id, pos] : e.afterPos) {
                 if (obj.mesh.vertexAlive(id)) obj.mesh.vrt(id).pos = pos;
+            }
+            break;
+        }
+        case Entry::Kind::ColorDelta: {
+            if (e.objIndex >= scene.objects.size()) return false;
+            SceneObject& obj = scene.objects[e.objIndex];
+            for (const auto& [id, col] : e.afterCol) {
+                if (obj.mesh.vertexAlive(id)) obj.mesh.vrt(id).color = col;
             }
             break;
         }

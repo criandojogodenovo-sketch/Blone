@@ -1,9 +1,20 @@
 #pragma once
-// BLONEPRJ — Blone's own versioned project format (Phase 2).
+// BLONEPRJ — Blone's own versioned project format.
+//
+// VERSION HISTORY
+//  v1 (Fase 2): geometry + topology + selection, no vertex colors.
+//  v2 (Fase 3): adds 3 x f32 albedo color per vertex (see §Payload).
+//
+// Compatibility contract (docs/PROJECT_FORMAT.md):
+//  - The reader accepts v1 AND v2 (a v1 file loads with the default vertex
+//    color kDefaultVertexColor — unpainted files look unchanged).
+//  - The writer emits the CURRENT version (2).
+//  - Newer-than-known versions are rejected with ErrVersion and a clear
+//    user-facing message — never guessed at.
 //
 // Layout (little-endian):
 //   8B  magic "BLONEPRJ"
-//   u32 formatVersion (currently 1; readers reject newer versions with a
+//   u32 formatVersion (2 since Fase 3; readers reject newer versions with a
 //       clear error and never silently guess)
 //   u64 payloadLength
 //   u32 CRC32 (IEEE, poly 0xEDB88320) of the payload
@@ -19,6 +30,7 @@
 //       3 x f32 position
 //       mesh (ALIVE elements only; pools are rebuilt on load):
 //         u32 vertexCount; per vertex: u32 id, 3 x f32 position
+//             v2 ONLY: 3 x f32 color (albedo RGB in [0,1])
 //         u32 heCount;     per he:    u32 id, origin, twin, next, prev, face, edge
 //         u32 edgeCount;   per edge:  u32 id, he
 //         u32 faceCount;   per face:  u32 id, he
@@ -48,7 +60,9 @@ enum LoadError : int {
     ErrIndex = -8,
 };
 
-constexpr uint32_t kFormatVersion = 1;
+constexpr uint32_t kFormatVersion = 2;
+// Oldest version the reader still accepts (v1 = pre-color files).
+constexpr uint32_t kOldestSupportedVersion = 1;
 constexpr size_t kMaxProjectObjects = 32;
 constexpr size_t kMaxNameBytes = 256;
 

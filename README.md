@@ -3,21 +3,31 @@
 Aplicação Android nativa de modelagem 3D — gratuita, offline e pensada para
 ecrãs táteis e telemóveis com recursos limitados.
 
-**Estado atual: Fase 2 + correção de estabilidade** (base nativa + viewport
- tátil + modelagem editável + gizmo funcional no écran + seleção com fonte
-única no motor, sem z-fighting, layouts sem cortes nas duas orientações e
-viewport centrada na área útil).
+**Estado atual: Fase 3** (base nativa + viewport tátil + modelagem editável
+ + gizmo funcional + seleção com fonte única no motor + **pincéis de
+esculpir e pintar sobre a malha**, com desfazer/refazer por gesto e cores
+guardadas no projeto).
 
 ## Instalação
 
 1. Descarrega o APK em *Actions → run mais recente → Artifacts*
-   (`Blone-fase2-debug-…` ou `Blone-fase2-release-assinado-…`), ou numa
+   (`Blone-fase3-debug-…` ou `Blone-fase3-release-assinado-…), ou numa
    release do separador *Releases*, quando existir.
 2. No telemóvel, permite "Instalar apps de fontes desconhecidas" para este
    ficheiro e instala o APK.
 3. Requisitos: Android 8.0 (API 26) ou superior.
 
-## Funcionalidades (Fase 2 + correção)
+## Funcionalidades (Fase 2 + correção, e Fase 3)
+
+- **Esculpir sobre a malha**: arraste na superfície para deformar — raio e
+  intensidade reais, modo Levantar/Cavar (deslocamento segundo a normal da
+  face tocada, com atenuação suave), atualização imediata no renderizador e
+  proteção contra valores inválidos.
+- **Pintar sobre a malha**: cor por vértice com raio e opacidade reais e
+  paleta de 12 cores; só a região tocada muda; as cores são guardadas no
+  projeto (formato v2 — ficheiros antigos continuam a abrir).
+- **Um gesto = um passo de desfazer**: arrastos longos são um único passo
+  (nunca um por frame); cancelar o traço (2.º dedo) restaura o estado exato.
 
 - Viewport 3D real: renderização C++ com OpenGL ES 3.0 (grelha, eixos
   X/Vermelho · Y/Verde · Z/Azul, malhas com sombreamento plano e wireframe).

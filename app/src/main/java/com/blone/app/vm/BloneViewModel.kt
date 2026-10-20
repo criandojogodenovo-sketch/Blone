@@ -34,6 +34,12 @@ enum class Tool(val label: String, val native: Int) {
     SCALE("Escalar", 3),
 }
 
+/** Brush tools for the Fase 3 viewport modes (mirrors the native BrushTool). */
+enum class BrushToolKind(val label: String, val native: Int) {
+    SCULPT("Esculpir", 0),
+    PAINT("Pintar", 1),
+}
+
 /** Human-readable mapping of native status codes (PT). */
 object StatusMessages {
     fun forCode(code: Int, action: String): String = when (code) {
@@ -139,6 +145,32 @@ class BloneViewModel : ViewModel() {
     var toolsOpen by mutableStateOf(false)
         private set
 
+    // ---- brush state (Fase 3) ----------------------------------------------
+    // These are REAL operation parameters: they are passed to the native
+    // stroke on every begin/move, not merely display values.
+
+    /** Brush radius in world units (native clamps to [0.02, 4]). */
+    var brushRadius by mutableStateOf(0.5f)
+
+    /** Stroke intensity in [0.05, 1] (native clamps). */
+    var brushStrength by mutableStateOf(0.5f)
+
+    /** Paint opacity in [0.05, 1] (native clamps). */
+    var brushOpacity by mutableStateOf(0.85f)
+
+    /** Sculpt displacement mode: false = raise, true = dig. */
+    var sculptDig by mutableStateOf(false)
+
+    /** Paint color as ARGB (Compose) — the swatch the user picked. */
+    var brushColorArgb by mutableStateOf(0xFFF44336.toInt())
+
+    /** True while a brush gesture owns the finger (plain field, not UI state). */
+    private var brushStrokeActive = false
+
+    /** True in the viewport modes that use the brush (drives the touch probe). */
+    val brushModeActive: Boolean
+        get() = mode == ViewportMode.SCULPT || mode == ViewportMode.PAINT
+
     /** True while a mutating native operation is in flight. */
     var busy by mutableStateOf(false)
         private set
@@ -166,17 +198,31 @@ class BloneViewModel : ViewModel() {
             ViewportMode.OBJECT -> {
                 mode = m
                 NativeLib.setEditMode(false)
+                NativeLib.setGizmoTool(gizmoTool.native) // restore the gizmo
                 statusText = "Modo Objeto — toque num objeto para o ativar · 1 dedo orbita · 2 dedos câmara"
                 refresh()
             }
             ViewportMode.EDIT -> {
                 mode = m
                 NativeLib.setEditMode(true)
+                NativeLib.setGizmoTool(gizmoTool.native) // restore the gizmo
                 statusText = "Editar — toque: selecionar · arraste um eixo do gizmo: transformar · fora: câmara"
                 refresh()
             }
-            else ->
-                statusText = "\"${m.label}\" ainda não está disponível nesta versão."
+            ViewportMode.SCULPT -> {
+                mode = m
+                NativeLib.setEditMode(false)
+                NativeLib.setGizmoTool(Tool.NONE.native) // the brush owns the view
+                statusText = "Esculpir — arraste sobre a superfície · fora dela: câmara · 2 dedos câmara"
+                refresh()
+            }
+            ViewportMode.PAINT -> {
+                mode = m
+                NativeLib.setEditMode(false)
+                NativeLib.setGizmoTool(Tool.NONE.native) // the brush owns the view
+                statusText = "Pintar — arraste sobre a superfície para pintar · fora dela: câmara"
+                refresh()
+            }
         }
     }
 
@@ -288,6 +334,69 @@ class BloneViewModel : ViewModel() {
         refresh()
     }
 
+    // ---- brush gestures (Fase 3) --------------------------------------------
+    // Same shape as the gizmo drag path: the surface view feeds touch events
+    // in, the native engine does the work, Kotlin owns only the parameters.
+
+    /**
+     * Touch-down in a brush mode: hits the surface and starts a stroke.
+     * Returns true when a stroke is active (the gesture becomes a stroke,
+     * never an orbit).
+     */
+    fun beginBrushAt(xPx: Float, yPx: Float): Boolean {
+        if (mode != ViewportMode.SCULPT && mode != ViewportMode.PAINT) return false
+        val tool = if (mode == ViewportMode.SCULPT) BrushToolKind.SCULPT else BrushToolKind.PAINT
+        // Honest probe: without a surface under the finger no stroke starts
+        // (the gesture falls through to the camera orbit path).
+        val hit = NativeLib.brushHit(xPx, yPx)
+        if (hit == null || hit.isEmpty() || hit[0] < 0.5f) return false
+        val c = brushColorArgb
+        val r = ((c shr 16) and 0xFF) / 255f
+        val g = ((c shr 8) and 0xFF) / 255f
+        val b = (c and 0xFF) / 255f
+        val code = NativeLib.beginBrushStroke(
+            tool = tool.native,
+            xPx = xPx,
+            yPx = yPx,
+            radius = brushRadius,
+            strength = brushStrength,
+            mode = if (sculptDig) 1 else 0,
+            r = r,
+            g = g,
+            b = b,
+            opacity = brushOpacity,
+        )
+        brushStrokeActive = code == NativeLib.Status.OK
+        if (!brushStrokeActive && code != 0) {
+            statusText = StatusMessages.forCode(code, "Pincel")
+        }
+        return brushStrokeActive
+    }
+
+    fun onBrushMove(xPx: Float, yPx: Float) {
+        if (!brushStrokeActive) return
+        val code = NativeLib.moveBrushStroke(xPx, yPx, brushRadius, brushStrength)
+        if (code != NativeLib.Status.OK && code != 0) {
+            statusText = StatusMessages.forCode(code, "Pincel")
+        }
+    }
+
+    fun onBrushEnd() {
+        if (!brushStrokeActive) return
+        brushStrokeActive = false
+        val code = NativeLib.endBrushStroke()
+        statusText = StatusMessages.forCode(code, "Pincel")
+        refresh()
+    }
+
+    fun onBrushCancel() {
+        if (!brushStrokeActive) return
+        brushStrokeActive = false
+        NativeLib.cancelBrushStroke()
+        statusText = "Traço cancelado (câmara assumiu)"
+        refresh()
+    }
+
     // ---- modeling operations ------------------------------------------------
 
     private fun runOp(action: String, onOk: (() -> Unit)? = null, op: () -> Int) {
@@ -358,6 +467,7 @@ class BloneViewModel : ViewModel() {
     fun newScene() = runOp("Nova cena", onOk = {
         mode = ViewportMode.OBJECT
         activeObject = -1
+        NativeLib.setGizmoTool(gizmoTool.native)
         statusText = "Cena nova — adicione uma primitiva no painel Avançado"
     }, op = { NativeLib.newScene() })
 
@@ -376,6 +486,7 @@ class BloneViewModel : ViewModel() {
             // the saved edit state stays inside the file.
             mode = ViewportMode.OBJECT
             NativeLib.setEditMode(false)
+            NativeLib.setGizmoTool(gizmoTool.native)
         }
         refresh()
     }

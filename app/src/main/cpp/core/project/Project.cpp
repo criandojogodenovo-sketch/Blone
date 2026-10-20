@@ -1,5 +1,6 @@
 #include "Project.h"
 
+#include <algorithm>
 #include <cstring>
 
 namespace blone::project {
@@ -71,6 +72,10 @@ void writeMesh(Writer& w, const HalfEdgeMesh& m) {
         w.f32(v->pos.x);
         w.f32(v->pos.y);
         w.f32(v->pos.z);
+        // v2: albedo color per vertex (Fase 3).
+        w.f32(v->color.x);
+        w.f32(v->color.y);
+        w.f32(v->color.z);
     }
     w.u32(static_cast<uint32_t>(hs.size()));
     for (const auto* h : hs) {
@@ -154,7 +159,7 @@ struct Reader {
     }
 };
 
-int readMesh(Reader& r, HalfEdgeMesh& m) {
+int readMesh(Reader& r, HalfEdgeMesh& m, uint32_t fmtVersion) {
     HalfEdgeMesh::Raw raw;
     uint32_t n = 0;
     if (!r.u32(n)) return ErrTruncated;
@@ -166,6 +171,19 @@ int readMesh(Reader& r, HalfEdgeMesh& m) {
             return ErrTruncated;
         }
         if (v.id == kNull) return ErrIndex;
+        if (fmtVersion >= 2) {
+            if (!r.f32(v.color.x) || !r.f32(v.color.y) || !r.f32(v.color.z)) {
+                return ErrTruncated;
+            }
+            // Defensive color validation: reject non-finite (corrupt), clamp
+            // out-of-range finite values into [0,1] (never guess beyond that).
+            if (!std::isfinite(v.color.x) || !std::isfinite(v.color.y) || !std::isfinite(v.color.z)) return ErrIndex;
+            v.color.x = std::min(1.0f, std::max(0.0f, v.color.x));
+            v.color.y = std::min(1.0f, std::max(0.0f, v.color.y));
+            v.color.z = std::min(1.0f, std::max(0.0f, v.color.z));
+        } else {
+            v.color = kDefaultVertexColor; // v1 files have no colors
+        }
         v.alive = true;
     }
     if (!r.u32(n)) return ErrTruncated;
@@ -322,7 +340,12 @@ int load(const std::vector<uint8_t>& bytes, Scene& out) {
     if (std::memcmp(bytes.data(), "BLONEPRJ", 8) != 0) return ErrMagic;
     uint32_t version;
     std::memcpy(&version, bytes.data() + 8, 4);
-    if (version != kFormatVersion) return ErrVersion;
+    // Versioned compatibility (Fase 3): v1 files (no colors) and v2 files
+    // (with colors) are both accepted; anything newer is REJECTED with a
+    // clear error — never silently guessed at.
+    if (version < kOldestSupportedVersion || version > kFormatVersion) {
+        return ErrVersion;
+    }
     uint64_t payloadLen;
     std::memcpy(&payloadLen, bytes.data() + 12, 8);
     uint32_t crc;
@@ -355,7 +378,7 @@ int load(const std::vector<uint8_t>& bytes, Scene& out) {
         if (!r.f32(obj.position.x) || !r.f32(obj.position.y) || !r.f32(obj.position.z)) {
             return ErrTruncated;
         }
-        int rc = readMesh(r, obj.mesh);
+        int rc = readMesh(r, obj.mesh, version);
         if (rc != Ok) return rc;
         rc = readSelection(r, obj.mesh, obj.sel);
         if (rc != Ok) return rc;
