@@ -686,18 +686,18 @@ private fun BottomBar(viewModel: BloneViewModel) {
 // the row itself. 12 colors cover skin/landscape/contrast needs for now;
 // fine HSV tuning is a documented future extension.
 private val PaintPalette = listOf(
-    0xFFF44336, // vermelho
-    0xFFFF7043, // laranja
-    0xFFFFD54F, // amarelo
-    0xFF66BB6A, // verde
-    0xFF26A69A, // teal
-    0xFF42A5F5, // azul
-    0xFF5C6BC0, // indigo
-    0xFFAB47BC, // roxo
-    0xFFEC407A, // rosa
-    0xFF8D6E63, // castanho
-    0xFFECEFF1, // branco
-    0xFF263238, // quase preto
+    0xFFF44336.toInt(), // vermelho
+    0xFFFF7043.toInt(), // laranja
+    0xFFFFD54F.toInt(), // amarelo
+    0xFF66BB6A.toInt(), // verde
+    0xFF26A69A.toInt(), // teal
+    0xFF42A5F5.toInt(), // azul
+    0xFF5C6BC0.toInt(), // indigo
+    0xFFAB47BC.toInt(), // roxo
+    0xFFEC407A.toInt(), // rosa
+    0xFF8D6E63.toInt(), // castanho
+    0xFFECEFF1.toInt(), // branco
+    0xFF263238.toInt(), // quase preto
 )
 
 /** One selectable color swatch (44 dp target, ring when selected). */
