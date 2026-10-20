@@ -24,12 +24,15 @@
 #include "../core/scene/Scene.h"
 
 #include <GLES3/gl3.h>
+#include <algorithm>
+#include <cmath>
 #include <vector>
 
 namespace blone {
 
-// Gizmo tool shown in edit mode (mirrors the Kotlin Tool enum).
-enum class GizmoTool : int { Move = 1, Rotate = 2, Scale = 3 };
+// Gizmo tool (mirrors the Kotlin Tool enum). None = no gizmo drawn and no
+// gizmo hit (the "Seleção" tool: taps select, nothing transforms).
+enum class GizmoTool : int { None = 0, Move = 1, Rotate = 2, Scale = 3 };
 
 class Renderer {
 public:
@@ -41,6 +44,17 @@ public:
     // Must be called on the GL thread. Values are clamped; a degenerate
     // usable area falls back to the full viewport.
     void setViewportInsets(int topPx, int bottomPx);
+    // Same, with LEFT/RIGHT bands too (side toolbars / property panel).
+    // glViewport(left, bottom, width - left - right, height - top - bottom).
+    void setViewportInsetsRect(int topPx, int bottomPx, int leftPx, int rightPx);
+    // Density scale for the gizmo (Kotlin passes resources.displayMetrics
+    // .density). Hit targets scale 1:1 with density (the 44 dp rule);
+    // visual lengths scale moderately (capped) so the gizmo never explodes
+    // on tablets. Clamped to [0.75, 3.0].
+    void setGizmoTouchScale(float scale) {
+        gizmoTouchScale_ = std::min(3.0f, std::max(0.75f,
+                std::isfinite(scale) ? scale : 1.0f));
+    }
     void render(const OrbitCamera& camera, const Scene& scene, float pointRadiusPx,
                 GizmoTool gizmoTool);
 
@@ -73,6 +87,8 @@ public:
     int viewportSurfaceHeight() const { return height_; }
     int viewportUsableTop() const { return usableTop_; }
     int viewportUsableHeight() const { return usableHeight_; }
+    int viewportUsableLeft() const { return usableLeft_; }
+    int viewportUsableWidth() const { return usableWidth_; }
 
 private:
     struct ObjectGpu {
@@ -139,7 +155,10 @@ private:
     // picking and the gizmo mapping all use THIS rect, so the model is
     // centered in the visible area and what you tap is what you see.
     int topInset_ = 0, bottomInset_ = 0;
+    int leftInset_ = 0, rightInset_ = 0;
     int usableTop_ = 0, usableHeight_ = 0;
+    int usableLeft_ = 0, usableWidth_ = 0;
+    float gizmoTouchScale_ = 1.0f;
     void applyViewport();
 };
 

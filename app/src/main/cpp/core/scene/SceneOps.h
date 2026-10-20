@@ -61,6 +61,11 @@ struct ToolSession {
 // Returns the new object index, or a negative ops::Status code.
 int createPrimitive(Scene& s, History& h, PrimType type, int segsU, int segsV);
 Status deleteActiveObject(Scene& s, History& h);
+// Duplicates the ACTIVE object (whole mesh clone, selection NOT copied,
+// offset +1.5 X so the copy is visible), activates the copy and pushes an
+// ObjectAdded history entry (undo removes the copy). Returns the new index
+// or a negative ops::Status code.
+int duplicateActiveObject(Scene& s, History& h);
 Status setActiveObject(Scene& s, int index);
 Status setEditMode(Scene& s, bool edit);
 Status setSelectionMode(Scene& s, SelMode mode);
@@ -90,6 +95,10 @@ Status loopCut(Scene& s, History& h);
 
 // ---- transform tools (gizmo-driven) ---------------------------------------
 // begins: tool from the gizmo mode; kind/axis from the renderer hit-test.
+// Works in BOTH modes (interface reorganization):
+//   - OBJECT mode: the target is ALWAYS the whole active object;
+//   - EDIT mode:   the target is the valid selection, or the whole object
+//                  when the selection is empty (documented fallback).
 Status beginTool(Scene& s, History& h, ToolSession& t, Tool tool, int kind,
                  int axis, float touchX, float touchY);
 // touchX/touchY are ABSOLUTE pixel positions (rings need the swept angle).
@@ -97,6 +106,16 @@ Status updateTool(Scene& s, ToolSession& t, const GizmoMapping& map,
                   float touchX, float touchY);
 Status endTool(Scene& s, History& h, ToolSession& t);
 void cancelTool(Scene& s, History& h, ToolSession& t);
+
+// Direct STEP transforms for the properties panel (no drag session):
+//   Tool::Move   -> `amount` = world units along the world axis (signed);
+//   Tool::Rotate -> `amount` = degrees around the world axis at the pivot;
+//   Tool::Scale  -> `amount` = factor (uniform when axis==3, axial otherwise),
+//                   clamped to [0.01, 100] like the gizmo path.
+// Target: EDIT mode valid selection, otherwise the whole active object.
+// Validates finiteness BEFORE mutating; commits a verticesDelta history
+// entry when something moved. Reuses the TransformMath helpers — no new math.
+Status transformDirect(Scene& s, History& h, Tool tool, int axis, float amount);
 
 // ---- history / scene -------------------------------------------------------
 Status undo(Scene& s, History& h);

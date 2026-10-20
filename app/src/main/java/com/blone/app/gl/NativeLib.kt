@@ -42,6 +42,21 @@ object NativeLib {
     external fun setViewportInsets(topPx: Int, bottomPx: Int)
 
     /**
+     * Same as [setViewportInsets] with LEFT/RIGHT bands too (side toolbar /
+     * property panel). MUST be called on the GL thread. The renderer draws,
+     * picks and maps the gizmo inside THIS rect — what you see is what you
+     * touch, in every panel state.
+     */
+    external fun setViewportInsetsRect(topPx: Int, bottomPx: Int, leftPx: Int, rightPx: Int)
+
+    /**
+     * Density scale for the gizmo touch targets (DECISÃO D — 44 dp rule):
+     * pass `resources.displayMetrics.density` once per process. Hit targets
+     * scale 1:1; visual lengths scale moderately (capped natively).
+     */
+    external fun setGizmoTouchScale(scale: Float)
+
+    /**
      * ATOMIC selection snapshot from the C++ engine (single source of truth):
      * [editMode, selectionMode, multiSelect, hasActiveObject,
      *  nVerts, nEdges, nFaces, hasValidSelection].
@@ -79,6 +94,13 @@ object NativeLib {
     /** [vertices, edges, faces, isActive] or null when the index is invalid. */
     external fun objectInfo(index: Int): IntArray?
 
+    /**
+     * World-space centroid of the object (whole-object gizmo pivot rule):
+     * [x, y, z] or null when the index is invalid / the mesh is empty.
+     * Display-only (properties panel readout).
+     */
+    external fun objectCenter(index: Int): FloatArray?
+
     external fun setActiveObject(index: Int): Int
 
     external fun setEditMode(edit: Boolean)
@@ -95,10 +117,19 @@ object NativeLib {
     external fun subdivide(): Int
     external fun deleteSelection(): Int
     external fun deleteActiveObject(): Int
+    external fun duplicateActiveObject(): Int
     external fun loopCut(): Int
 
+    /**
+     * Direct STEP transform (properties panel): tool 1 move / 2 rotate /
+     * 3 scale; axis 0..2 (3 = uniform, scale only); amount in world units /
+     * degrees / factor. Validates finiteness and clamps like the gizmo path;
+     * commits one history entry. Returns 0 (OK) or a negative status.
+     */
+    external fun transformDirect(tool: Int, axis: Int, amount: Float): Int
+
     // ---- gizmo (correção Fase 2) --------------------------------------------
-    /** Selects the gizmo tool shown in edit mode: 1 move, 2 rotate, 3 scale. */
+    /** Selects the gizmo tool: 0 none ("Seleção"), 1 move, 2 rotate, 3 scale. */
     external fun setGizmoTool(tool: Int)
 
     /**

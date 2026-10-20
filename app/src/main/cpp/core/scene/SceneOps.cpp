@@ -96,6 +96,35 @@ Status deleteActiveObject(Scene& s, History& h) {
     return Status::OK;
 }
 
+int duplicateActiveObject(Scene& s, History& h) {
+    SceneObject* obj = s.activeObject();
+    if (!obj) return -static_cast<int>(Status::ErrNoActiveObject);
+    if (s.objects.size() >= Scene::kMaxObjects) return -static_cast<int>(Status::ErrLimit);
+
+    // Build the clone into a temporary first: the scene is untouched on
+    // failure (same contract as createPrimitive).
+    SceneObject clone;
+    clone.name = obj->name;
+    // Visible offset so the copy is distinguishable from the original.
+    clone.position = obj->position + Vec3{1.5f, 0.0f, 0.0f};
+    clone.mesh.restoreRaw(obj->mesh.captureRaw());
+    clone.sel.clear();
+
+    // History reservation BEFORE the scene changes (condition 3).
+    const uint64_t cost = clone.mesh.rawBytes() * 2 + 256;
+    if (!h.reserve(cost)) return -static_cast<int>(Status::ErrBudget);
+
+    s.objects.push_back(std::move(clone));
+    const int index = static_cast<int>(s.objects.size()) - 1;
+    s.active = index;
+    if (!h.pushObjectAdded(static_cast<uint32_t>(index), s.objects[static_cast<size_t>(index)])) {
+        h.rollbackReservation();
+        return -static_cast<int>(Status::ErrInternal);
+    }
+    s.bump();
+    return index;
+}
+
 Status setActiveObject(Scene& s, int index) {
     if (index < 0 || index >= static_cast<int>(s.objects.size())) return Status::ErrInvalidArg;
     s.active = index;
@@ -344,24 +373,28 @@ Status beginTool(Scene& s, History& h, ToolSession& t, Tool tool, int kind,
     if (t.active) cancelTool(s, h, t);
     SceneObject* obj = s.activeObject();
     if (!obj) return Status::ErrNoActiveObject;
-    if (!s.editMode) return Status::ErrInvalidArg;
+    // OBJECT mode transforms the WHOLE object (interface reorganization:
+    // DECISÃO C — the user can move/rotate/scale a full object without
+    // entering edit mode). EDIT mode keeps the selection-based target.
     if (kind < 1 || kind > 3 || axis < 0 || axis > 3) return Status::ErrInvalidArg;
 
     // Deduplicated vertex set from the current selection.
     std::set<ElemId> verts;
-    for (const ElemId v : obj->sel.verts) verts.insert(v);
-    for (const ElemId e : obj->sel.edges) {
-        if (!obj->mesh.edgeAlive(e)) continue;
-        const ElemId he = obj->mesh.edg(e).he;
-        verts.insert(obj->mesh.heg(he).origin);
-        verts.insert(obj->mesh.heg(obj->mesh.heg(he).twin).origin);
-    }
-    for (const ElemId f : obj->sel.faces) {
-        for (const ElemId v : obj->mesh.faceVertices(f)) verts.insert(v);
+    if (s.editMode) {
+        for (const ElemId v : obj->sel.verts) verts.insert(v);
+        for (const ElemId e : obj->sel.edges) {
+            if (!obj->mesh.edgeAlive(e)) continue;
+            const ElemId he = obj->mesh.edg(e).he;
+            verts.insert(obj->mesh.heg(he).origin);
+            verts.insert(obj->mesh.heg(obj->mesh.heg(he).twin).origin);
+        }
+        for (const ElemId f : obj->sel.faces) {
+            for (const ElemId v : obj->mesh.faceVertices(f)) verts.insert(v);
+        }
     }
     if (verts.empty()) {
-        // No selection: the WHOLE object is the transform target — the edit
-        // mode never locks up (touch a gizmo axis, the object moves).
+        // No selection (or OBJECT mode): the WHOLE object is the transform
+        // target — the tool never locks up (touch a gizmo axis, it moves).
         for (const auto& v : obj->mesh.vertices()) {
             if (v.alive) verts.insert(v.id);
         }
@@ -559,6 +592,119 @@ void cancelTool(Scene& s, History& h, ToolSession& t) {
     h.rollbackReservation();
     s.bump();
     t = ToolSession{};
+}
+
+// ------------------------------------------------- direct step transforms --
+
+Status transformDirect(Scene& s, History& h, Tool tool, int axis, float amount) {
+    SceneObject* obj = s.activeObject();
+    if (!obj) return Status::ErrNoActiveObject;
+    if (tool == Tool::None) return Status::ErrInvalidArg;
+    if (axis < 0 || axis > 3) return Status::ErrInvalidArg;
+    // axis==3 means "uniform" — only Scale accepts it.
+    if (tool != Tool::Scale && axis == 3) return Status::ErrInvalidArg;
+    // Non-finite amounts are rejected BEFORE anything changes (same policy
+    // as the gizmo path — stability correction).
+    if (!std::isfinite(amount)) return Status::ErrInvalidArg;
+
+    // Target: EDIT mode valid selection, otherwise the whole active object.
+    std::set<ElemId> verts;
+    if (s.editMode) {
+        for (const ElemId v : obj->sel.verts) verts.insert(v);
+        for (const ElemId e : obj->sel.edges) {
+            if (!obj->mesh.edgeAlive(e)) continue;
+            const ElemId he = obj->mesh.edg(e).he;
+            verts.insert(obj->mesh.heg(he).origin);
+            verts.insert(obj->mesh.heg(obj->mesh.heg(he).twin).origin);
+        }
+        for (const ElemId f : obj->sel.faces) {
+            for (const ElemId v : obj->mesh.faceVertices(f)) verts.insert(v);
+        }
+    }
+    if (verts.empty()) {
+        for (const auto& v : obj->mesh.vertices()) {
+            if (v.alive) verts.insert(v.id);
+        }
+    }
+    if (verts.empty()) return Status::ErrNoSelection;
+
+    const std::vector<ElemId> targets(verts.begin(), verts.end());
+    Vec3 pivot{};
+    for (const ElemId v : targets) pivot = pivot + obj->mesh.vrt(v).pos;
+    pivot = pivot * (1.0f / static_cast<float>(targets.size()));
+
+    // Capture BEFORE, reserve history, mutate, validate, commit.
+    std::vector<std::pair<ElemId, Vec3>> before;
+    before.reserve(targets.size());
+    for (const ElemId v : targets) before.emplace_back(v, obj->mesh.vrt(v).pos);
+    const uint64_t cost = static_cast<uint64_t>(targets.size()) * 2ull * 16ull + 256;
+    if (!h.reserve(cost)) return Status::ErrBudget;
+
+    const Vec3 axisVec = axisUnit(axis < 3 ? axis : 0); // axis==3: unused (uniform)
+    switch (tool) {
+        case Tool::Move: {
+            ops::applyMove(obj->mesh, targets, axisVec * amount);
+            break;
+        }
+        case Tool::Rotate: {
+            ops::applyRotation(obj->mesh, targets, pivot, axisVec, amount);
+            break;
+        }
+        case Tool::Scale: {
+            const float f = ops::clampAccumScale(amount);
+            if (!std::isfinite(f) || f <= 0.0f) {
+                h.rollbackReservation();
+                return Status::ErrInvalidArg;
+            }
+            if (axis == 3) {
+                ops::applyScale(obj->mesh, targets, pivot, f);
+            } else {
+                ops::applyAxisScale(obj->mesh, targets, pivot, axisVec, f);
+            }
+            break;
+        }
+        case Tool::None:
+            h.rollbackReservation();
+            return Status::ErrInvalidArg;
+    }
+
+    // Post-validation: a committed transform must never write non-finite
+    // geometry (same contract as endTool).
+    std::vector<std::pair<ElemId, Vec3>> after;
+    after.reserve(targets.size());
+    for (const ElemId v : targets) after.emplace_back(v, obj->mesh.vrt(v).pos);
+    for (const auto& [id, pos] : after) {
+        if (!ops::isFiniteVec(pos.x, pos.y, pos.z)) {
+            for (const auto& [vid, orig] : before) {
+                if (obj->mesh.vertexAlive(vid)) obj->mesh.vrt(vid).pos = orig;
+            }
+            h.rollbackReservation();
+            s.bump();
+            return Status::ErrInternal;
+        }
+    }
+    const bool moved = [&] {
+        for (size_t i = 0; i < before.size(); ++i) {
+            const Vec3 d = before[i].second - after[i].second;
+            if (std::fabs(d.x) + std::fabs(d.y) + std::fabs(d.z) > 1e-7f) return true;
+        }
+        return false;
+    }();
+    if (!moved) {
+        h.rollbackReservation();
+        return Status::OK;
+    }
+    // Copies (not moves): 'before' must stay valid for the failure restore.
+    if (!h.pushVerticesDelta(static_cast<uint32_t>(s.active), before, after)) {
+        for (const auto& [vid, orig] : before) {
+            if (obj->mesh.vertexAlive(vid)) obj->mesh.vrt(vid).pos = orig;
+        }
+        h.rollbackReservation();
+        s.bump();
+        return Status::ErrInternal;
+    }
+    s.bump();
+    return Status::OK;
 }
 
 // -------------------------------------------------------- history / scene --

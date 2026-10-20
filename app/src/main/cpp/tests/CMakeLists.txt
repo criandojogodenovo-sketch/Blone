@@ -18,6 +18,7 @@ add_executable(blone_tests
         test_history_project.cpp
         test_render_gizmo.cpp
         test_selection.cpp
+        test_ui_modes.cpp
         ${CPP_DIR}/core/mesh/HalfEdgeMesh.cpp
         ${CPP_DIR}/core/mesh/Primitives.cpp
         ${CPP_DIR}/core/operations/Operations.cpp

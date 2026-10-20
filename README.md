@@ -29,13 +29,24 @@ viewport centrada na área útil).
 - **Luz de preenchimento**: as faces viradas para longe da luz mantêm
   leitura (culling permanece ativo — sem buracos falsos).
 - Primitivas editáveis: Cubo, Esfera, Cilindro e Plano (núcleo half-edge).
+- Modo Objeto: toque num objeto para o ATIVAR; **gizmo do objeto inteiro**
+  (mover/rodar/escalar sem entrar em Edição); **Duplicar objeto** (cópia
+  deslocada, desfeita pelo undo); apagar objeto.
 - Modo Editar com seleção de vértices, arestas e faces (oclusão respeitada,
-  snap por distância ponto-segmento), seleção múltipla opcional.
-- **GIZMO no écran**: eixos X/Y/Z para mover, anéis para rodar, eixos +
-  centro para escalar — arrastar uma alça transforma a seleção; com a
-  seleção VAZIA o gizmo desaparece (sem alças invisíveis); arrastar FORA
-  do gizmo orbita a câmara; **dois dedos é sempre a câmara** e cancela o
-  arrasto do gizmo.
+  snap por distância ponto-segmento), seleção múltipla opcional. A
+  identidade do objeto ativo e a seleção de componentes sobrevivem às
+  transições Objeto↔Edição (escondidas, nunca perdidas).
+- **GIZMO no écran**: eixos X/Y/Z para mover (com centro visível), anéis
+  para rodar, eixos + centro para escalar — arrastar uma alça transforma o
+  alvo; **alvos de toque adaptados à densidade (regra dos 44 dp) e o corpo
+  do eixo inteiro também agarra**; em Edição, com a seleção VAZIA o gizmo
+  desaparece (sem alças invisíveis); arrastar FORA do gizmo orbita a
+  câmara; **dois dedos é sempre a câmara** e cancela o arrasto do gizmo;
+  a ferramenta "Sel." desliga o gizmo (toque = só selecionar).
+- **Painel de propriedades** (recolhível): nome real do motor ("Cubo 1"),
+  contagens V/A/F, centro do objeto e transformações por passos fixos
+  (mover ±0.25, rodar ±15°, escalar ×1.25/÷1.25) com histórico —
+  acessibilidade sem arrastos precisos.
 - Extrusão de faces, subdivisão (quads/triângulos), apagar vértices/arestas/
   faces com validação topológica (rejeição sem mutação parcial), loop cut
   em anéis de quads.
@@ -45,13 +56,18 @@ viewport centrada na área útil).
   acumulado nunca achata a malha (mínimo 0.01).
 - Guardar/Abrir projeto próprio (formato BLONEPRJ v1, validado com CRC32 —
   ver docs/PROJECT_FORMAT.md) via SAF, sem permissões de armazenamento.
-- Interface compacta NAS DUAS ORIENTAÇÕES: barra contextual (V/A/F +
-  gizmo) com scroll horizontal, painel secundário expansível ("Mais ▾"),
-  painéis inferiores limitados a 35% da altura útil em paisagem com scroll
-  interno, objetos com nomes legíveis ("Cubo 1") e o modelo centrado na
-  área realmente visível (viewport útil reportada ao renderer).
+- Interface em QUATRO ZONAS nas duas orientações (barra inferior deixa de
+  ser o lar das ferramentas): **barra superior compacta** com uma linha
+  (undo/refazer, Guardar/Abrir, modo atual, FPS, Avançado, Propriedades);
+  **barra lateral de ferramentas** à esquerda (Sel./Mover/Rodar/Escalar
+  mais as operações contextuais de cada modo); **painel de propriedades**
+  à direita; **barra inferior compacta** (Objeto/Edição + V/A/F + estado
+  da seleção). O modelo é desenhado, centrado e tocado no retângulo
+  realmente visível (viewport útil com os 4 lados reportada ao renderer);
+  painéis limitados com scroll interno em ecrãs pequenos.
 - Contador de FPS medido a partir de timestamps reais.
-- Modos Esculpir/Pintar visíveis mas desativados (fases futuras).
+- Esculpir/Pintar continuam indisponíveis (fases futuras) e deixaram de
+  ter botões na interface — documentados aqui e no ARCHITECTURE.md.
 
 ## Compilar localmente
 

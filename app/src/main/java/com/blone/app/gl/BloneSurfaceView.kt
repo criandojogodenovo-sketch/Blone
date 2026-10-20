@@ -5,7 +5,6 @@ import android.content.Context
 import android.opengl.GLSurfaceView
 import android.view.MotionEvent
 import com.blone.app.vm.BloneViewModel
-import com.blone.app.vm.ViewportMode
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
 
@@ -51,19 +50,18 @@ class BloneSurfaceView(
         onGizmoDown = { x, y ->
             // Runs on the UI thread; the native hit-test is CPU-only and
             // mutex-guarded (one frame of contention at most).
-            if (viewModel.mode == ViewportMode.EDIT) {
-                val handle = try {
-                    NativeLib.gizmoHitTest(x, y)
-                } catch (_: Throwable) {
-                    0
-                }
-                if (handle != 0) {
-                    viewModel.beginGizmoDrag(handle, x, y)
-                }
-                handle
-            } else {
+            // NO mode gate here: the ENGINE decides in both modes — the
+            // object-mode gizmo (whole active object) and the edit-mode
+            // gizmo (valid selection) share the same gate as the drawing.
+            val handle = try {
+                NativeLib.gizmoHitTest(x, y)
+            } catch (_: Throwable) {
                 0
             }
+            if (handle != 0) {
+                viewModel.beginGizmoDrag(handle, x, y)
+            }
+            handle
         },
         onGizmoMove = { x, y ->
             viewModel.onGizmoDragMove(x, y)
@@ -82,6 +80,13 @@ class BloneSurfaceView(
         preserveEGLContextOnPause = true
         setRenderer(RendererBridge())
         renderMode = RENDERMODE_CONTINUOUSLY
+        // DECISÃO D: gizmo touch targets scale with density (hit targets 1:1,
+        // visual lengths capped natively). Not GL state — safe pre-context.
+        try {
+            NativeLib.setGizmoTouchScale(density)
+        } catch (_: Throwable) {
+            // Native not ready — the renderer default (1.0) applies.
+        }
     }
 
     /** Sends the current camera snapshot to native code (called each frame). */
@@ -119,6 +124,21 @@ class BloneSurfaceView(
         queueEvent {
             try {
                 NativeLib.setViewportInsets(topPx, bottomPx)
+            } catch (_: Throwable) {
+                // Context tearing down — the next surfaceChanged re-applies.
+            }
+            requestRender()
+        }
+    }
+
+    /**
+     * Same, including LEFT/RIGHT bands (side toolbar / property panel). The
+     * renderer draws, picks and maps the gizmo inside THIS rect.
+     */
+    fun applyViewportRect(topPx: Int, bottomPx: Int, leftPx: Int, rightPx: Int) {
+        queueEvent {
+            try {
+                NativeLib.setViewportInsetsRect(topPx, bottomPx, leftPx, rightPx)
             } catch (_: Throwable) {
                 // Context tearing down — the next surfaceChanged re-applies.
             }

@@ -3,6 +3,7 @@
 #include "../core/Log.h"
 #include "../core/Scene.h"
 #include "../core/render/RenderData.h"
+#include "../core/scene/GizmoPivot.h"
 #include "../core/scene/Scene.h"
 #include "../core/scene/SceneOps.h"
 
@@ -197,11 +198,18 @@ constexpr float kAxisColor[3][3] = {
         {0.35f, 0.80f, 0.40f},
         {0.35f, 0.60f, 0.98f},
 };
+// VISUAL sizes (px at density 1; scaled moderately by gizmoTouchScale_,
+// capped so the gizmo never explodes on tablets).
 constexpr float kGizmoArrowPx = 78.0f;  // axis length on screen
 constexpr float kGizmoRingPx = 54.0f;   // rotation ring radius on screen
-constexpr float kGizmoTipRadiusPx = 26.0f;
-constexpr float kGizmoRingRadiusPx = 16.0f;
-constexpr float kGizmoCenterRadiusPx = 22.0f;
+// HIT targets (px at density 1; scaled 1:1 by gizmoTouchScale_): the tip
+// radius gives a 44 px diameter at density 1 => the 44 dp touch-target rule
+// (audit finding #3: the old fixed 26/16/22 px radii were far too small on
+// high-density phones).
+constexpr float kHitTipPx = 22.0f;      // axis tip => 44px diameter target
+constexpr float kHitRingPx = 18.0f;     // rotation ring band
+constexpr float kHitCenterPx = 20.0f;   // uniform-scale center => 40px
+constexpr float kHitAxisSegmentPx = 10.0f; // anywhere along the axis body
 
 } // namespace
 
@@ -518,18 +526,25 @@ void Renderer::applyViewport() {
     if (width_ <= 0 || height_ <= 0) return;
     int top = std::clamp(topInset_, 0, height_ - 1);
     int bottom = std::clamp(bottomInset_, 0, height_ - 1 - top);
-    const int usable = height_ - top - bottom;
-    if (usable <= 0) {
+    int left = std::clamp(leftInset_, 0, width_ - 1);
+    int right = std::clamp(rightInset_, 0, width_ - 1 - left);
+    const int usableH = height_ - top - bottom;
+    const int usableW = width_ - left - right;
+    if (usableH <= 0 || usableW <= 0) {
         // Degenerate chrome — fall back to the full surface rather than
         // drawing nothing (never confuse empty selection/zero area with a
         // rendering failure).
         top = 0;
         bottom = 0;
+        left = 0;
+        right = 0;
     }
     usableTop_ = top;
     usableHeight_ = height_ - top - bottom;
-    aspect_ = static_cast<float>(width_) / static_cast<float>(usableHeight_);
-    glViewport(0, bottom, width_, usableHeight_);
+    usableLeft_ = left;
+    usableWidth_ = width_ - left - right;
+    aspect_ = static_cast<float>(usableWidth_) / static_cast<float>(usableHeight_);
+    glViewport(usableLeft_, bottom, usableWidth_, usableHeight_);
 }
 
 void Renderer::resize(int width, int height) {
@@ -540,12 +555,20 @@ void Renderer::resize(int width, int height) {
 }
 
 void Renderer::setViewportInsets(int topPx, int bottomPx) {
+    setViewportInsetsRect(topPx, bottomPx, leftInset_, rightInset_);
+}
+
+void Renderer::setViewportInsetsRect(int topPx, int bottomPx, int leftPx, int rightPx) {
     if (!std::isfinite(static_cast<float>(topPx)) ||
-        !std::isfinite(static_cast<float>(bottomPx))) {
+        !std::isfinite(static_cast<float>(bottomPx)) ||
+        !std::isfinite(static_cast<float>(leftPx)) ||
+        !std::isfinite(static_cast<float>(rightPx))) {
         return;
     }
     topInset_ = std::max(0, topPx);
     bottomInset_ = std::max(0, bottomPx);
+    leftInset_ = std::max(0, leftPx);
+    rightInset_ = std::max(0, rightPx);
     applyViewport();
 }
 
@@ -668,11 +691,18 @@ void Renderer::render(const OrbitCamera& camera, const Scene& scene,
     }
     glBindVertexArray(0);
 
-    // Gizmo overlay (edit mode, active object) — ONLY when the selection is
-    // VALID (at least one alive selected element). An empty or invalidated
-    // selection draws NO gizmo, NO markers, NO highlights — the UI state
-    // matches what the renderer actually shows (stability correction).
-    if (scene.editMode && sceneops::hasValidSelection(scene)) {
+    // Gizmo overlay — active object, in BOTH modes (interface reorganization:
+    // DECISÃO C — whole-object gizmo in object mode):
+    //   - OBJECT mode: shown when an active object with geometry exists;
+    //   - EDIT mode: ONLY when the selection is VALID (at least one alive
+    //     selected element). An empty or invalidated selection draws NO
+    //     gizmo, NO markers, NO highlights — the UI state matches what the
+    //     renderer actually shows (stability correction).
+    //   - GizmoTool::None ("Seleção") draws no gizmo and accepts no hit.
+    const bool objectModeGizmo = !scene.editMode && scene.activeObject() != nullptr &&
+                                 !scene.activeObject()->mesh.empty();
+    const bool editModeGizmo = scene.editMode && sceneops::hasValidSelection(scene);
+    if (gizmoTool != GizmoTool::None && (objectModeGizmo || editModeGizmo)) {
         drawGizmo(scene, vp, gizmoTool);
     }
 }
@@ -687,8 +717,10 @@ bool Renderer::projectToScreenPx(const Vec3& world, float& sx, float& sy) const 
     if (cw <= 1e-6f) return false; // behind the camera
     const float ndcX = cx / cw;
     const float ndcY = cy / cw;
+    const int usableW = usableWidth_ > 0 ? usableWidth_ : width_;
     const int usableH = usableHeight_ > 0 ? usableHeight_ : height_;
-    sx = (ndcX * 0.5f + 0.5f) * static_cast<float>(width_);
+    sx = static_cast<float>(usableLeft_) +
+         (ndcX * 0.5f + 0.5f) * static_cast<float>(usableW);
     sy = static_cast<float>(usableTop_) +
          (1.0f - (ndcY * 0.5f + 0.5f)) * static_cast<float>(usableH);
     return true;
@@ -696,52 +728,15 @@ bool Renderer::projectToScreenPx(const Vec3& world, float& sx, float& sy) const 
 
 namespace {
 
-// Selection pivot in WORLD space: centroid of the selected elements, or of
-// the whole object when the selection is empty (gizmo transforms the whole
-// object then — the edit mode is never "locked").
-Vec3 gizmoPivot(const Scene& scene, int& objIndexOut) {
-    objIndexOut = scene.active;
-    const SceneObject* obj = scene.activeObject();
-    if (!obj || obj->mesh.empty()) return Vec3{};
-    Vec3 acc{};
-    size_t count = 0;
-    for (const ElemId v : obj->sel.verts) {
-        if (!obj->mesh.vertexAlive(v)) continue;
-        acc = acc + obj->mesh.vrt(v).pos;
-        ++count;
-    }
-    for (const ElemId e : obj->sel.edges) {
-        if (!obj->mesh.edgeAlive(e)) continue;
-        const ElemId h = obj->mesh.edg(e).he;
-        acc = acc + obj->mesh.vrt(obj->mesh.heg(h).origin).pos;
-        acc = acc + obj->mesh.vrt(obj->mesh.heg(obj->mesh.heg(h).twin).origin).pos;
-        count += 2;
-    }
-    for (const ElemId f : obj->sel.faces) {
-        if (!obj->mesh.faceAlive(f)) continue;
-        for (const ElemId v : obj->mesh.faceVertices(f)) {
-            acc = acc + obj->mesh.vrt(v).pos;
-            ++count;
-        }
-    }
-    if (count == 0) {
-        for (const auto& v : obj->mesh.vertices()) {
-            if (!v.alive) continue;
-            acc = acc + v.pos;
-            ++count;
-        }
-    }
-    if (count == 0) return Vec3{};
-    const Vec3 local = acc * (1.0f / static_cast<float>(count));
-    return local + obj->position;
-}
+// The gizmo pivot rule is SHARED with the JNI mapping (core/scene/GizmoPivot.h)
+// so drawing and hit-testing can never diverge.
 
 } // namespace
 
 void Renderer::drawGizmo(const Scene& scene, const Mat4& vp, GizmoTool tool) {
     int objIndex = -1;
-    const Vec3 pivot = gizmoPivot(scene, objIndex);
-    if (objIndex < 0) return;
+    Vec3 pivot{};
+    if (!gizmopivot::pivotFor(scene, scene.editMode, pivot, objIndex)) return;
 
     const Vec3 toPivot = pivot - eye_;
     const float distPivot = std::max(length(toPivot), 0.5f);
@@ -749,8 +744,11 @@ void Renderer::drawGizmo(const Scene& scene, const Mat4& vp, GizmoTool tool) {
     const float wpp = 2.0f * distPivot *
                       std::tan(cam_.fovYDeg * static_cast<float>(M_PI) / 180.0f * 0.5f) /
                       static_cast<float>(std::max(usableH, 1));
-    const float axisLen = wpp * kGizmoArrowPx;
-    const float ringR = wpp * kGizmoRingPx;
+    // Visual scale: moderate growth with density (capped); hit targets use
+    // the full density scale (see kHit* constants).
+    const float visual = std::min(gizmoTouchScale_, 1.6f);
+    const float axisLen = wpp * kGizmoArrowPx * visual;
+    const float ringR = wpp * kGizmoRingPx * visual;
 
     gizmoLineScratch_.clear();
     gizmoPtScratch_.clear();
@@ -807,14 +805,15 @@ void Renderer::drawGizmo(const Scene& scene, const Mat4& vp, GizmoTool tool) {
         glEnable(GL_DEPTH_TEST);
     }
 
-    // Handle dots: one per axis tip (axis color) — readable touch targets.
+    // Handle dots: one per axis tip (axis color) — readable touch targets
+    // (size scales with density; DECISÃO D).
     if (tool != GizmoTool::Rotate) {
         glDisable(GL_DEPTH_TEST);
         glBindVertexArray(gizmoPtVao_);
         glBindBuffer(GL_ARRAY_BUFFER, gizmoPtVbo_);
         glUseProgram(pointProgram_);
         glUniformMatrix4fv(pointMvpLoc_, 1, GL_FALSE, vp.m);
-        glUniform1f(pointSizeLoc_, 12.0f);
+        glUniform1f(pointSizeLoc_, std::min(20.0f, 12.0f * gizmoTouchScale_));
         for (int a = 0; a < 3; ++a) {
             gizmoPtScratch_.clear();
             gizmoPtScratch_.push_back(tips[a].x);
@@ -827,18 +826,18 @@ void Renderer::drawGizmo(const Scene& scene, const Mat4& vp, GizmoTool tool) {
                         kAxisColor[a][2], 1.0f);
             glDrawArrays(GL_POINTS, 0, 1);
         }
-        if (tool == GizmoTool::Scale) {
-            // Uniform-scale center handle (white dot).
-            gizmoPtScratch_.clear();
-            gizmoPtScratch_.push_back(pivot.x);
-            gizmoPtScratch_.push_back(pivot.y);
-            gizmoPtScratch_.push_back(pivot.z);
-            glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(3 * sizeof(float)),
-                         gizmoPtScratch_.data(), GL_DYNAMIC_DRAW);
-            glUniform4f(pointColorLoc_, 1.0f, 1.0f, 1.0f, 1.0f);
-            glUniform1f(pointSizeLoc_, 10.0f);
-            glDrawArrays(GL_POINTS, 0, 1);
-        }
+        // Visible CENTER dot at the pivot (DECISÃO D: "gizmo de mover com
+        // eixos identificáveis e centro visível") — white, no hit.
+        gizmoPtScratch_.clear();
+        gizmoPtScratch_.push_back(pivot.x);
+        gizmoPtScratch_.push_back(pivot.y);
+        gizmoPtScratch_.push_back(pivot.z);
+        glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(3 * sizeof(float)),
+                     gizmoPtScratch_.data(), GL_DYNAMIC_DRAW);
+        glUniform4f(pointColorLoc_, 1.0f, 1.0f, 1.0f, 1.0f);
+        glUniform1f(pointSizeLoc_,
+                    std::min(16.0f, 9.0f * gizmoTouchScale_));
+        glDrawArrays(GL_POINTS, 0, 1);
         glBindVertexArray(0);
         glEnable(GL_DEPTH_TEST);
     }
@@ -847,11 +846,17 @@ void Renderer::drawGizmo(const Scene& scene, const Mat4& vp, GizmoTool tool) {
 Renderer::GizmoHit Renderer::gizmoHitAt(float xPx, float yPx, const Scene& scene,
                                         GizmoTool tool) const {
     GizmoHit out;
-    // Same gate as the drawing: an empty/invalid selection shows NO gizmo,
-    // so it must never produce a hit either (no invisible handles).
-    if (!sceneops::hasValidSelection(scene)) return out;
+    // EXACTLY the same gate as the drawing (render()): object mode gizmo for
+    // the active object, edit-mode gizmo only with a VALID selection, and
+    // GizmoTool::None never hits — no invisible/ghost handles.
+    const bool objectModeGizmo = !scene.editMode && scene.activeObject() != nullptr &&
+                                 !scene.activeObject()->mesh.empty();
+    const bool editModeGizmo = scene.editMode && sceneops::hasValidSelection(scene);
+    if (tool == GizmoTool::None || !(objectModeGizmo || editModeGizmo)) return out;
+
     int objIndex = -1;
-    const Vec3 pivot = gizmoPivot(scene, objIndex);
+    Vec3 pivot{};
+    if (!gizmopivot::pivotFor(scene, scene.editMode, pivot, objIndex)) return out;
     if (objIndex < 0) return out;
 
     float psx = 0.0f, psy = 0.0f;
@@ -863,8 +868,14 @@ Renderer::GizmoHit Renderer::gizmoHitAt(float xPx, float yPx, const Scene& scene
     const float wpp = 2.0f * distPivot *
                       std::tan(cam_.fovYDeg * static_cast<float>(M_PI) / 180.0f * 0.5f) /
                       static_cast<float>(std::max(usableH, 1));
-    const float axisLen = wpp * kGizmoArrowPx;
-    const float ringR = wpp * kGizmoRingPx;
+    const float visual = std::min(gizmoTouchScale_, 1.6f);
+    const float axisLen = wpp * kGizmoArrowPx * visual;
+    const float ringR = wpp * kGizmoRingPx * visual;
+    // Hit radii scale 1:1 with density (44 dp rule — DECISÃO D).
+    const float hitTip = kHitTipPx * gizmoTouchScale_;
+    const float hitRing = kHitRingPx * gizmoTouchScale_;
+    const float hitCenter = kHitCenterPx * gizmoTouchScale_;
+    const float hitSegment = kHitAxisSegmentPx * gizmoTouchScale_;
 
     const Vec3 axes[3] = {Vec3{1, 0, 0}, Vec3{0, 1, 0}, Vec3{0, 0, 1}};
     float best = std::numeric_limits<float>::max();
@@ -889,13 +900,30 @@ Renderer::GizmoHit Renderer::gizmoHitAt(float xPx, float yPx, const Scene& scene
             float sx = 0.0f, sy = 0.0f;
             if (!projectToScreenPx(tip, sx, sy)) continue;
             const float dx = sx - xPx, dy = sy - yPx;
-            if (std::sqrt(dx * dx + dy * dy) <= kGizmoTipRadiusPx) {
+            if (std::sqrt(dx * dx + dy * dy) <= hitTip) {
                 consider(sx, sy, a + 1, a, 1);
+            }
+            // Axis BODY: closest point on the pivot->tip screen segment so a
+            // touch anywhere along the arrow grabs that axis (hit target far
+            // larger than the 1 px visual line — DECISÃO D).
+            float bx = 0.0f, by = 0.0f;
+            if (!projectToScreenPx(pivot, bx, by)) continue;
+            const float ex = sx - bx, ey = sy - by;
+            const float len2 = ex * ex + ey * ey;
+            float t = 0.0f;
+            if (len2 > 1e-9f) {
+                t = ((xPx - bx) * ex + (yPx - by) * ey) / len2;
+                t = std::clamp(t, 0.0f, 1.0f);
+            }
+            const float cxp = bx + ex * t, cyp = by + ey * t;
+            const float ddx = cxp - xPx, ddy = cyp - yPx;
+            if (std::sqrt(ddx * ddx + ddy * ddy) <= hitSegment) {
+                consider(cxp, cyp, a + 1, a, 1);
             }
         }
         if (tool == GizmoTool::Scale) {
             const float dx = psx - xPx, dy = psy - yPx;
-            if (std::sqrt(dx * dx + dy * dy) <= kGizmoCenterRadiusPx) {
+            if (std::sqrt(dx * dx + dy * dy) <= hitCenter) {
                 consider(psx, psy, 4, 3, 3);
             }
         }
@@ -914,7 +942,7 @@ Renderer::GizmoHit Renderer::gizmoHitAt(float xPx, float yPx, const Scene& scene
                 if (!projectToScreenPx(p, sx, sy)) continue;
                 const float dx = sx - xPx, dy = sy - yPx;
                 const float d = std::sqrt(dx * dx + dy * dy);
-                if (d <= kGizmoRingRadiusPx && d < best) {
+                if (d <= hitRing && d < best) {
                     best = d;
                     out.hit = true;
                     out.handle = 11 + a;
@@ -936,8 +964,10 @@ Renderer::PickHit Renderer::pickAtPixel(float xPx, float yPx, const Scene& scene
 
     // SAME usable viewport rect the renderer drew with — taps map through the
     // exact projection used on screen (model centered in the visible area).
+    const int usableW = usableWidth_ > 0 ? usableWidth_ : width_;
     const int usableH = usableHeight_ > 0 ? usableHeight_ : height_;
-    const float ndcX = (2.0f * xPx / static_cast<float>(width_)) - 1.0f;
+    const float ndcX =
+            (2.0f * (xPx - static_cast<float>(usableLeft_)) / static_cast<float>(usableW)) - 1.0f;
     const float ndcY =
             1.0f - (2.0f * (yPx - static_cast<float>(usableTop_)) /
                     static_cast<float>(usableH));

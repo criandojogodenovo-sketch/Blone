@@ -131,12 +131,34 @@ class BloneViewModel : ViewModel() {
     var advancedOpen by mutableStateOf(false)
         private set
 
+    /** Contextual properties panel (right side, collapsible). */
+    var propertiesOpen by mutableStateOf(false)
+        private set
+
     /** Expandable secondary tool panel in Edit mode (contextual bar). */
     var toolsOpen by mutableStateOf(false)
         private set
 
     /** True while a mutating native operation is in flight. */
     var busy by mutableStateOf(false)
+        private set
+
+    // ---- properties panel readout (mirror of the engine, like selection) ----
+    // Filled by refresh() from NativeLib — never a second source of truth.
+    var propLabel by mutableStateOf("")
+        private set
+
+    var propVerts by mutableStateOf(0)
+        private set
+
+    var propEdges by mutableStateOf(0)
+        private set
+
+    var propFaces by mutableStateOf(0)
+        private set
+
+    /** World-space centroid of the active object; null when there is none. */
+    var propCenter by mutableStateOf<FloatArray?>(null)
         private set
 
     fun selectMode(m: ViewportMode) {
@@ -214,14 +236,13 @@ class BloneViewModel : ViewModel() {
     private var gizmoDragActive = false
 
     fun chooseGizmoTool(t: Tool) {
-        if (t == Tool.NONE) return
         gizmoTool = t
         NativeLib.setGizmoTool(t.native)
         statusText = when (t) {
             Tool.MOVE -> "Gizmo: Mover — arraste um eixo X/Y/Z · fora do gizmo: câmara"
             Tool.ROTATE -> "Gizmo: Rodar — arraste um anel · fora do gizmo: câmara"
             Tool.SCALE -> "Gizmo: Escalar — arraste um eixo ou o centro (uniforme)"
-            Tool.NONE -> ""
+            Tool.NONE -> "Seleção — toque para selecionar · gizmo desligado"
         }
     }
 
@@ -291,6 +312,28 @@ class BloneViewModel : ViewModel() {
     fun redo() = runOp("Refazer") { NativeLib.redo() }
     fun deleteActiveObject() = runOp("Apagar objeto") { NativeLib.deleteActiveObject() }
 
+    /** Duplicates the ACTIVE object; the copy becomes active (engine side). */
+    fun duplicateActiveObject() = runOp("Duplicar objeto") {
+        val idx = NativeLib.duplicateActiveObject()
+        if (idx >= 0) {
+            activeObject = idx // the engine activated the copy
+            NativeLib.Status.OK
+        } else {
+            -idx // positive status code -> readable StatusMessages entry
+        }
+    }
+
+    // ---- direct step transforms (properties panel) ---------------------------
+    // Fixed, honest steps — no free-form numeric entry yet (documented).
+    fun nudgeMove(axis: Int, worldUnits: Float) =
+        runOp("Mover") { NativeLib.transformDirect(Tool.MOVE.native, axis, worldUnits) }
+
+    fun nudgeRotate(axis: Int, degrees: Float) =
+        runOp("Rodar") { NativeLib.transformDirect(Tool.ROTATE.native, axis, degrees) }
+
+    fun nudgeScale(axis: Int, factor: Float) =
+        runOp("Escalar") { NativeLib.transformDirect(Tool.SCALE.native, axis, factor) }
+
     fun createPrimitive(type: Int, name: String) =
         runOp("Criar $name") { NativeLib.createPrimitive(type, 24, 12) }
 
@@ -302,6 +345,10 @@ class BloneViewModel : ViewModel() {
 
     fun toggleAdvanced() {
         advancedOpen = !advancedOpen
+    }
+
+    fun toggleProperties() {
+        propertiesOpen = !propertiesOpen
     }
 
     fun toggleTools() {
@@ -342,5 +389,22 @@ class BloneViewModel : ViewModel() {
         // ONE atomic native read for every selection-derived UI state — the
         // Kotlin layer never derives selection state on its own.
         applySnapshot(NativeLib.selectionSnapshot())
+        // Properties readout: engine-reported name/counts/center only.
+        val idx = activeObject
+        if (idx < 0 || idx >= objectCount) {
+            propLabel = ""
+            propVerts = 0
+            propEdges = 0
+            propFaces = 0
+            propCenter = null
+        } else {
+            val base = NativeLib.objectName(idx)
+            propLabel = if (base.isNullOrEmpty()) "Objeto ${idx + 1}" else "$base ${idx + 1}"
+            val info = NativeLib.objectInfo(idx)
+            propVerts = info?.getOrNull(0) ?: 0
+            propEdges = info?.getOrNull(1) ?: 0
+            propFaces = info?.getOrNull(2) ?: 0
+            propCenter = NativeLib.objectCenter(idx)
+        }
     }
 }

@@ -21,6 +21,7 @@
 #include "core/operations/TransformMath.h"
 #include "core/project/Project.h"
 #include "core/render/RenderData.h"
+#include "core/scene/GizmoPivot.h"
 #include "core/scene/Scene.h"
 #include "core/scene/SceneOps.h"
 #include "renderer/Renderer.h"
@@ -83,43 +84,16 @@ jintArray toJIntArray(JNIEnv* env, const std::vector<jint>& v) {
 // selection single-source-of-truth coherent at every entry point.
 void pruneSelectionsLocked() { blone::sceneops::pruneAllSelections(gScene); }
 
-// Selection pivot in WORLD space — identical rule to the renderer's
-// gizmoPivot (centroid of the selection; whole object when empty).
+// Selection pivot in WORLD space — the SHARED rule (core/scene/GizmoPivot.h)
+// used by the renderer too: drawing, hit-testing and drag mapping can never
+// diverge.
 blone::Vec3 gizmoPivotForJni(const blone::Scene& scene, int& objIndexOut) {
-    objIndexOut = scene.active;
-    const blone::SceneObject* obj = scene.activeObject();
-    if (!obj || obj->mesh.empty()) return blone::Vec3{};
-    blone::Vec3 acc{};
-    size_t count = 0;
-    for (const blone::ElemId v : obj->sel.verts) {
-        if (!obj->mesh.vertexAlive(v)) continue;
-        acc = acc + obj->mesh.vrt(v).pos;
-        ++count;
+    blone::Vec3 pivot{};
+    if (!blone::gizmopivot::pivotFor(scene, scene.editMode, pivot, objIndexOut)) {
+        objIndexOut = -1;
+        return blone::Vec3{};
     }
-    for (const blone::ElemId e : obj->sel.edges) {
-        if (!obj->mesh.edgeAlive(e)) continue;
-        const blone::ElemId h = obj->mesh.edg(e).he;
-        acc = acc + obj->mesh.vrt(obj->mesh.heg(h).origin).pos;
-        acc = acc + obj->mesh.vrt(obj->mesh.heg(obj->mesh.heg(h).twin).origin).pos;
-        count += 2;
-    }
-    for (const blone::ElemId f : obj->sel.faces) {
-        if (!obj->mesh.faceAlive(f)) continue;
-        for (const blone::ElemId v : obj->mesh.faceVertices(f)) {
-            acc = acc + obj->mesh.vrt(v).pos;
-            ++count;
-        }
-    }
-    if (count == 0) {
-        for (const auto& v : obj->mesh.vertices()) {
-            if (!v.alive) continue;
-            acc = acc + v.pos;
-            ++count;
-        }
-    }
-    if (count == 0) return blone::Vec3{};
-    const blone::Vec3 local = acc * (1.0f / static_cast<float>(count));
-    return local + obj->position;
+    return pivot;
 }
 
 // Pixel-space mapping of a world axis at the pivot for gizmo drags: screen
@@ -139,14 +113,18 @@ blone::sceneops::GizmoMapping gizmoMapping(const blone::OrbitCamera& cam,
     const blone::Vec3 axisDir = (axis >= 0 && axis <= 2) ? axes[axis] : axes[0];
 
     const float surfaceW = static_cast<float>(gRenderer.viewportSurfaceWidth());
-    const float surfaceH = static_cast<float>(gRenderer.viewportSurfaceHeight());
     const float usableTop = static_cast<float>(gRenderer.viewportUsableTop());
+    const float usableLeft = static_cast<float>(gRenderer.viewportUsableLeft());
     const float usableH = static_cast<float>(
             gRenderer.viewportUsableHeight() > 0 ? gRenderer.viewportUsableHeight()
                                                  : gRenderer.viewportSurfaceHeight());
-    const float vpW = surfaceW > 0.0f ? surfaceW : viewportW;
+    const float usableW = static_cast<float>(
+            gRenderer.viewportUsableWidth() > 0 ? gRenderer.viewportUsableWidth()
+                                                : gRenderer.viewportSurfaceWidth());
+    const float vpW = surfaceW > 0.0f ? usableW : viewportW;
     const float vpH = usableH > 0.0f ? usableH : viewportH;
     const float vpTop = surfaceW > 0.0f ? usableTop : 0.0f;
+    const float vpLeft = surfaceW > 0.0f ? usableLeft : 0.0f;
 
     // Selection pivot in world space (same rule as the renderer's gizmo).
     int objIndex = -1;
@@ -164,7 +142,7 @@ blone::sceneops::GizmoMapping gizmoMapping(const blone::OrbitCamera& cam,
         const float cy = vp.m[1] * w.x + vp.m[5] * w.y + vp.m[9] * w.z + vp.m[13];
         const float cw = vp.m[3] * w.x + vp.m[7] * w.y + vp.m[11] * w.z + vp.m[15];
         if (cw <= 1e-6f) return false;
-        sx = ((cx / cw) * 0.5f + 0.5f) * vpW;
+        sx = vpLeft + ((cx / cw) * 0.5f + 0.5f) * vpW;
         sy = vpTop + (1.0f - ((cy / cw) * 0.5f + 0.5f)) * vpH;
         return true;
     };
@@ -250,6 +228,25 @@ Java_com_blone_app_gl_NativeLib_setViewportInsets(JNIEnv* /*env*/, jobject /*thi
     gRenderer.setViewportInsets(topPx, bottomPx);
 }
 
+// Same, with left/right bands (side toolbar / property panel). MUST be called
+// on the GL thread (queueEvent) — the usable rect must match the drawn frame.
+extern "C" JNIEXPORT void JNICALL
+Java_com_blone_app_gl_NativeLib_setViewportInsetsRect(JNIEnv* /*env*/, jobject /*thiz*/,
+                                                      jint topPx, jint bottomPx,
+                                                      jint leftPx, jint rightPx) {
+    std::lock_guard<std::mutex> lock(gMutex);
+    gRenderer.setViewportInsetsRect(topPx, bottomPx, leftPx, rightPx);
+}
+
+// Density scale for the gizmo touch targets (44 dp rule). Not GL state —
+// safe from any thread (mutex-guarded).
+extern "C" JNIEXPORT void JNICALL
+Java_com_blone_app_gl_NativeLib_setGizmoTouchScale(JNIEnv* /*env*/, jobject /*thiz*/,
+                                                   jfloat scale) {
+    std::lock_guard<std::mutex> lock(gMutex);
+    gRenderer.setGizmoTouchScale(scale);
+}
+
 // ATOMIC selection snapshot for the UI (single source of truth):
 // [editMode, selectionMode, multiSelect, hasActive, nV, nE, nF, hasValid].
 extern "C" JNIEXPORT jintArray JNICALL
@@ -293,11 +290,11 @@ Java_com_blone_app_gl_NativeLib_pickAndSelect(JNIEnv* env, jobject /*thiz*/,
     return toJIntArray(env, out);
 }
 
-// Gizmo tool shown in edit mode: 1 move, 2 rotate, 3 scale.
+// Gizmo tool: 0 none ("Seleção"), 1 move, 2 rotate, 3 scale.
 extern "C" JNIEXPORT void JNICALL
 Java_com_blone_app_gl_NativeLib_setGizmoTool(JNIEnv* /*env*/, jobject /*thiz*/, jint tool) {
     std::lock_guard<std::mutex> lock(gMutex);
-    if (tool >= 1 && tool <= 3) {
+    if (tool >= 0 && tool <= 3) {
         gGizmoTool = static_cast<blone::GizmoTool>(tool);
     }
 }
@@ -420,6 +417,30 @@ Java_com_blone_app_gl_NativeLib_objectInfo(JNIEnv* env, jobject /*thiz*/, jint i
     return toJIntArray(env, out);
 }
 
+// World-space centroid of the object (same whole-object rule as the gizmo
+// pivot) for the properties panel readout; null when the index is invalid.
+extern "C" JNIEXPORT jfloatArray JNICALL
+Java_com_blone_app_gl_NativeLib_objectCenter(JNIEnv* env, jobject /*thiz*/, jint index) {
+    std::lock_guard<std::mutex> lock(gMutex);
+    if (index < 0 || index >= static_cast<jint>(gScene.objects.size())) return nullptr;
+    const blone::SceneObject& obj = gScene.objects[static_cast<size_t>(index)];
+    if (obj.mesh.empty()) return nullptr;
+    blone::Vec3 acc{};
+    size_t count = 0;
+    for (const auto& v : obj.mesh.vertices()) {
+        if (!v.alive) continue;
+        acc = acc + v.pos;
+        ++count;
+    }
+    if (count == 0) return nullptr;
+    const blone::Vec3 center = acc * (1.0f / static_cast<float>(count)) + obj.position;
+    const float c[3] = {center.x, center.y, center.z};
+    jfloatArray arr = env->NewFloatArray(3);
+    if (!arr) return nullptr;
+    env->SetFloatArrayRegion(arr, 0, 3, c);
+    return arr;
+}
+
 extern "C" JNIEXPORT jint JNICALL
 Java_com_blone_app_gl_NativeLib_setActiveObject(JNIEnv* /*env*/, jobject /*thiz*/,
                                                 jint index) {
@@ -485,6 +506,30 @@ extern "C" JNIEXPORT jint JNICALL
 Java_com_blone_app_gl_NativeLib_deleteActiveObject(JNIEnv* /*env*/, jobject /*thiz*/) {
     std::lock_guard<std::mutex> lock(gMutex);
     return static_cast<jint>(blone::sceneops::deleteActiveObject(gScene, gHistory));
+}
+
+// Duplicates the ACTIVE object; returns the new index or -status.
+extern "C" JNIEXPORT jint JNICALL
+Java_com_blone_app_gl_NativeLib_duplicateActiveObject(JNIEnv* /*env*/, jobject /*thiz*/) {
+    std::lock_guard<std::mutex> lock(gMutex);
+    const jint rc = static_cast<jint>(
+            blone::sceneops::duplicateActiveObject(gScene, gHistory));
+    pruneSelectionsLocked();
+    return rc;
+}
+
+// Direct STEP transform for the properties panel: tool 1 move / 2 rotate /
+// 3 scale; axis 0..2 (3 = uniform, scale only); amount in world units /
+// degrees / factor. Returns 0 (OK) or a negative status code.
+extern "C" JNIEXPORT jint JNICALL
+Java_com_blone_app_gl_NativeLib_transformDirect(JNIEnv* /*env*/, jobject /*thiz*/,
+                                                jint tool, jint axis, jfloat amount) {
+    std::lock_guard<std::mutex> lock(gMutex);
+    if (tool < 1 || tool > 3) return static_cast<jint>(blone::ops::Status::ErrInvalidArg);
+    const jint rc = static_cast<jint>(blone::sceneops::transformDirect(
+            gScene, gHistory, static_cast<blone::sceneops::Tool>(tool), axis, amount));
+    pruneSelectionsLocked();
+    return rc;
 }
 
 extern "C" JNIEXPORT jint JNICALL

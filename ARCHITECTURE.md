@@ -193,6 +193,37 @@ são rejeitadas antes de qualquer mutação; o fator acumulado fica preso a
 Transformações só são gravadas no histórico com geometria finita
 (verificação defensiva no fim da sessão).
 
+**Modo Objeto transformável (reorganização da interface):**
+`beginTool` funciona nos DOIS modos — no Modo Objeto o alvo é SEMPRE o
+objeto ativo inteiro (mover/rodar/escalar sem entrar em Edição); no
+Modo Edição o alvo é a seleção válida, com o objeto inteiro como
+fallback documentado quando a seleção está vazia. A ferramenta
+"Seleção" (`GizmoTool::None`) desliga o gizmo: toques selecionam, nada
+transforma, nenhum hit é aceito.
+
+**Duplicar objeto:** `duplicateActiveObject` clona a malha inteira do
+objeto ativo (`captureRaw`/`restoreRaw`), SEM copiar a seleção, com
+deslocamento visível (+1.5 X), ativa a cópia e grava uma entrada
+`ObjAdd` — o undo remove a cópia e restaura o objeto ativo anterior; o
+redo re-ativa o objeto re-adicionado (identidade consistente — correção
+no `History::redo`, que antes não restaurava o ativo).
+
+**Transformações por passos (painel de propriedades):**
+`transformDirect(tool, axis, amount)` aplica passos fixos (mover
+±0.25 un., rodar ±15°, escalar ×1.25/÷1.25 — uniforme com `axis==3`,
+axial com 0..2) reutilizando os helpers `TransformMath` — nenhuma
+matemática nova; valida finitude ANTES de mutar, prende o fator a
+[0.01, 100] e grava UMA entrada `verticesDelta`. No Modo Edição o alvo
+é a seleção válida (não o objeto inteiro).
+
+**Correção do orçamento do histórico (bug real da Fase 2):**
+`History::reserve` subtraía duas vezes os bytes do ramo de refazer
+(o `undo()` já os tinha subtraído) — um underflow uint64 fazia
+TODA operação seguinte a um desfazer falhar com `ErrBudget`
+("limite de histórico excedido") até a app ser reiniciada. Corrigido:
+`used_` contabiliza apenas a pilha de desfazer; limpar o ramo de
+refazer não subtrai nada. Fixado pela suíte `test_ui_modes.cpp`.
+
 ### 2.6 Projeto (`core/project`, `docs/PROJECT_FORMAT.md`)
 
 Formato binário próprio **BLONEPRJ v1**: magic, versão, comprimento, CRC32
@@ -225,14 +256,17 @@ temporária; erro algum destrói o projeto aberto. Ver tabela de erros em
   à frente). `GL_DEPTH_TEST` nunca é desativado globalmente; o estado GL
   é restaurado no fim de CADA passe. O gizmo (UI de ecrã) continua com
   depth test off temporário e restauro imediato.
-- **Viewport ÚTIL (correção de estabilidade):** `setViewportInsets(top,
-  bottom)` reserva as bandas do chrome Compose — `glViewport(0, bottom,
-  w, h-top-bottom)`, aspeto e projeção calculados na área VISIBLE, modelo
-  centrado nela nas DUAS orientações. `projectToScreenPx`/`pickAtPixel`
-  e o mapeamento do gizmo no JNI usam o MESMO retângulo (o que se toca é
-  o que se vê); área degenerada recai para a superfície completa.
-  FOV vertical 55° (banda exigida 50–60°), near/far 0.1/200 coerentes
-  com a distância orbital limitada (2.5–40).
+- **Viewport ÚTIL (correção de estabilidade + reorganização):**
+  `setViewportInsetsRect(top, bottom, left, right)` reserva as bandas do
+  chrome Compose (barra superior/inferior, barra lateral de ferramentas e
+  painel de propriedades) — `glViewport(left, bottom, w-l-r, h-t-b)`,
+  aspeto e projeção calculados na área VISIBLE, modelo centrado nela em
+  qualquer estado dos painéis. `setViewportInsets(top, bottom)` mantém-se
+  como compatibilidade (delega no rect completo). `projectToScreenPx`/
+  `pickAtPixel` e o mapeamento do gizmo no JNI usam o MESMO retângulo (o
+  que se toca é o que se vê); área degenerada recai para a superfície
+  completa. FOV vertical 55° (banda exigida 50–60°), near/far 0.1/200
+  coerentes com a distância orbital limitada (2.5–40).
 - Grelha/eixos estáticos + um conjunto de buffers por objeto (fill,
   wireframe, pontos) + contorno do modo Objeto EM CACHE (sem alocação
   por frame). Buffers reconstruídos quando `Scene::version` muda (troca
@@ -241,14 +275,23 @@ temporária; erro algum destrói o projeto aberto. Ver tabela de erros em
   negativo + depth write off), arestas e pontos selecionados na
   profundidade nativa contra o passe sólido recuado — sem z-fighting e
   com oclusão correta (ver "Política de profundidade por passe").
-- **GIZMO** (Editar): desenhado por cima (depth test off) no pivô da
-  seleção — setas X/Y/Z (Mover), anéis (Rodar), eixos + centro (Escalar),
-  com tamanho constante no ecrã. Hit-test CPU (`gizmoHitAt`) por
-  distância em px (pontas 26 px, anéis 16 px amostrados, centro 22 px).
-  **O gizmo só é desenhado (e só produz hit) quando a seleção é VÁLIDA**
-  (`sceneops::hasValidSelection` — pelo menos um elemento vivo
-  selecionado): seleção vazia/invalidada não desenha gizmo, marcadores
-  nem realces — nunca há alças invisíveis.
+- **GIZMO** (nos DOIS modos): desenhado por cima (depth test off) no
+  pivô da regra PARTILHADA `core/scene/GizmoPivot.h` — a mesma função
+  inline alimenta o desenho, o hit-test e o mapeamento JNI de arrasto
+  (nenhuma duplicação, nenhuma divergência possível). No Modo Objeto o
+  pivô é o centróide do objeto inteiro; em Edição, o da seleção válida.
+  Setas X/Y/Z (Mover, com PONTO CENTRAL visível), anéis (Rodar), eixos +
+  centro (Escalar), tamanho constante no ecrã. **Alvos de toque adaptados
+  à densidade (DECISÃO D):** o Kotlin passa
+  `NativeLib.setGizmoTouchScale(density)` uma vez por processo; os raios
+  de hit escalam 1:1 (ponta 22 px base ⇒ 44 px de diâmetro a densidade 1
+  — regra dos 44 dp; anel 18 px; centro 20 px; CORPO do eixo 10 px por
+  ponto-segmento — o toque em qualquer ponto da seta agarra esse eixo),
+  os comprimentos visuais escalam moderadamente (teto 1.6×) para não
+  explodir em tablets. Hit-test CPU (`gizmoHitAt`) com o MESMO gate do
+  desenho: Modo Objeto com objeto ativo, ou Edição com seleção VÁLIDA
+  (`hasValidSelection`); `GizmoTool::None` nunca desenha nem produz hit
+  — nunca há alças invisíveis ou "fantasma".
 - **Picking CPU** (`pickAtPixel`): raio por pixel com as matrizes do
   último frame; interseção raio-triângulo (Möller–Trumbore) sobre a
   MESMA triangulação do render; hit mais próximo (oclusão). Vértices e
@@ -262,10 +305,10 @@ temporária; erro algum destrói o projeto aberto. Ver tabela de erros em
 
 | Ficheiro | Responsabilidade |
 |---|---|
-| `MainActivity.kt` | Activity única; SAF (`CreateDocument`/`OpenDocument`) para Guardar/Abrir — sem permissões de armazenamento abrangentes; liga o ciclo de vida do Activity à superfície GL; encaminha as alturas medidas do chrome para a viewport útil GL (via `queueEvent` — sempre na thread GL). |
-| `ui/BloneOverlay.kt` | Chrome Compose (correção de estabilidade): topo com barra SÓLIDA e scroll horizontal (nenhum botão cortado); estado em linha própria (máx. 2 linhas); barra de modos; em Editar barra contextual com scroll horizontal — V/A/F + Mover/Rodar/Escalar + "Mais ▾" fixo — painel secundário expansível (Extrudir/Subdiv./Apagar/Loop cut, multisseleção, Limpar) e linha de ajuda própria (≤ 2 linhas); em paisagem os painéis inferiores ficam limitados a 35% da altura útil com scroll interno (50% em retrato); objetos listados com nomes reais do motor ("Cubo 1", "Cilindro 2"); "Nova cena" no topo do painel Avançado, integralmente visível; as alturas medidas do chrome são reportadas ao renderer (viewport útil) nas duas orientações. Nada foi removido. |
-| `vm/BloneViewModel.kt` | Estado que sobrevive a rotação; operações nativas em `Dispatchers.Default` (nunca bloqueiam a UI nem a thread GL); mensagens de estado em PT mapeadas dos códigos nativos; o espelho da seleção (`selVerts/selEdges/selFaces/hasValidSelection`) é preenchido EXCLUSIVAMENTE pelo snapshot atômico do motor — nunca derivado no Kotlin. |
-| `gl/BloneSurfaceView.kt` | GLSurfaceView ES 3.0; prioridade: botões Compose > **arrasto de alça do gizmo** (1 dedo em alça) > órbita (1 dedo fora do gizmo) > tap de seleção (1 dedo curto); **2 dedos é SEMPRE câmara** (pan+zoom) e cancela qualquer arrasto de gizmo. `preserveEGLContextOnPause = true` (quando o Android PRESERVA o contexto em pausa/rotação); quando o Android o RECRIA (o que não é garantido — depende do driver/dispositivo), `surfaceCreated → Renderer::init()` reconstrói TODOS os recursos GPU a partir da cena CPU (singletons nativos + ViewModel sobrevivem à recriação do Activity no mesmo processo) e `sceneVersion_ = 0` força a ressincronização completa — os dados CPU da cena nunca se duplicam nem se perdem. Todas as chamadas GL correm na thread GL (`onSurfaceCreated/Changed/drawFrame`/`queueEvent`); `setViewportInsets` é aplicado via `queueEvent`. |
+| `MainActivity.kt` | Activity única; SAF (`CreateDocument`/`OpenDocument`) para Guardar/Abrir — sem permissões de armazenamento abrangentes; liga o ciclo de vida do Activity à superfície GL; encaminha o RETÂNGULO medido do chrome (topo/fundo/esquerda/direita, via `queueEvent` — sempre na thread GL) para a viewport útil GL. |
+| `ui/BloneOverlay.kt` | Chrome Compose em QUATRO zonas (DECISÃO B): **A** barra superior compacta (1 linha com scroll — undo/refazer, Guardar/Abrir, chip do modo atual, FPS, Avançado e Propriedades); **B** barra lateral de ferramentas à esquerda (Sel./Mover/Rodar/Escalar nos dois modos + Duplicar/Apagar objeto no Objeto + Extrudir/Subdiv./Apagar/Loop/Limpar/Multi na Edição) — a barra inferior deixa de ser o lar das ferramentas; **C** painel de propriedades contextual à direita, recolhível (leitura do motor: nome, V/A/F, centro; passos fixos de mover/rodar/escalar; ajuda) — abrir/fechar NÃO toca na cena, só muda insets; **D** barra inferior compacta (alternância Objeto/Edição, V/A/F em Edição, estado da seleção reportado pelo motor). Esculpir/Pintar deixaram de ter botões mortos — documentados como indisponíveis. As medidas das 4 zonas são reportadas ao renderer (viewport útil com 4 lados); caps de altura (35% paisagem / 50% retrato) com scroll interno. |
+| `vm/BloneViewModel.kt` | Estado que sobrevive a rotação; operações nativas em `Dispatchers.Default` (nunca bloqueiam a UI nem a thread GL); mensagens de estado em PT mapeadas dos códigos nativos; o espelho da seleção e a leitura de propriedades (`propLabel/propVerts/propEdges/propFaces/propCenter`) são preenchidos EXCLUSIVAMENTE por chamadas nativas — nunca derivados no Kotlin. `chooseGizmoTool` aceita `Tool.NONE` (gizmo desligado); `duplicateActiveObject` e `nudgeMove/nudgeRotate/nudgeScale` (passos) chamam o motor. |
+| `gl/BloneSurfaceView.kt` | GLSurfaceView ES 3.0; prioridade: botões Compose > **arrasto de alça do gizmo** (1 dedo em alça, sem gate de modo — o MOTOR decide nos dois modos) > órbita (1 dedo fora do gizmo) > tap de seleção (1 dedo curto); **2 dedos é SEMPRE câmara** (pan+zoom) e cancela qualquer arrasto de gizmo. `setGizmoTouchScale(density)` uma vez por processo (alvos de toque em dp — DECISÃO D). `preserveEGLContextOnPause = true` (quando o Android PRESERVA o contexto em pausa/rotação); quando o Android o RECRIA (o que não é garantido — depende do driver/dispositivo), `surfaceCreated → Renderer::init()` reconstrói TODOS os recursos GPU a partir da cena CPU (singletons nativos + ViewModel sobrevivem à recriação do Activity no mesmo processo) e `sceneVersion_ = 0` força a ressincronização completa — os dados CPU da cena nunca se duplicam nem se perdem. Todas as chamadas GL correm na thread GL; `setViewportInsetsRect` é aplicado via `queueEvent`. |
 | `gl/NativeLib.kt` | Declarações JNI + códigos de estado; documenta o contrato de threads. |
 | `gl/TouchTracker.kt` / `CameraState.kt` / `FpsMeter.kt` | TouchTracker com modo GIZMO (alça detetada no ACTION_DOWN por callback; arrasto vai ao gizmo; 2.º dedo cancela e assume a câmara; tap em alça não seleciona) — 100% JVM-testável; câmara orbital com clamps; FPS real por timestamps. |
 
@@ -299,7 +342,7 @@ correm fora da thread principal e a UI nunca bloqueia.
 - Gradle (Kotlin DSL) + AGP 8.7.3 + Kotlin 2.0.21 (plugin Compose) +
   Compose BOM 2024.12.01; JDK 17; NDK r27 (27.1.12297006) fixado;
   CMake 3.22.1; minSdk 26 / targetSdk 35; ABIs armeabi-v7a, arm64-v8a,
-  x86_64; versionName `0.2.0-fase2`.
+  x86_64; versionName `0.3.0-fase2` (versionCode 5).
 - `.github/workflows/android.yml` — **condição 7 (testes do núcleo
   primeiro)**:
   1. job `core-tests`: `cmake` + `ctest` da suíte do núcleo C++ em host
@@ -319,7 +362,7 @@ correm fora da thread principal e a UI nunca bloqueia.
 ## 7. Testes
 
 - **Núcleo C++ em host** (`app/src/main/cpp/tests`, CMake + ctest no CI):
-  1302 verificações em 6 suítes — invariantes topológicas após cada
+  1822 verificações em 7 suítes — invariantes topológicas após cada
   operação; estrutura e normais das 4 primitivas + rejeições de parâmetros;
   extrusão (contagens exatas V12/E20/F10 no cubo, paredes para fora,
   região fechada rejeitada, extrusão do plano); subdivisão (cubo inteiro
@@ -362,6 +405,19 @@ correm fora da thread principal e a UI nunca bloqueia.
   seguida de ×0.5 restaura a geometria exata; extrusão com tampa movida:
   as 10 faces com normal para FORA (winding exterior seguro para
   culling) e normais finitas.
+- **Suíte da reorganização da interface** (`test_ui_modes.cpp`): gizmo
+  do MODO OBJETO transformando o objeto inteiro (mover/rodar/escalar com
+  topologia invariante, invariantes de half-edge e undo/refazer byte-exato);
+  transições Objeto↔Edição preservando a identidade do objeto ativo e a
+  seleção de componentes (escondida, nunca perdida); `duplicateActiveObject`
+  (clone byte-exato, deslocamento visível, ativação da cópia, undo remove
+  e restaura o ativo, redo re-ativa); `transformDirect` (passos com
+  histórico exato, rejeição de NaN/Inf/eixo inválido, clamp [0.01, 100],
+  alvo = seleção válida em Edição vs objeto inteiro em Objeto); regra
+  PARTILHADA do pivô (`gizmopivot::pivotFor`: objeto inteiro no Modo
+  Objeto, centróide da seleção em Edição, sem pivô sem objeto — nunca
+  há gizmo fantasma); e o regressão do orçamento do histórico (operar
+  APÓS desfazer já não falha com ErrBudget).
 - **Layouts/ciclo de vida (limitação declarada):** medições visuais
   (sobreposição de botões, corte em ecrãs pequenos, limite de 35% em
   paisagem) e comportamento de rotação/CONTEXT GL não têm testes

@@ -26,8 +26,12 @@ void History::dropOldestUndo() {
 }
 
 bool History::reserve(uint64_t costUpperBound) {
-    // Any new operation invalidates the redo branch.
-    for (const Entry& e : redo_) used_ -= e.bytes;
+    // Any new operation invalidates the redo branch. The redo entries' bytes
+    // are ALREADY excluded from used_ (undo() subtracted them), so clearing
+    // the stack here must NOT subtract again — a uint64 underflow made every
+    // post-undo reservation fail with ErrBudget (regression found by the
+    // UI-modes test suite: "undo, depois qualquer operação -> limite
+    // excedido").
     redo_.clear();
     pending_ = 0;
     if (costUpperBound > budget_) return false; // even the bound doesn't fit
@@ -219,9 +223,18 @@ bool History::redo(Scene& scene) {
         redo_.push_back(std::move(e));
         return false;
     }
+    const Entry::Kind kind = e.kind; // captured BEFORE the move below
+    const uint32_t objIndex = e.objIndex;
     used_ += e.bytes;
     undo_.push_back(std::move(e));
-    scene.active = std::min(scene.active, static_cast<int>(scene.objects.size()) - 1);
+    if (kind == Entry::Kind::ObjAdd) {
+        // The redone state had the (re-)added object ACTIVE — createPrimitive
+        // and duplicateActiveObject both activate the new object, so redo
+        // restores that exact state (selection/identity consistency).
+        scene.active = static_cast<int>(objIndex);
+    } else {
+        scene.active = std::min(scene.active, static_cast<int>(scene.objects.size()) - 1);
+    }
     for (auto& obj : scene.objects) obj.sel.prune(obj.mesh);
     scene.bump();
     lastEntryBytes_ = 0;
