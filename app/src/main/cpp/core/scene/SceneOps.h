@@ -70,6 +70,18 @@ Status clearSelection(Scene& s);
 // policy of the scene.
 Status selectFromPick(Scene& s, int kind, int objIndex, ElemId elemId);
 
+// ---- selection state queries (single source of truth) ---------------------
+// True when the ACTIVE object holds at least one ALIVE selected element.
+// The renderer gates the gizmo and the Kotlin UI gates its affordances on
+// this — an empty/invalid selection never shows transform handles.
+bool hasValidSelection(const Scene& s);
+// Atomic counts of the ACTIVE object's alive selection [V, E, F]. Ids that
+// no longer exist in the mesh are NOT counted.
+void selectionCounts(const Scene& s, int out[3]);
+// Removes ids that no longer exist from EVERY object's selection and reports
+// whether anything changed. Defensive hygiene after any mutation.
+bool pruneAllSelections(Scene& s);
+
 // ---- modeling operations ---------------------------------------------------
 Status extrude(Scene& s, History& h);
 Status subdivide(Scene& s, History& h);

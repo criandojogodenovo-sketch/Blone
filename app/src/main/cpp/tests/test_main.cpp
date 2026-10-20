@@ -8,6 +8,7 @@ void runOpsTests();
 void runTransformMathTests();
 void runHistoryProjectTests();
 void runRenderGizmoTests();
+void runSelectionStabilityTests();
 } // namespace blone::test
 
 int main() {
@@ -19,6 +20,7 @@ int main() {
     runTransformMathTests();
     runHistoryProjectTests();
     runRenderGizmoTests();
+    runSelectionStabilityTests();
     std::printf("\nVerificações: %d | Falhas: %d\n", g_checks, g_failures);
     if (g_failures == 0) {
         std::printf("RESULTADO: TODOS OS TESTES PASSARAM\n");

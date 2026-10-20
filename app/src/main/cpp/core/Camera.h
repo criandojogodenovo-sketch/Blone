@@ -13,7 +13,9 @@ struct OrbitCamera {
     float elevationDeg = 25.0f;
     float distance = 8.0f;
     Vec3 target{0.0f, 1.0f, 0.0f};
-    float fovYDeg = 45.0f;
+    // Vertical FOV within the required 50–60° band (stability correction:
+    // 55° keeps the model comfortably framed at the default orbit distance).
+    float fovYDeg = 55.0f;
 
     // Unit direction from the target towards the camera.
     Vec3 orbitDirection() const {

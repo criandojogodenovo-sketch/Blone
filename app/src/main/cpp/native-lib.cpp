@@ -52,12 +52,36 @@ std::vector<jint> selectionCounts() {
             static_cast<jint>(obj->sel.faces.size())};
 }
 
+// ATOMIC selection snapshot for the UI (single source of truth): the Kotlin
+// layer reads this instead of keeping a diverging copy of the selection.
+// Layout: [editMode, selectionMode, multiSelect, hasActiveObject,
+//          nVerts, nEdges, nFaces, hasValidSelection].
+// Dead ids are NOT counted; hasValidSelection distinguishes an EMPTY
+// selection (all zero) from an INVALID one (ids kept but dead).
+std::vector<jint> selectionSnapshotLocked() {
+    int counts[3] = {0, 0, 0};
+    blone::sceneops::selectionCounts(gScene, counts);
+    const blone::SceneObject* obj = gScene.activeObject();
+    return {gScene.editMode ? 1 : 0,
+            static_cast<jint>(gScene.selectionMode),
+            gScene.multiSelect ? 1 : 0,
+            obj ? 1 : 0,
+            counts[0], counts[1], counts[2],
+            blone::sceneops::hasValidSelection(gScene) ? 1 : 0};
+}
+
 jintArray toJIntArray(JNIEnv* env, const std::vector<jint>& v) {
     jintArray arr = env->NewIntArray(static_cast<jsize>(v.size()));
     if (!arr) return nullptr;
     env->SetIntArrayRegion(arr, 0, static_cast<jsize>(v.size()), v.data());
     return arr;
 }
+
+// Defensive hygiene after ANY scene mutation: selection ids that no longer
+// exist in the mesh are removed everywhere (belt and braces — the scene
+// layer already prunes its own paths). Keeps the renderer/UI and the
+// selection single-source-of-truth coherent at every entry point.
+void pruneSelectionsLocked() { blone::sceneops::pruneAllSelections(gScene); }
 
 // Selection pivot in WORLD space — identical rule to the renderer's
 // gizmoPivot (centroid of the selection; whole object when empty).
@@ -101,6 +125,11 @@ blone::Vec3 gizmoPivotForJni(const blone::Scene& scene, int& objIndexOut) {
 // Pixel-space mapping of a world axis at the pivot for gizmo drags: screen
 // direction (y down), apparent pixels-per-world-unit and the ring sign that
 // makes the surface point under the finger follow the finger.
+//
+// The projection uses the SAME usable viewport rect the renderer drew with
+// (surfaceChanged + setViewportInsets), so the mapping can never diverge
+// from what is on screen. The Kotlin-provided viewportW/H are only a
+// fallback while the renderer has not been sized yet.
 blone::sceneops::GizmoMapping gizmoMapping(const blone::OrbitCamera& cam,
                                            int axis, float viewportW,
                                            float viewportH) {
@@ -109,6 +138,16 @@ blone::sceneops::GizmoMapping gizmoMapping(const blone::OrbitCamera& cam,
                                  blone::Vec3{0, 0, 1}};
     const blone::Vec3 axisDir = (axis >= 0 && axis <= 2) ? axes[axis] : axes[0];
 
+    const float surfaceW = static_cast<float>(gRenderer.viewportSurfaceWidth());
+    const float surfaceH = static_cast<float>(gRenderer.viewportSurfaceHeight());
+    const float usableTop = static_cast<float>(gRenderer.viewportUsableTop());
+    const float usableH = static_cast<float>(
+            gRenderer.viewportUsableHeight() > 0 ? gRenderer.viewportUsableHeight()
+                                                 : gRenderer.viewportSurfaceHeight());
+    const float vpW = surfaceW > 0.0f ? surfaceW : viewportW;
+    const float vpH = usableH > 0.0f ? usableH : viewportH;
+    const float vpTop = surfaceW > 0.0f ? usableTop : 0.0f;
+
     // Selection pivot in world space (same rule as the renderer's gizmo).
     int objIndex = -1;
     blone::Vec3 pivot = gizmoPivotForJni(gScene, objIndex);
@@ -116,7 +155,7 @@ blone::sceneops::GizmoMapping gizmoMapping(const blone::OrbitCamera& cam,
 
     const blone::Mat4 proj = blone::Mat4::perspective(
             cam.fovYDeg,
-            viewportH > 0.0f ? viewportW / viewportH : 1.0f, 0.1f, 200.0f);
+            vpH > 0.0f ? vpW / vpH : 1.0f, 0.1f, 200.0f);
     const blone::Mat4 view = cam.viewMatrix();
     const blone::Mat4 vp = proj * view;
 
@@ -125,8 +164,8 @@ blone::sceneops::GizmoMapping gizmoMapping(const blone::OrbitCamera& cam,
         const float cy = vp.m[1] * w.x + vp.m[5] * w.y + vp.m[9] * w.z + vp.m[13];
         const float cw = vp.m[3] * w.x + vp.m[7] * w.y + vp.m[11] * w.z + vp.m[15];
         if (cw <= 1e-6f) return false;
-        sx = ((cx / cw) * 0.5f + 0.5f) * viewportW;
-        sy = (1.0f - ((cy / cw) * 0.5f + 0.5f)) * viewportH;
+        sx = ((cx / cw) * 0.5f + 0.5f) * vpW;
+        sy = vpTop + (1.0f - ((cy / cw) * 0.5f + 0.5f)) * vpH;
         return true;
     };
 
@@ -199,6 +238,24 @@ Java_com_blone_app_gl_NativeLib_surfaceChanged(JNIEnv* /*env*/, jobject /*thiz*/
                                                jint width, jint height) {
     std::lock_guard<std::mutex> lock(gMutex);
     gRenderer.resize(width, height);
+}
+
+// Reserves the top/bottom pixel bands for the Compose chrome so the model is
+// projected into the really visible area. MUST be called on the GL thread
+// (the Kotlin side dispatches it through queueEvent).
+extern "C" JNIEXPORT void JNICALL
+Java_com_blone_app_gl_NativeLib_setViewportInsets(JNIEnv* /*env*/, jobject /*thiz*/,
+                                                  jint topPx, jint bottomPx) {
+    std::lock_guard<std::mutex> lock(gMutex);
+    gRenderer.setViewportInsets(topPx, bottomPx);
+}
+
+// ATOMIC selection snapshot for the UI (single source of truth):
+// [editMode, selectionMode, multiSelect, hasActive, nV, nE, nF, hasValid].
+extern "C" JNIEXPORT jintArray JNICALL
+Java_com_blone_app_gl_NativeLib_selectionSnapshot(JNIEnv* env, jobject /*thiz*/) {
+    std::lock_guard<std::mutex> lock(gMutex);
+    return toJIntArray(env, selectionSnapshotLocked());
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -330,6 +387,7 @@ Java_com_blone_app_gl_NativeLib_createPrimitive(JNIEnv* /*env*/, jobject /*thiz*
         blone::renderdata::buildObject(gScene.objects[static_cast<size_t>(index)], rd);
         logCubeValidation(gScene.objects[static_cast<size_t>(index)], rd);
     }
+    pruneSelectionsLocked();
     return index;
 }
 
@@ -402,19 +460,25 @@ Java_com_blone_app_gl_NativeLib_clearSelection(JNIEnv* /*env*/, jobject /*thiz*/
 extern "C" JNIEXPORT jint JNICALL
 Java_com_blone_app_gl_NativeLib_extrude(JNIEnv* /*env*/, jobject /*thiz*/) {
     std::lock_guard<std::mutex> lock(gMutex);
-    return static_cast<jint>(blone::sceneops::extrude(gScene, gHistory));
+    const jint rc = static_cast<jint>(blone::sceneops::extrude(gScene, gHistory));
+    pruneSelectionsLocked();
+    return rc;
 }
 
 extern "C" JNIEXPORT jint JNICALL
 Java_com_blone_app_gl_NativeLib_subdivide(JNIEnv* /*env*/, jobject /*thiz*/) {
     std::lock_guard<std::mutex> lock(gMutex);
-    return static_cast<jint>(blone::sceneops::subdivide(gScene, gHistory));
+    const jint rc = static_cast<jint>(blone::sceneops::subdivide(gScene, gHistory));
+    pruneSelectionsLocked();
+    return rc;
 }
 
 extern "C" JNIEXPORT jint JNICALL
 Java_com_blone_app_gl_NativeLib_deleteSelection(JNIEnv* /*env*/, jobject /*thiz*/) {
     std::lock_guard<std::mutex> lock(gMutex);
-    return static_cast<jint>(blone::sceneops::deleteSelection(gScene, gHistory));
+    const jint rc = static_cast<jint>(blone::sceneops::deleteSelection(gScene, gHistory));
+    pruneSelectionsLocked();
+    return rc;
 }
 
 extern "C" JNIEXPORT jint JNICALL
@@ -426,7 +490,9 @@ Java_com_blone_app_gl_NativeLib_deleteActiveObject(JNIEnv* /*env*/, jobject /*th
 extern "C" JNIEXPORT jint JNICALL
 Java_com_blone_app_gl_NativeLib_loopCut(JNIEnv* /*env*/, jobject /*thiz*/) {
     std::lock_guard<std::mutex> lock(gMutex);
-    return static_cast<jint>(blone::sceneops::loopCut(gScene, gHistory));
+    const jint rc = static_cast<jint>(blone::sceneops::loopCut(gScene, gHistory));
+    pruneSelectionsLocked();
+    return rc;
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
@@ -450,13 +516,17 @@ Java_com_blone_app_gl_NativeLib_historyMemBytes(JNIEnv* /*env*/, jobject /*thiz*
 extern "C" JNIEXPORT jint JNICALL
 Java_com_blone_app_gl_NativeLib_undo(JNIEnv* /*env*/, jobject /*thiz*/) {
     std::lock_guard<std::mutex> lock(gMutex);
-    return static_cast<jint>(blone::sceneops::undo(gScene, gHistory));
+    const jint rc = static_cast<jint>(blone::sceneops::undo(gScene, gHistory));
+    pruneSelectionsLocked();
+    return rc;
 }
 
 extern "C" JNIEXPORT jint JNICALL
 Java_com_blone_app_gl_NativeLib_redo(JNIEnv* /*env*/, jobject /*thiz*/) {
     std::lock_guard<std::mutex> lock(gMutex);
-    return static_cast<jint>(blone::sceneops::redo(gScene, gHistory));
+    const jint rc = static_cast<jint>(blone::sceneops::redo(gScene, gHistory));
+    pruneSelectionsLocked();
+    return rc;
 }
 
 // Serializes the current scene; returns null on failure.

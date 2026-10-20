@@ -111,6 +111,25 @@ inline float scaleAxisFromDrag(const AxisScreen& a, float dxPx, float dyPx) {
     return std::clamp(1.0f + along / 150.0f, 0.02f, 50.0f);
 }
 
+// ---- scale safety (correção de estabilidade) ------------------------------
+//
+// A accumulated scale factor is VALID only when it is finite and strictly
+// positive. The per-event clamps above already keep each step in (0, +inf),
+// but the accumulated product of many events is clamped here into
+// [0.01, 100] so a long drag can never approach zero (flattened mesh) or
+// explode. Pinned by host tests.
+constexpr float kMinAccumScaleFactor = 0.01f;
+constexpr float kMaxAccumScaleFactor = 100.0f;
+
+inline bool isFiniteVec(float x, float y, float z) {
+    return std::isfinite(x) && std::isfinite(y) && std::isfinite(z);
+}
+
+inline float clampAccumScale(float f) {
+    if (!std::isfinite(f)) return 1.0f;
+    return std::clamp(f, kMinAccumScaleFactor, kMaxAccumScaleFactor);
+}
+
 // Vertex-set application helpers (dedup is the caller's duty).
 inline void applyMove(HalfEdgeMesh& m, const std::vector<ElemId>& verts, const Vec3& d) {
     for (const ElemId v : verts) {

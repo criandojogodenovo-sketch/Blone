@@ -3,6 +3,7 @@
 #include "../Log.h"
 
 #include <algorithm>
+#include <cmath>
 
 namespace blone::sceneops {
 
@@ -114,6 +115,51 @@ Status clearSelection(Scene& s) {
     return Status::OK;
 }
 
+// ---- selection state queries (single source of truth) ---------------------
+
+bool hasValidSelection(const Scene& s) {
+    const SceneObject* obj = s.activeObject();
+    if (!obj) return false;
+    for (const ElemId v : obj->sel.verts) {
+        if (obj->mesh.vertexAlive(v)) return true;
+    }
+    for (const ElemId e : obj->sel.edges) {
+        if (obj->mesh.edgeAlive(e)) return true;
+    }
+    for (const ElemId f : obj->sel.faces) {
+        if (obj->mesh.faceAlive(f)) return true;
+    }
+    return false;
+}
+
+void selectionCounts(const Scene& s, int out[3]) {
+    out[0] = out[1] = out[2] = 0;
+    const SceneObject* obj = s.activeObject();
+    if (!obj) return;
+    for (const ElemId v : obj->sel.verts) {
+        if (obj->mesh.vertexAlive(v)) ++out[0];
+    }
+    for (const ElemId e : obj->sel.edges) {
+        if (obj->mesh.edgeAlive(e)) ++out[1];
+    }
+    for (const ElemId f : obj->sel.faces) {
+        if (obj->mesh.faceAlive(f)) ++out[2];
+    }
+}
+
+bool pruneAllSelections(Scene& s) {
+    bool changed = false;
+    for (SceneObject& obj : s.objects) {
+        const size_t before = obj.sel.verts.size() + obj.sel.edges.size() +
+                              obj.sel.faces.size();
+        obj.sel.prune(obj.mesh);
+        const size_t after = obj.sel.verts.size() + obj.sel.edges.size() +
+                             obj.sel.faces.size();
+        if (after != before) changed = true;
+    }
+    return changed;
+}
+
 Status selectFromPick(Scene& s, int kind, int objIndex, ElemId elemId) {
     if (objIndex < 0 || objIndex >= static_cast<int>(s.objects.size())) {
         return Status::ErrInvalidArg;
@@ -153,6 +199,7 @@ Status extrude(Scene& s, History& h) {
     if (faces.empty()) return Status::ErrNoSelection;
 
     const HalfEdgeMesh::Raw pre = obj->mesh.captureRaw();
+    const Selection selBefore = obj->sel;
     const uint64_t bound = obj->mesh.rawBytes() * kBoundExtrude + 4096;
     if (!h.reserve(bound)) return Status::ErrBudget;
 
@@ -162,14 +209,18 @@ Status extrude(Scene& s, History& h) {
         h.rollbackReservation();
         return st; // mesh untouched: ops:: rolled back internally
     }
-    if (!h.pushMeshSwap(static_cast<uint32_t>(s.active), pre, obj->mesh.captureRaw())) {
+    // The selection moves to the new cap faces (single source of truth: the
+    // engine decides; the entry restores it on undo/redo).
+    Selection selAfter;
+    selAfter.faces = caps;
+    if (!h.pushMeshSwapWithSelection(static_cast<uint32_t>(s.active), pre,
+                                     obj->mesh.captureRaw(), selBefore, selAfter)) {
         obj->mesh.restoreRaw(pre);
+        obj->sel = selBefore;
         h.rollbackReservation();
         return Status::ErrInternal;
     }
-    obj->sel.faces = caps;
-    obj->sel.verts.clear();
-    obj->sel.edges.clear();
+    obj->sel = selAfter;
     s.bump();
     return Status::OK;
 }
@@ -185,6 +236,7 @@ Status subdivide(Scene& s, History& h) {
     }
 
     const HalfEdgeMesh::Raw pre = obj->mesh.captureRaw();
+    const Selection selBefore = obj->sel;
     const uint64_t bound = obj->mesh.rawBytes() * kBoundSubdivide + 4096;
     if (!h.reserve(bound)) return Status::ErrBudget;
 
@@ -193,12 +245,15 @@ Status subdivide(Scene& s, History& h) {
         h.rollbackReservation();
         return st;
     }
-    if (!h.pushMeshSwap(static_cast<uint32_t>(s.active), pre, obj->mesh.captureRaw())) {
+    const Selection selAfter; // subdivide always clears the selection
+    if (!h.pushMeshSwapWithSelection(static_cast<uint32_t>(s.active), pre,
+                                     obj->mesh.captureRaw(), selBefore, selAfter)) {
         obj->mesh.restoreRaw(pre);
+        obj->sel = selBefore;
         h.rollbackReservation();
         return Status::ErrInternal;
     }
-    obj->sel.clear();
+    obj->sel = selAfter;
     s.bump();
     return Status::OK;
 }
@@ -210,6 +265,7 @@ Status deleteSelection(Scene& s, History& h) {
     if (sel.empty()) return Status::ErrNoSelection;
 
     const HalfEdgeMesh::Raw pre = obj->mesh.captureRaw();
+    const Selection selBefore = obj->sel;
     const uint64_t bound = obj->mesh.rawBytes() * kBoundDelete + 4096;
     if (!h.reserve(bound)) return Status::ErrBudget;
 
@@ -224,12 +280,16 @@ Status deleteSelection(Scene& s, History& h) {
         h.rollbackReservation();
         return st;
     }
-    if (!h.pushMeshSwap(static_cast<uint32_t>(s.active), pre, obj->mesh.captureRaw())) {
+    Selection selAfter = selBefore;
+    selAfter.prune(obj->mesh); // survivors only
+    if (!h.pushMeshSwapWithSelection(static_cast<uint32_t>(s.active), pre,
+                                     obj->mesh.captureRaw(), selBefore, selAfter)) {
         obj->mesh.restoreRaw(pre);
+        obj->sel = selBefore;
         h.rollbackReservation();
         return Status::ErrInternal;
     }
-    obj->sel.prune(obj->mesh);
+    obj->sel = selAfter;
     s.bump();
     return Status::OK;
 }
@@ -241,6 +301,7 @@ Status loopCut(Scene& s, History& h) {
     if (edges.empty()) return Status::ErrNoSelection;
 
     const HalfEdgeMesh::Raw pre = obj->mesh.captureRaw();
+    const Selection selBefore = obj->sel;
     const uint64_t bound = obj->mesh.rawBytes() * kBoundLoopCut + 4096;
     if (!h.reserve(bound)) return Status::ErrBudget;
 
@@ -250,12 +311,15 @@ Status loopCut(Scene& s, History& h) {
         h.rollbackReservation();
         return st;
     }
-    if (!h.pushMeshSwap(static_cast<uint32_t>(s.active), pre, obj->mesh.captureRaw())) {
+    const Selection selAfter; // loop cut clears the selection
+    if (!h.pushMeshSwapWithSelection(static_cast<uint32_t>(s.active), pre,
+                                     obj->mesh.captureRaw(), selBefore, selAfter)) {
         obj->mesh.restoreRaw(pre);
+        obj->sel = selBefore;
         h.rollbackReservation();
         return Status::ErrInternal;
     }
-    obj->sel.clear();
+    obj->sel = selAfter;
     s.bump();
     return Status::OK;
 }
@@ -339,6 +403,11 @@ Status updateTool(Scene& s, ToolSession& t, const GizmoMapping& map,
     if (t.objIndex < 0 || t.objIndex >= static_cast<int>(s.objects.size())) {
         return Status::ErrNoActiveObject;
     }
+    // Non-finite touch input is REJECTED before any state changes (the mesh
+    // and the session stay valid — stability correction).
+    if (!std::isfinite(touchX) || !std::isfinite(touchY)) {
+        return Status::ErrInvalidArg;
+    }
     if (!t.lastTouchValid) {
         t.lastTouchX = touchX;
         t.lastTouchY = touchY;
@@ -384,7 +453,9 @@ Status updateTool(Scene& s, ToolSession& t, const GizmoMapping& map,
         case Tool::Scale: {
             if (t.kind == 3) { // center handle: uniform, absolute from begin
                 const float f = ops::scaleFromDrag(touchY - t.beginTouchY);
-                t.accumFactor = f;
+                // Reject non-finite / non-positive factors: mesh untouched.
+                if (!std::isfinite(f) || f <= 0.0f) return Status::ErrInvalidArg;
+                t.accumFactor = ops::clampAccumScale(f);
                 for (size_t i = 0; i < t.verts.size(); ++i) {
                     const ElemId v = t.verts[i];
                     if (obj.mesh.vertexAlive(v)) {
@@ -395,7 +466,8 @@ Status updateTool(Scene& s, ToolSession& t, const GizmoMapping& map,
             } else { // axial scale (kind 1)
                 const ops::AxisScreen as{map.axisDirX, map.axisDirY, map.pxPerWorld};
                 const float f = ops::scaleAxisFromDrag(as, dx, dy);
-                t.accumFactor *= f;
+                if (!std::isfinite(f) || f <= 0.0f) return Status::ErrInvalidArg;
+                t.accumFactor = ops::clampAccumScale(t.accumFactor * f);
                 const Vec3 axis = axisUnit(t.axis);
                 for (size_t i = 0; i < t.verts.size(); ++i) {
                     const ElemId v = t.verts[i];
@@ -430,6 +502,20 @@ Status endTool(Scene& s, History& h, ToolSession& t) {
         if (!obj.mesh.vertexAlive(v)) continue;
         before.emplace_back(v, t.startPos[i]);
         after.emplace_back(v, obj.mesh.vrt(v).pos);
+    }
+    // Defensive: a committed transform must never write non-finite geometry.
+    for (const auto& [id, pos] : after) {
+        if (!ops::isFiniteVec(pos.x, pos.y, pos.z)) {
+            for (size_t i = 0; i < t.verts.size(); ++i) {
+                if (obj.mesh.vertexAlive(t.verts[i])) {
+                    obj.mesh.vrt(t.verts[i]).pos = t.startPos[i];
+                }
+            }
+            h.rollbackReservation();
+            s.bump();
+            t = ToolSession{};
+            return Status::ErrInternal;
+        }
     }
     const bool moved = [&] {
         for (size_t i = 0; i < before.size(); ++i) {

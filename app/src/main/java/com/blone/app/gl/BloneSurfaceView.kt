@@ -110,6 +110,22 @@ class BloneSurfaceView(
         }
     }
 
+    /**
+     * Reserves the top/bottom pixel bands for the Compose chrome so the model
+     * is projected into the REALLY visible area. The GL call runs on the GL
+     * thread (queueEvent) — never off-context.
+     */
+    fun applyViewportInsets(topPx: Int, bottomPx: Int) {
+        queueEvent {
+            try {
+                NativeLib.setViewportInsets(topPx, bottomPx)
+            } catch (_: Throwable) {
+                // Context tearing down — the next surfaceChanged re-applies.
+            }
+            requestRender()
+        }
+    }
+
     @SuppressLint("ClickableViewAccessibility")
     override fun onTouchEvent(event: MotionEvent): Boolean {
         val active = (0 until event.pointerCount).map { i ->

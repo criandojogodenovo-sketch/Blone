@@ -34,6 +34,22 @@ object NativeLib {
     /** Updates viewport and projection for the given surface size in pixels. */
     external fun surfaceChanged(width: Int, height: Int)
 
+    /**
+     * Reserves the top/bottom pixel bands for the UI chrome so the model is
+     * projected and centered into the REALLY visible area. MUST be called on
+     * the GL thread (dispatch via GLSurfaceView.queueEvent).
+     */
+    external fun setViewportInsets(topPx: Int, bottomPx: Int)
+
+    /**
+     * ATOMIC selection snapshot from the C++ engine (single source of truth):
+     * [editMode, selectionMode, multiSelect, hasActiveObject,
+     *  nVerts, nEdges, nFaces, hasValidSelection].
+     * Dead ids are never counted; hasValidSelection distinguishes an EMPTY
+     * selection (all counts zero) from an INVALID one (stale ids dropped).
+     */
+    external fun selectionSnapshot(): IntArray?
+
     /** Renders one frame with the given orbit camera and scene state. */
     external fun drawFrame(
         azimuthDeg: Float,

@@ -3,8 +3,10 @@
 Aplicação Android nativa de modelagem 3D — gratuita, offline e pensada para
 ecrãs táteis e telemóveis com recursos limitados.
 
-**Estado atual: Fase 2 + correção de renderização/interação** (base nativa +
-viewport tátil + modelagem editável + gizmo funcional no écran).
+**Estado atual: Fase 2 + correção de estabilidade** (base nativa + viewport
+ tátil + modelagem editável + gizmo funcional no écran + seleção com fonte
+única no motor, sem z-fighting, layouts sem cortes nas duas orientações e
+viewport centrada na área útil).
 
 ## Instalação
 
@@ -30,17 +32,24 @@ viewport tátil + modelagem editável + gizmo funcional no écran).
 - Modo Editar com seleção de vértices, arestas e faces (oclusão respeitada,
   snap por distância ponto-segmento), seleção múltipla opcional.
 - **GIZMO no écran**: eixos X/Y/Z para mover, anéis para rodar, eixos +
-  centro para escalar — arrastar uma alça transforma mesmo a seleção (ou o
-  objeto, se nada estiver selecionado); arrastar FORA do gizmo orbita a
-  câmara; **dois dedos é sempre a câmara** e cancela o arrasto do gizmo.
+  centro para escalar — arrastar uma alça transforma a seleção; com a
+  seleção VAZIA o gizmo desaparece (sem alças invisíveis); arrastar FORA
+  do gizmo orbita a câmara; **dois dedos é sempre a câmara** e cancela o
+  arrasto do gizmo.
 - Extrusão de faces, subdivisão (quads/triângulos), apagar vértices/arestas/
   faces com validação topológica (rejeição sem mutação parcial), loop cut
   em anéis de quads.
-- Desfazer/Refazer com orçamento de memória (24 MB) — sempre visíveis.
+- Desfazer/Refazer com orçamento de memória (24 MB) — sempre visíveis; o
+  desfazer/refazer restaura também um estado de seleção válido.
+- Escalas seguras: fatores não finitos ou zero são rejeitados; o fator
+  acumulado nunca achata a malha (mínimo 0.01).
 - Guardar/Abrir projeto próprio (formato BLONEPRJ v1, validado com CRC32 —
   ver docs/PROJECT_FORMAT.md) via SAF, sem permissões de armazenamento.
-- Interface compacta: barra contextual (V/A/F + gizmo) e painel secundário
-  expansível ("Mais ▾") — nada cobre desnecessariamente a viewport.
+- Interface compacta NAS DUAS ORIENTAÇÕES: barra contextual (V/A/F +
+  gizmo) com scroll horizontal, painel secundário expansível ("Mais ▾"),
+  painéis inferiores limitados a 35% da altura útil em paisagem com scroll
+  interno, objetos com nomes legíveis ("Cubo 1") e o modelo centrado na
+  área realmente visível (viewport útil reportada ao renderer).
 - Contador de FPS medido a partir de timestamps reais.
 - Modos Esculpir/Pintar visíveis mas desativados (fases futuras).
 

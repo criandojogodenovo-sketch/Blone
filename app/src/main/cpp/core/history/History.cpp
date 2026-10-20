@@ -77,6 +77,35 @@ bool History::pushMeshSwap(uint32_t objIndex, HalfEdgeMesh::Raw before,
     return true;
 }
 
+bool History::pushMeshSwapWithSelection(uint32_t objIndex, HalfEdgeMesh::Raw before,
+                                        HalfEdgeMesh::Raw after,
+                                        const Selection& selBefore,
+                                        const Selection& selAfter) {
+    if (pending_ == 0) return false;
+    Entry e;
+    e.kind = Entry::Kind::MeshSwap;
+    e.objIndex = objIndex;
+    e.beforeMesh = std::move(before);
+    e.afterMesh = std::move(after);
+    e.hasSelections = true;
+    e.selBefore = selBefore;
+    e.selAfter = selAfter;
+    const uint64_t selBytes =
+            static_cast<uint64_t>(e.selBefore.verts.size() + e.selBefore.edges.size() +
+                                  e.selBefore.faces.size() + e.selAfter.verts.size() +
+                                  e.selAfter.edges.size() + e.selAfter.faces.size()) *
+                    4ull +
+            64ull;
+    e.bytes = meshRawBytes(e.beforeMesh) + meshRawBytes(e.afterMesh) + selBytes +
+              sizeof(Entry);
+    undo_.push_back(std::move(e));
+    used_ += undo_.back().bytes; // exact cost replaces the reserved bound
+    pending_ = 0;
+    lastEntryBytes_ = undo_.back().bytes;
+    while (undo_.size() > kMaxEntries) dropOldestUndo();
+    return true;
+}
+
 bool History::pushObjectAdded(uint32_t index, const SceneObject& data) {
     if (pending_ == 0) return false;
     Entry e;
@@ -118,6 +147,7 @@ bool History::applyUndoToScene(Scene& scene, Entry& e) {
             break;
         case Entry::Kind::MeshSwap:
             obj.mesh.restoreRaw(e.beforeMesh);
+            if (e.hasSelections) obj.sel = e.selBefore; // pruned by undo()
             break;
         case Entry::Kind::ObjAdd:
             e.object = std::move(obj); // keep the object for redo
@@ -144,6 +174,9 @@ bool History::applyRedoToScene(Scene& scene, Entry& e) {
         case Entry::Kind::MeshSwap: {
             if (e.objIndex >= scene.objects.size()) return false;
             scene.objects[e.objIndex].mesh.restoreRaw(e.afterMesh);
+            if (e.hasSelections) {
+                scene.objects[e.objIndex].sel = e.selAfter; // pruned by redo()
+            }
             break;
         }
         case Entry::Kind::ObjAdd: {

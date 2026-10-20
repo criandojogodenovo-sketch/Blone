@@ -177,6 +177,22 @@ multisseleção e um `version` incrementado em qualquer mudança estrutural
 usada pelo JNI: valida → reserva histórico → muta → pós-valida → grava
 entrada + remapeia seleção.
 
+**Seleção — fonte única de verdade (correção de estabilidade):** a
+seleção vive APENAS no C++. `hasValidSelection()` distingue seleção
+vazia/inválida de válida (pelo menos um elemento vivo); `selectionCounts()`
+devolve contagens atômicas de elementos VIVOS; `pruneAllSelections()` é
+higiene defensiva executada pelo JNI após toda mutação. O Kotlin consome
+o snapshot atômico `NativeLib.selectionSnapshot()`
+(`[editMode, mode, multi, hasActive, nV, nE, nF, hasValid]`) e apenas
+APRESENTA o estado do motor — não mantém cópia própria. As entradas
+`MeshSwap` do histórico guardam a seleção pré/pós da operação
+(`pushMeshSwapWithSelection`) e o undo/refazer RESTAURA uma seleção
+válida (poda aplicada de seguida). Escalas com fatores não finitos ou ≤ 0
+são rejeitadas antes de qualquer mutação; o fator acumulado fica preso a
+`[0.01, 100]` (mínimo positivo 0.01 — malha nunca achatada até zero).
+Transformações só são gravadas no histórico com geometria finita
+(verificação defensiva no fim da sessão).
+
 ### 2.6 Projeto (`core/project`, `docs/PROJECT_FORMAT.md`)
 
 Formato binário próprio **BLONEPRJ v1**: magic, versão, comprimento, CRC32
@@ -198,17 +214,41 @@ temporária; erro algum destrói o projeto aberto. Ver tabela de erros em
   (Newell) a cada reconstrução. O shader tem luz principal + **luz de
   preenchimento oposta** (correção "faces invisíveis": as faces viradas
   para longe da luz mantêm leitura — sem desativar o culling).
+- **Política de profundidade por passe (correção de estabilidade —
+  z-fighting das arestas sobre a superfície):** o passe SÓLIDO é
+  empurrado para trás com `GL_POLYGON_OFFSET_FILL (1,1)`; wireframe e
+  pontos editáveis rasterizam à profundidade exata da superfície e ganham
+  o depth test SEM cintilação; o passe de tint das faces selecionadas usa
+  offset `(-1,-1)` com `glDepthMask(GL_FALSE)` (não contamina os passes
+  seguintes); arestas/pontos selecionados e marcadores passam o depth
+  test na profundidade nativa (ficam corretamente OCULTOS pela geometria
+  à frente). `GL_DEPTH_TEST` nunca é desativado globalmente; o estado GL
+  é restaurado no fim de CADA passe. O gizmo (UI de ecrã) continua com
+  depth test off temporário e restauro imediato.
+- **Viewport ÚTIL (correção de estabilidade):** `setViewportInsets(top,
+  bottom)` reserva as bandas do chrome Compose — `glViewport(0, bottom,
+  w, h-top-bottom)`, aspeto e projeção calculados na área VISIBLE, modelo
+  centrado nela nas DUAS orientações. `projectToScreenPx`/`pickAtPixel`
+  e o mapeamento do gizmo no JNI usam o MESMO retângulo (o que se toca é
+  o que se vê); área degenerada recai para a superfície completa.
+  FOV vertical 55° (banda exigida 50–60°), near/far 0.1/200 coerentes
+  com a distância orbital limitada (2.5–40).
 - Grelha/eixos estáticos + um conjunto de buffers por objeto (fill,
   wireframe, pontos) + contorno do modo Objeto EM CACHE (sem alocação
   por frame). Buffers reconstruídos quando `Scene::version` muda (troca
   documentada: malhas limitadas ⇒ reconstrução barata e coerente).
-- Overlays do objeto ativo em Editar: faces selecionadas tingidas,
-  arestas em âmbar e pontos — todos com `polygonOffset` (correção de
-  z-fighting dos marcadores).
+- Overlays do objeto ativo em Editar: faces selecionadas tingidas (offset
+  negativo + depth write off), arestas e pontos selecionados na
+  profundidade nativa contra o passe sólido recuado — sem z-fighting e
+  com oclusão correta (ver "Política de profundidade por passe").
 - **GIZMO** (Editar): desenhado por cima (depth test off) no pivô da
   seleção — setas X/Y/Z (Mover), anéis (Rodar), eixos + centro (Escalar),
   com tamanho constante no ecrã. Hit-test CPU (`gizmoHitAt`) por
   distância em px (pontas 26 px, anéis 16 px amostrados, centro 22 px).
+  **O gizmo só é desenhado (e só produz hit) quando a seleção é VÁLIDA**
+  (`sceneops::hasValidSelection` — pelo menos um elemento vivo
+  selecionado): seleção vazia/invalidada não desenha gizmo, marcadores
+  nem realces — nunca há alças invisíveis.
 - **Picking CPU** (`pickAtPixel`): raio por pixel com as matrizes do
   último frame; interseção raio-triângulo (Möller–Trumbore) sobre a
   MESMA triangulação do render; hit mais próximo (oclusão). Vértices e
@@ -222,10 +262,10 @@ temporária; erro algum destrói o projeto aberto. Ver tabela de erros em
 
 | Ficheiro | Responsabilidade |
 |---|---|
-| `MainActivity.kt` | Activity única; SAF (`CreateDocument`/`OpenDocument`) para Guardar/Abrir — sem permissões de armazenamento abrangentes; liga o ciclo de vida do Activity à superfície GL. |
-| `ui/BloneOverlay.kt` | Chrome Compose (correção "interface poluída"): topo (título, FPS, Desfazer/Refazer, Guardar/Abrir, Avançado); barra de modos; em Editar UMA barra contextual compacta — seleção V/A/F + gizmo Mover/Rodar/Escalar + "Mais ▾" — com painel secundário EXPANSÍVEL (Extrudir/Subdividir/Apagar/Loop cut, multisseleção, Limpar). Nada foi removido; apenas reorganizado por contexto. |
-| `vm/BloneViewModel.kt` | Estado que sobrevive a rotação; operações nativas em `Dispatchers.Default` (nunca bloqueiam a UI nem a thread GL); mensagens de estado em PT mapeadas dos códigos nativos. |
-| `gl/BloneSurfaceView.kt` | GLSurfaceView ES 3.0; prioridade: botões Compose > **arrasto de alça do gizmo** (1 dedo em alça) > órbita (1 dedo fora do gizmo) > tap de seleção (1 dedo curto); **2 dedos é SEMPRE câmara** (pan+zoom) e cancela qualquer arrasto de gizmo. |
+| `MainActivity.kt` | Activity única; SAF (`CreateDocument`/`OpenDocument`) para Guardar/Abrir — sem permissões de armazenamento abrangentes; liga o ciclo de vida do Activity à superfície GL; encaminha as alturas medidas do chrome para a viewport útil GL (via `queueEvent` — sempre na thread GL). |
+| `ui/BloneOverlay.kt` | Chrome Compose (correção de estabilidade): topo com barra SÓLIDA e scroll horizontal (nenhum botão cortado); estado em linha própria (máx. 2 linhas); barra de modos; em Editar barra contextual com scroll horizontal — V/A/F + Mover/Rodar/Escalar + "Mais ▾" fixo — painel secundário expansível (Extrudir/Subdiv./Apagar/Loop cut, multisseleção, Limpar) e linha de ajuda própria (≤ 2 linhas); em paisagem os painéis inferiores ficam limitados a 35% da altura útil com scroll interno (50% em retrato); objetos listados com nomes reais do motor ("Cubo 1", "Cilindro 2"); "Nova cena" no topo do painel Avançado, integralmente visível; as alturas medidas do chrome são reportadas ao renderer (viewport útil) nas duas orientações. Nada foi removido. |
+| `vm/BloneViewModel.kt` | Estado que sobrevive a rotação; operações nativas em `Dispatchers.Default` (nunca bloqueiam a UI nem a thread GL); mensagens de estado em PT mapeadas dos códigos nativos; o espelho da seleção (`selVerts/selEdges/selFaces/hasValidSelection`) é preenchido EXCLUSIVAMENTE pelo snapshot atômico do motor — nunca derivado no Kotlin. |
+| `gl/BloneSurfaceView.kt` | GLSurfaceView ES 3.0; prioridade: botões Compose > **arrasto de alça do gizmo** (1 dedo em alça) > órbita (1 dedo fora do gizmo) > tap de seleção (1 dedo curto); **2 dedos é SEMPRE câmara** (pan+zoom) e cancela qualquer arrasto de gizmo. `preserveEGLContextOnPause = true` (quando o Android PRESERVA o contexto em pausa/rotação); quando o Android o RECRIA (o que não é garantido — depende do driver/dispositivo), `surfaceCreated → Renderer::init()` reconstrói TODOS os recursos GPU a partir da cena CPU (singletons nativos + ViewModel sobrevivem à recriação do Activity no mesmo processo) e `sceneVersion_ = 0` força a ressincronização completa — os dados CPU da cena nunca se duplicam nem se perdem. Todas as chamadas GL correm na thread GL (`onSurfaceCreated/Changed/drawFrame`/`queueEvent`); `setViewportInsets` é aplicado via `queueEvent`. |
 | `gl/NativeLib.kt` | Declarações JNI + códigos de estado; documenta o contrato de threads. |
 | `gl/TouchTracker.kt` / `CameraState.kt` / `FpsMeter.kt` | TouchTracker com modo GIZMO (alça detetada no ACTION_DOWN por callback; arrasto vai ao gizmo; 2.º dedo cancela e assume a câmara; tap em alça não seleciona) — 100% JVM-testável; câmara orbital com clamps; FPS real por timestamps. |
 
@@ -308,9 +348,27 @@ correm fora da thread principal e a UI nunca bloqueia.
   histórico (mover por eixo só mexe esse eixo; escala axial em torno do
   pivô; sinal do anel: o ponto sob o dedo segue o dedo) e desfazer
   byte-exato.
-- **JVM Kotlin** (CI): 26 testes de câmara, gestos (incl. modo gizmo:
+- **JVM Kotlin** (CI): 25 testes de câmara, gestos (incl. modo gizmo:
   alça→gizmo, falha→órbita, 2.º dedo cancela, tap em alça silencioso) e
   FPS.
+- **Suíte de estabilidade** (`test_selection.cpp`, correção de
+  estabilidade): seleção vazia → zero buffers de overlay e `hasValidSelection`
+  falso; ids mortos não contados, nunca desenhados e removidos pela poda
+  defensiva; seleção válida após extrudir/subdividir/loop cut/apagar e
+  através de tempestades de undo/refazer (restauro da seleção pré/pós
+  pelas entradas do histórico); rejeição de escala não finita (toque NaN
+  /Inf) com a malha intacta; fator acumulado preso a [0.01, 100] (arrasto
+  longo de encolhimento nunca achata a malha até zero); escala axial ×2
+  seguida de ×0.5 restaura a geometria exata; extrusão com tampa movida:
+  as 10 faces com normal para FORA (winding exterior seguro para
+  culling) e normais finitas.
+- **Layouts/ciclo de vida (limitação declarada):** medições visuais
+  (sobreposição de botões, corte em ecrãs pequenos, limite de 35% em
+  paisagem) e comportamento de rotação/CONTEXT GL não têm testes
+  automatizados neste projeto (sem Robolectric/dispositivo na CI) — a
+  verificação continua a exigir dispositivo físico; a lógica pura
+  (tracker, câmara, mapeamentos, seleção, escalas) está coberta por
+  testes host/JVM.
 - **Dispositivo físico** (responsabilidade do proprietário): sequência-mestre
   no app, gestos, rotação, FPS real no contador. O objetivo de 60 FPS é
   avaliado no dispositivo, nunca prometido por padrão.

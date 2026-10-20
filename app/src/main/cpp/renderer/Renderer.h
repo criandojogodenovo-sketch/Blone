@@ -35,6 +35,12 @@ class Renderer {
 public:
     void init(); // with a current GL context; safe to call again after loss
     void resize(int width, int height);
+    // Reserves the top/bottom pixel bands for the UI chrome so the model is
+    // projected and centered into the REALLY VISIBLE area (both
+    // orientations). glViewport(0, bottom, width, height - top - bottom);
+    // Must be called on the GL thread. Values are clamped; a degenerate
+    // usable area falls back to the full viewport.
+    void setViewportInsets(int topPx, int bottomPx);
     void render(const OrbitCamera& camera, const Scene& scene, float pointRadiusPx,
                 GizmoTool gizmoTool);
 
@@ -60,6 +66,13 @@ public:
     // camera snapshot of the last rendered frame. Pure CPU (no GL calls).
     GizmoHit gizmoHitAt(float xPx, float yPx, const Scene& scene,
                         GizmoTool tool) const;
+
+    // Usable-viewport state for the JNI gizmo mapping (same projection as
+    // the drawn frame — mapping and picking never diverge).
+    int viewportSurfaceWidth() const { return width_; }
+    int viewportSurfaceHeight() const { return height_; }
+    int viewportUsableTop() const { return usableTop_; }
+    int viewportUsableHeight() const { return usableHeight_; }
 
 private:
     struct ObjectGpu {
@@ -122,6 +135,12 @@ private:
     Vec3 eye_{};
     int width_ = 0, height_ = 0;
     float aspect_ = 1.0f;
+    // Usable (chrome-free) viewport rect inside the surface. The projection,
+    // picking and the gizmo mapping all use THIS rect, so the model is
+    // centered in the visible area and what you tap is what you see.
+    int topInset_ = 0, bottomInset_ = 0;
+    int usableTop_ = 0, usableHeight_ = 0;
+    void applyViewport();
 };
 
 } // namespace blone

@@ -127,6 +127,11 @@ private fun BloneRoot() {
                     viewModel.openProjectResult(-3)
                 }
             },
+            onUsableViewportChanged = { topPx, bottomPx ->
+                // Chrome heights -> GL usable viewport (model centered in the
+                // visible area). The GL call is dispatched on the GL thread.
+                glView.value?.applyViewportInsets(topPx, bottomPx)
+            },
         )
     }
 

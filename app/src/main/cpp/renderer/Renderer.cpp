@@ -4,6 +4,7 @@
 #include "../core/Scene.h"
 #include "../core/render/RenderData.h"
 #include "../core/scene/Scene.h"
+#include "../core/scene/SceneOps.h"
 
 #include <algorithm>
 #include <cmath>
@@ -513,12 +514,39 @@ void Renderer::syncObjects(const Scene& scene) {
     sceneVersion_ = scene.version;
 }
 
+void Renderer::applyViewport() {
+    if (width_ <= 0 || height_ <= 0) return;
+    int top = std::clamp(topInset_, 0, height_ - 1);
+    int bottom = std::clamp(bottomInset_, 0, height_ - 1 - top);
+    const int usable = height_ - top - bottom;
+    if (usable <= 0) {
+        // Degenerate chrome — fall back to the full surface rather than
+        // drawing nothing (never confuse empty selection/zero area with a
+        // rendering failure).
+        top = 0;
+        bottom = 0;
+    }
+    usableTop_ = top;
+    usableHeight_ = height_ - top - bottom;
+    aspect_ = static_cast<float>(width_) / static_cast<float>(usableHeight_);
+    glViewport(0, bottom, width_, usableHeight_);
+}
+
 void Renderer::resize(int width, int height) {
     if (width <= 0 || height <= 0) return;
     width_ = width;
     height_ = height;
-    aspect_ = static_cast<float>(width) / static_cast<float>(height);
-    glViewport(0, 0, width, height);
+    applyViewport();
+}
+
+void Renderer::setViewportInsets(int topPx, int bottomPx) {
+    if (!std::isfinite(static_cast<float>(topPx)) ||
+        !std::isfinite(static_cast<float>(bottomPx))) {
+        return;
+    }
+    topInset_ = std::max(0, topPx);
+    bottomInset_ = std::max(0, bottomPx);
+    applyViewport();
 }
 
 void Renderer::render(const OrbitCamera& camera, const Scene& scene,
@@ -564,19 +592,32 @@ void Renderer::render(const OrbitCamera& camera, const Scene& scene,
         glUniform3f(fillTintLoc_, 0.0f, 0.0f, 0.0f);
         glUniform1f(fillTintMixLoc_, 0.0f);
         glBindVertexArray(g.vao);
+        // Z-fighting fix: the SOLID pass is pushed slightly back in depth
+        // (GL_POLYGON_OFFSET_FILL, GLES3-compatible) so the wireframe and the
+        // editable-vertex points rasterized at the exact surface depth win the
+        // depth test cleanly — no stippled/dashed edges. States are restored
+        // after the pass so nothing leaks into the overlay passes.
+        glEnable(GL_POLYGON_OFFSET_FILL);
+        glPolygonOffset(1.0f, 1.0f);
         glDrawElements(GL_TRIANGLES, g.indexCount, GL_UNSIGNED_INT, nullptr);
+        glDisable(GL_POLYGON_OFFSET_FILL);
 
         const bool active = (static_cast<int>(i) == scene.active);
         if (scene.editMode && active) {
-            // Wireframe of the active object.
+            // Wireframe of the active object (depth ON, native depth — clean
+            // against the offset solid pass above).
             glUseProgram(lineProgram_);
             glUniformMatrix4fv(lineMvpLoc_, 1, GL_FALSE, mvp.m);
             glUniform1f(lineUseOverrideLoc_, 0.0f);
             glBindVertexArray(g.wireVao);
             glDrawArrays(GL_LINES, 0, g.wireCount);
 
-            // Selected faces (tinted, slightly pulled towards the camera).
+            // Selected faces tinted: pulled towards the camera with polygon
+            // offset and drawn WITHOUT depth writes so the edge/point
+            // highlights drawn after them keep passing the depth test
+            // against the (offset-back) solid surface.
             if (g.selFaceIndexCount > 0) {
+                glDepthMask(GL_FALSE);
                 glEnable(GL_POLYGON_OFFSET_FILL);
                 glPolygonOffset(-1.0f, -1.0f);
                 glUseProgram(fillProgram_);
@@ -587,18 +628,17 @@ void Renderer::render(const OrbitCamera& camera, const Scene& scene,
                 glDrawElements(GL_TRIANGLES, g.selFaceIndexCount, GL_UNSIGNED_INT,
                                nullptr);
                 glDisable(GL_POLYGON_OFFSET_FILL);
+                glDepthMask(GL_TRUE);
             }
-            // Selected edges + face-boundary highlight — drawn with depth
-            // test OFF: selected elements always read on top (standard
-            // modeling-app behaviour; kills z-fighting entirely).
+            // Selected edges + face-boundary highlight — depth test ON at
+            // native depth: they win against the offset solid (no z-fighting)
+            // and stay correctly OCCLUDED by foreground geometry.
             if (g.selEdgeCount > 0) {
-                glDisable(GL_DEPTH_TEST);
                 glUseProgram(lineProgram_);
                 glUniformMatrix4fv(lineMvpLoc_, 1, GL_FALSE, mvp.m);
                 glUniform1f(lineUseOverrideLoc_, 0.0f);
                 glBindVertexArray(g.selEdgeVao);
                 glDrawArrays(GL_LINES, 0, g.selEdgeCount);
-                glEnable(GL_DEPTH_TEST);
             }
             // All vertices as small points; selected vertices bigger/amber.
             if (g.ptCount > 0) {
@@ -610,14 +650,12 @@ void Renderer::render(const OrbitCamera& camera, const Scene& scene,
                 glDrawArrays(GL_POINTS, 0, g.ptCount);
             }
             if (g.selPtCount > 0) {
-                glDisable(GL_DEPTH_TEST);
                 glUseProgram(pointProgram_);
                 glUniformMatrix4fv(pointMvpLoc_, 1, GL_FALSE, mvp.m);
                 glUniform4f(pointColorLoc_, 1.0f, 0.72f, 0.20f, 1.0f);
                 glUniform1f(pointSizeLoc_, pointRadiusPx);
                 glBindVertexArray(g.selPtVao);
                 glDrawArrays(GL_POINTS, 0, g.selPtCount);
-                glEnable(GL_DEPTH_TEST);
             }
         } else if (active) {
             // Object mode: cached amber box outline (no per-frame allocation).
@@ -630,8 +668,11 @@ void Renderer::render(const OrbitCamera& camera, const Scene& scene,
     }
     glBindVertexArray(0);
 
-    // Gizmo overlay (edit mode, active object) — always readable on top.
-    if (scene.editMode) {
+    // Gizmo overlay (edit mode, active object) — ONLY when the selection is
+    // VALID (at least one alive selected element). An empty or invalidated
+    // selection draws NO gizmo, NO markers, NO highlights — the UI state
+    // matches what the renderer actually shows (stability correction).
+    if (scene.editMode && sceneops::hasValidSelection(scene)) {
         drawGizmo(scene, vp, gizmoTool);
     }
 }
@@ -646,8 +687,10 @@ bool Renderer::projectToScreenPx(const Vec3& world, float& sx, float& sy) const 
     if (cw <= 1e-6f) return false; // behind the camera
     const float ndcX = cx / cw;
     const float ndcY = cy / cw;
+    const int usableH = usableHeight_ > 0 ? usableHeight_ : height_;
     sx = (ndcX * 0.5f + 0.5f) * static_cast<float>(width_);
-    sy = (1.0f - (ndcY * 0.5f + 0.5f)) * static_cast<float>(height_);
+    sy = static_cast<float>(usableTop_) +
+         (1.0f - (ndcY * 0.5f + 0.5f)) * static_cast<float>(usableH);
     return true;
 }
 
@@ -702,9 +745,10 @@ void Renderer::drawGizmo(const Scene& scene, const Mat4& vp, GizmoTool tool) {
 
     const Vec3 toPivot = pivot - eye_;
     const float distPivot = std::max(length(toPivot), 0.5f);
+    const int usableH = usableHeight_ > 0 ? usableHeight_ : height_;
     const float wpp = 2.0f * distPivot *
                       std::tan(cam_.fovYDeg * static_cast<float>(M_PI) / 180.0f * 0.5f) /
-                      static_cast<float>(std::max(height_, 1));
+                      static_cast<float>(std::max(usableH, 1));
     const float axisLen = wpp * kGizmoArrowPx;
     const float ringR = wpp * kGizmoRingPx;
 
@@ -803,6 +847,9 @@ void Renderer::drawGizmo(const Scene& scene, const Mat4& vp, GizmoTool tool) {
 Renderer::GizmoHit Renderer::gizmoHitAt(float xPx, float yPx, const Scene& scene,
                                         GizmoTool tool) const {
     GizmoHit out;
+    // Same gate as the drawing: an empty/invalid selection shows NO gizmo,
+    // so it must never produce a hit either (no invisible handles).
+    if (!sceneops::hasValidSelection(scene)) return out;
     int objIndex = -1;
     const Vec3 pivot = gizmoPivot(scene, objIndex);
     if (objIndex < 0) return out;
@@ -812,9 +859,10 @@ Renderer::GizmoHit Renderer::gizmoHitAt(float xPx, float yPx, const Scene& scene
 
     const Vec3 toPivot = pivot - eye_;
     const float distPivot = std::max(length(toPivot), 0.5f);
+    const int usableH = usableHeight_ > 0 ? usableHeight_ : height_;
     const float wpp = 2.0f * distPivot *
                       std::tan(cam_.fovYDeg * static_cast<float>(M_PI) / 180.0f * 0.5f) /
-                      static_cast<float>(std::max(height_, 1));
+                      static_cast<float>(std::max(usableH, 1));
     const float axisLen = wpp * kGizmoArrowPx;
     const float ringR = wpp * kGizmoRingPx;
 
@@ -886,8 +934,13 @@ Renderer::PickHit Renderer::pickAtPixel(float xPx, float yPx, const Scene& scene
     PickHit out;
     if (width_ <= 0 || height_ <= 0) return out;
 
+    // SAME usable viewport rect the renderer drew with — taps map through the
+    // exact projection used on screen (model centered in the visible area).
+    const int usableH = usableHeight_ > 0 ? usableHeight_ : height_;
     const float ndcX = (2.0f * xPx / static_cast<float>(width_)) - 1.0f;
-    const float ndcY = 1.0f - (2.0f * yPx / static_cast<float>(height_));
+    const float ndcY =
+            1.0f - (2.0f * (yPx - static_cast<float>(usableTop_)) /
+                    static_cast<float>(usableH));
     const float tanHalf = std::tan(cam_.fovYDeg * static_cast<float>(M_PI) / 180.0f * 0.5f);
     const Vec3 dir = normalize(cam_.forward() +
                                cam_.right() * (ndcX * tanHalf * aspect_) +

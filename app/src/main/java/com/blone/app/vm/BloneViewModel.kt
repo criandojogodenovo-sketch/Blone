@@ -105,6 +105,29 @@ class BloneViewModel : ViewModel() {
     var activeObject by mutableStateOf(-1)
         private set
 
+    // ---- selection state (MIRROR of the C++ engine, never a second truth) --
+    // Filled exclusively from NativeLib.selectionSnapshot() by refresh().
+    // The Kotlin layer does not keep its own selection set — it displays what
+    // the engine reports (atomic snapshot: editMode/mode/multi + counts).
+    var engineSelectionMode by mutableStateOf(SelectionMode.FACE)
+        private set
+
+    var engineMultiSelect by mutableStateOf(false)
+        private set
+
+    var selVerts by mutableStateOf(0)
+        private set
+
+    var selEdges by mutableStateOf(0)
+        private set
+
+    var selFaces by mutableStateOf(0)
+        private set
+
+    /** True when the engine reports at least one ALIVE selected element. */
+    var hasValidSelection by mutableStateOf(false)
+        private set
+
     var advancedOpen by mutableStateOf(false)
         private set
 
@@ -139,18 +162,32 @@ class BloneViewModel : ViewModel() {
         selectionMode = m
         NativeLib.setSelectionMode(m.native)
         statusText = "Seleção: ${m.label}"
+        refresh()
     }
 
     fun toggleMultiSelect() {
         multiSelect = !multiSelect
         NativeLib.setMultiSelect(multiSelect)
         statusText = if (multiSelect) "Seleção múltipla ativada" else "Seleção única"
+        refresh()
     }
 
     fun clearSelection() {
         NativeLib.clearSelection()
         statusText = "Seleção limpa"
         refresh()
+    }
+
+    /** Applies one atomic engine snapshot to the mirrored UI state. */
+    private fun applySnapshot(snap: IntArray?) {
+        if (snap == null || snap.size < 8) return
+        engineSelectionMode = SelectionMode.entries.firstOrNull { it.native == snap[1] }
+            ?: SelectionMode.FACE
+        engineMultiSelect = snap[2] == 1
+        selVerts = snap[4]
+        selEdges = snap[5]
+        selFaces = snap[6]
+        hasValidSelection = snap[7] == 1
     }
 
     /** Called (UI thread) with the result of [NativeLib.pickAndSelect]:
@@ -302,5 +339,8 @@ class BloneViewModel : ViewModel() {
         canRedo = NativeLib.canRedo()
         objectCount = NativeLib.objectCount()
         if (activeObject >= objectCount) activeObject = objectCount - 1
+        // ONE atomic native read for every selection-derived UI state — the
+        // Kotlin layer never derives selection state on its own.
+        applySnapshot(NativeLib.selectionSnapshot())
     }
 }

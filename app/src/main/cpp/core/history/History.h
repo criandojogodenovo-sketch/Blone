@@ -50,6 +50,14 @@ public:
                            std::vector<std::pair<ElemId, Vec3>> after);
     bool pushMeshSwap(uint32_t objIndex, HalfEdgeMesh::Raw before,
                       HalfEdgeMesh::Raw after);
+    // Mesh swap that ALSO restores the object selection on undo/redo
+    // (stability correction: "undo/redo restaura também um estado de
+    // seleção válido"). The selections are stored as-is; History::undo/redo
+    // prune afterwards, so only alive ids survive.
+    bool pushMeshSwapWithSelection(uint32_t objIndex, HalfEdgeMesh::Raw before,
+                                   HalfEdgeMesh::Raw after,
+                                   const Selection& selBefore,
+                                   const Selection& selAfter);
     bool pushObjectAdded(uint32_t index, const SceneObject& data);
     bool pushObjectRemoved(uint32_t index, const SceneObject& data);
 
@@ -69,6 +77,9 @@ private:
         // MeshSwap
         HalfEdgeMesh::Raw beforeMesh;
         HalfEdgeMesh::Raw afterMesh;
+        bool hasSelections = false; // true => restore selBefore/selAfter
+        Selection selBefore;
+        Selection selAfter;
         // ObjAdd / ObjRemove
         SceneObject object;
     };

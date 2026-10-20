@@ -38,8 +38,9 @@ class CameraState(
     /** Drag sensitivity for orbit, in degrees per pixel. */
     var orbitDegreesPerPx: Float = 0.35f
 
-    /** Vertical field of view used for pan world-units-per-pixel math. */
-    var fovYDegrees: Float = 45f
+    /** Vertical field of view used for pan world-units-per-pixel math
+     *  (kept in sync with the native OrbitCamera default, 50–60° band). */
+    var fovYDegrees: Float = 55f
 
     /**
      * Current viewport height in pixels, set by the surface view on layout —
