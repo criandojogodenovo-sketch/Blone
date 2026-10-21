@@ -32,6 +32,12 @@
 //  - post-build validate() failure (defensive; cannot normally happen
 //    after successful addFace calls).
 //
+// Hotfix D1: build() accepts an optional `std::string* err` out-param —
+// when non-null it receives a human-readable PT reason for the rejection
+// (it flows to the user's toast via the I/O status protocol and to logcat
+// BloneIO). The default nullptr keeps the previous signature and every
+// existing caller working.
+//
 // Normals/uvs are validated for parallelism only (they are NOT stored in
 // the HalfEdgeMesh — the engine computes smooth normals itself and UV
 // storage is a documented Fase 5 extension point).
@@ -64,8 +70,11 @@ struct RawMeshData {
 class MeshBuilder {
 public:
     // Builds a validated HalfEdgeMesh from `data`. Returns std::nullopt and
-    // has zero side effects on every rejection listed above.
-    static std::optional<HalfEdgeMesh> build(const RawMeshData& data);
+    // has zero side effects on every rejection listed above. When `err` is
+    // non-null it receives a human-readable PT reason (hotfix D1); untouched
+    // on success. The default nullptr keeps the previous signature.
+    static std::optional<HalfEdgeMesh> build(const RawMeshData& data,
+                                             std::string* err = nullptr);
 };
 
 } // namespace blone::io

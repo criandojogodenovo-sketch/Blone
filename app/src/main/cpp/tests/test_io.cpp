@@ -212,6 +212,111 @@ void testGlbFixtureImport() {
     }
 }
 
+// ---------------------------------------------------------------- 4b ------
+// Hotfix D1: real-file robustness — the EXACT mix the owner hits on the
+// device: CRLF line endings, group/material directives (o/g/usemtl/mtllib),
+// comments, and NEGATIVE v and vn indices. Loaded through the FILE PATH
+// (like the device worker), not an in-memory stream.
+void testObjRealFileCrlfGroupsNegatives() {
+    const std::string path = "blone_test_crlf.obj";
+    {
+        std::ofstream out(path, std::ios::binary);
+        REQUIRE(out.good());
+        out << "# Exportado por FerramentaReal 1.0\r\n"
+               "mtllib cube_real.mtl\r\n"
+               "o Cubo_Real.001\r\n"
+               "g grupo_principal\r\n"
+               "s off\r\n"
+               "v -1 -1 1\r\n"
+               "v 1 -1 1\r\n"
+               "v 1 1 1\r\n"
+               "v -1 1 1\r\n"
+               "v -1 -1 -1\r\n"
+               "v 1 -1 -1\r\n"
+               "v 1 1 -1\r\n"
+               "v -1 1 -1\r\n"
+               "usemtl Material_Base\r\n"
+               "vn 0 0 1\r\n"
+               "vn 1 0 0\r\n"
+               "vn 0 0 -1\r\n"
+               "vn -1 0 0\r\n"
+               "vn 0 1 0\r\n"
+               "vn 0 -1 0\r\n"
+               "f 1//1 2//1 3//1 4//1\r\n"
+               "f -7//-5 -3//-5 -2//-5 -6//-5\r\n"
+               "f 6//3 5//3 8//3 7//3\r\n"
+               "f 5//4 1//4 4//4 8//4\r\n"
+               "f 4//5 3//5 7//5 8//5\r\n"
+               "f 5//6 6//6 2//6 1//6\r\n";
+    }
+
+    std::string err;
+    const std::optional<RawMeshData> raw = blone::io::ObjLoader::load(path, &err);
+    std::remove(path.c_str());
+    REQUIRE(raw.has_value());
+    CHECK(err.empty()); // success => NO error text (D1 err contract)
+    // Corner expansion: unique (position, normal) tuples of the 6 quads.
+    CHECK(raw->positions.size() == 24);
+    CHECK(raw->normals.size() == raw->positions.size()); // parallel
+    CHECK(raw->colors.size() == raw->positions.size());  // white default
+    CHECK(raw->faceIndices.size() == 6);                 // 6 quad faces
+
+    const std::optional<HalfEdgeMesh> mesh = MeshBuilder::build(*raw, &err);
+    REQUIRE(mesh.has_value());
+    CHECK(err.empty());
+    CHECK(mesh->validate());
+    CHECK(mesh->aliveVertexCount() == 24);
+    CHECK(mesh->aliveFaceCount() == 6);
+}
+
+// ---------------------------------------------------------------- 4c ------
+// Hotfix D1: embedded-buffer glTF (the .gltf self-contained form real tools
+// write) through the FILE PATH, plus the err contract of the loader.
+void testGltfEmbeddedDataUriFixture() {
+    const std::string path =
+            std::string(BLONE_TEST_DATA_DIR) + "/cube_embedded.gltf";
+    std::ifstream probe(path, std::ios::binary);
+    REQUIRE(probe.good());
+
+    std::string err;
+    const std::optional<RawMeshData> raw = blone::io::GltfLoader::load(path, &err);
+    REQUIRE(raw.has_value());
+    CHECK(err.empty()); // success => NO error text (D1 err contract)
+    CHECK(raw->positions.size() == 8);   // indexed shared-corner cube
+    CHECK(raw->colors.empty());          // no COLOR_0 => MeshBuilder whites
+    CHECK(raw->faceIndices.size() == 12); // 12 triangles
+
+    const std::optional<HalfEdgeMesh> mesh = MeshBuilder::build(*raw, &err);
+    REQUIRE(mesh.has_value());
+    CHECK(err.empty());
+    CHECK(mesh->validate());
+    CHECK(mesh->aliveVertexCount() == 8);
+    CHECK(mesh->aliveFaceCount() == 12);
+
+    // The failure side of the err contract: a truncated/glTF-foreign file
+    // rejects WITH a PT reason (the device toast shows it — R8).
+    const std::string badPath = "blone_test_bad.glb";
+    {
+        std::ofstream out(badPath, std::ios::binary);
+        out << "isto não é um glTF";
+    }
+    std::string badErr;
+    CHECK(!blone::io::GltfLoader::load(badPath, &badErr).has_value());
+    CHECK(!badErr.empty()); // motivo PT presente
+    std::remove(badPath.c_str());
+
+    // OBJ side of the err contract: malformed line reports the line number.
+    const std::string badObj = "blone_test_bad.obj";
+    {
+        std::ofstream out(badObj, std::ios::binary);
+        out << "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 9\n";
+    }
+    std::string objErr;
+    CHECK(!blone::io::ObjLoader::load(badObj, &objErr).has_value());
+    CHECK(objErr.find("linha 4") != std::string::npos); // motivo PT + linha
+    std::remove(badObj.c_str());
+}
+
 // ---------------------------------------------------------------- 5 -------
 void testImportHistoryUndoRedo() {
     History h;
@@ -233,6 +338,8 @@ void testImportHistoryUndoRedo() {
 
     CHECK(sceneops::addImportedObject(s, h, std::move(obj)) == Status::OK);
     CHECK(s.objects.size() == 1);
+    CHECK(s.active == 0); // hotfix D3: the drain ACTIVATES the import — the
+    // properties panel reads THIS index right after the drain.
     CHECK(h.undoDepth() == 1); // ONE coherent entry for ONE import
     CHECK(h.redoDepth() == 0);
 
@@ -298,6 +405,8 @@ void runIoTests() {
     testObjHandWrittenVtVnAndNegatives();
     testObjMalformedRejected();
     testGlbFixtureImport();
+    testObjRealFileCrlfGroupsNegatives();   // hotfix D1
+    testGltfEmbeddedDataUriFixture();       // hotfix D1
     testImportHistoryUndoRedo();
     testRawAboveLimitsRejected();
 }

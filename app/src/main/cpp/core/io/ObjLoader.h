@@ -41,11 +41,18 @@ namespace blone::io {
 class ObjLoader {
 public:
     // Opens `path` and parses it. std::nullopt on unreadable/malformed file.
-    static std::optional<RawMeshData> load(const std::string& path);
+    // When `err` is non-null it receives a human-readable PT reason for the
+    // failure (hotfix D1: the reason reaches the user's toast and logcat
+    // BloneIO); it is untouched when the call succeeds. The default nullptr
+    // keeps the previous signature and every existing caller working.
+    static std::optional<RawMeshData> load(const std::string& path,
+                                           std::string* err = nullptr);
 
     // Parses from an already-open stream (load() calls this; tests use it
-    // for hand-written OBJ without touching the filesystem).
-    static std::optional<RawMeshData> parseFile(std::istream& in);
+    // for hand-written OBJ without touching the filesystem). Same `err`
+    // contract as load(); reasons carry the 1-based line number.
+    static std::optional<RawMeshData> parseFile(std::istream& in,
+                                                std::string* err = nullptr);
 };
 
 } // namespace blone::io

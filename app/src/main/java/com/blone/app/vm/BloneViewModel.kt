@@ -451,9 +451,10 @@ class BloneViewModel : ViewModel() {
         }
     }
 
-    /** The SAF copy URI -> cache failed before any job was enqueued. */
+    /** The SAF copy URI -> cache failed before any job was enqueued
+     *  (hotfix D1/R8: a falha diz o motivo — nunca silenciosa). */
     fun importCopyFailed() {
-        statusText = "Falha na importação"
+        statusText = "Falha na importação: não foi possível ler o ficheiro"
         cleanupTemp()
     }
 
@@ -487,7 +488,10 @@ class BloneViewModel : ViewModel() {
     }
 
     private fun handleIoStatus(status: String) {
-        val parts = status.split("|", limit = 2)
+        // Protocol (hotfix D1): "<KIND>|<payload>[|<motivo PT>]" — the third
+        // field is the human-readable reason produced by the native stage
+        // that failed (parser/builder/drain/export). Missing = legacy message.
+        val parts = status.split("|", limit = 3)
         when (parts.getOrElse(0) { "" }) {
             "IMPORT_OK" -> {
                 statusText = "Importado: ${parts.getOrElse(1) { "" }}"
@@ -496,7 +500,9 @@ class BloneViewModel : ViewModel() {
                 refresh()
             }
             "IMPORT_FAIL" -> {
-                statusText = "Falha na importação"
+                val motivo = parts.getOrElse(2) { "" }
+                statusText = if (motivo.isEmpty()) "Falha na importação"
+                             else "Falha na importação: $motivo"
                 ioBusy = false
                 cleanupTemp()
                 refresh()
@@ -511,7 +517,9 @@ class BloneViewModel : ViewModel() {
                 onExportFileReady?.invoke(path ?: parts.getOrElse(1) { "" })
             }
             "EXPORT_FAIL" -> {
-                statusText = "Falha na exportação"
+                val motivo = parts.getOrElse(2) { "" }
+                statusText = if (motivo.isEmpty()) "Falha na exportação"
+                             else "Falha na exportação: $motivo"
                 ioBusy = false
                 cleanupTemp()
             }

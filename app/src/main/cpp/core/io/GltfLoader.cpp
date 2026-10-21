@@ -30,6 +30,21 @@ const cgltf_accessor* findAttr(const cgltf_primitive& prim, const char* name) {
     return nullptr;
 }
 
+// ---- failure reason plumbing (hotfix D1): PT reasons per cgltf stage.
+const char* resultReason(cgltf_result r) {
+    switch (r) {
+        case cgltf_result_file_not_found: return "ficheiro não encontrado";
+        case cgltf_result_io_error: return "erro de leitura do ficheiro";
+        case cgltf_result_unknown_format: return "não é um ficheiro glTF/GLB";
+        case cgltf_result_invalid_json: return "JSON inválido";
+        case cgltf_result_invalid_gltf: return "estrutura glTF inválida";
+        case cgltf_result_legacy_gltf: return "glTF 1.0 não suportado";
+        case cgltf_result_data_too_short: return "ficheiro truncado";
+        case cgltf_result_out_of_memory: return "sem memória para ler o ficheiro";
+        default: return "ficheiro glTF inválido";
+    }
+}
+
 // Bitwise position equality for the degenerate-triangle rule (Math3D's
 // Vec3 intentionally has no operator==; NaN never compares equal, which is
 // the behavior we want: corrupt NaN geometry flows on to MeshBuilder).
@@ -39,31 +54,47 @@ bool samePos(const Vec3& a, const Vec3& b) {
 
 } // namespace
 
-std::optional<RawMeshData> GltfLoader::load(const std::string& path) {
-    if (path.empty()) return std::nullopt;
+std::optional<RawMeshData> GltfLoader::load(const std::string& path,
+                                            std::string* err) {
+    if (path.empty()) {
+        if (err) *err = "caminho vazio";
+        return std::nullopt;
+    }
 
     cgltf_options options{};
     cgltf_data* data = nullptr;
-    if (cgltf_parse_file(&options, path.c_str(), &data) !=
-        cgltf_result_success) {
+    cgltf_result r = cgltf_parse_file(&options, path.c_str(), &data);
+    if (r != cgltf_result_success) {
+        if (err) *err = resultReason(r);
         return std::nullopt;
     }
     CgltfGuard guard(data);
 
     // uri_root = the document path: external .bin buffers of a .gltf file
     // resolve next to it. GLB buffers are embedded and need no root.
-    if (cgltf_load_buffers(&options, data, path.c_str()) !=
-        cgltf_result_success) {
+    r = cgltf_load_buffers(&options, data, path.c_str());
+    if (r != cgltf_result_success) {
+        if (err) {
+            *err = std::string("buffers não carregados: ") + resultReason(r);
+        }
         return std::nullopt;
     }
-    if (cgltf_validate(data) != cgltf_result_success) {
+    r = cgltf_validate(data);
+    if (r != cgltf_result_success) {
+        if (err) {
+            *err = std::string("validação glTF falhou: ") + resultReason(r);
+        }
         return std::nullopt;
     }
-    return extractRaw(data);
+    return extractRaw(data, err);
 }
 
-std::optional<RawMeshData> GltfLoader::extractRaw(const cgltf_data* data) {
-    if (!data) return std::nullopt;
+std::optional<RawMeshData> GltfLoader::extractRaw(const cgltf_data* data,
+                                                  std::string* err) {
+    if (!data) {
+        if (err) *err = "documento glTF nulo";
+        return std::nullopt;
+    }
     RawMeshData out;
 
     for (size_t mi = 0; mi < data->meshes_count; ++mi) {
@@ -73,27 +104,40 @@ std::optional<RawMeshData> GltfLoader::extractRaw(const cgltf_data* data) {
             if (prim.type != cgltf_primitive_type_triangles) continue;
 
             const cgltf_accessor* posAcc = findAttr(prim, "POSITION");
-            if (!posAcc) return std::nullopt; // mandatory
-            if (posAcc->type != cgltf_type_vec3) return std::nullopt;
+            if (!posAcc) {
+                if (err) *err = "primitiva sem POSITION (obrigatório)";
+                return std::nullopt; // mandatory
+            }
+            if (posAcc->type != cgltf_type_vec3) {
+                if (err) *err = "POSITION não é vec3";
+                return std::nullopt;
+            }
             if (posAcc->count == 0) continue; // empty primitive: skip
 
             const cgltf_accessor* nrmAcc = findAttr(prim, "NORMAL");
             if (nrmAcc && (nrmAcc->type != cgltf_type_vec3 ||
                            nrmAcc->count != posAcc->count)) {
+                if (err) *err = "NORMAL incompatível com POSITION";
                 return std::nullopt;
             }
             const cgltf_accessor* uvAcc = findAttr(prim, "TEXCOORD_0");
             if (uvAcc && (uvAcc->type != cgltf_type_vec2 ||
                           uvAcc->count != posAcc->count)) {
+                if (err) *err = "TEXCOORD_0 incompatível com POSITION";
                 return std::nullopt;
             }
             const cgltf_accessor* colAcc = findAttr(prim, "COLOR_0");
             if (colAcc && colAcc->type != cgltf_type_vec3 &&
                 colAcc->type != cgltf_type_vec4) {
+                if (err) *err = "COLOR_0 tem um tipo não suportado";
                 return std::nullopt; // never guess at exotic color layouts
             }
-            if (colAcc && colAcc->count != posAcc->count) return std::nullopt;
+            if (colAcc && colAcc->count != posAcc->count) {
+                if (err) *err = "COLOR_0 incompatível com POSITION";
+                return std::nullopt;
+            }
             if (posAcc->count > std::numeric_limits<int>::max()) {
+                if (err) *err = "geometria excede o limite de vértices";
                 return std::nullopt;
             }
 
@@ -114,23 +158,27 @@ std::optional<RawMeshData> GltfLoader::extractRaw(const cgltf_data* data) {
             std::vector<float> tmp(4, 0.0f);
             for (size_t i = 0; i < count; ++i) {
                 if (!cgltf_accessor_read_float(posAcc, i, tmp.data(), 4)) {
+                    if (err) *err = "POSITION ilegível (buffer corrompido?)";
                     return std::nullopt;
                 }
                 out.positions[base + i] = Vec3{tmp[0], tmp[1], tmp[2]};
                 if (nrmAcc) {
                     if (!cgltf_accessor_read_float(nrmAcc, i, tmp.data(), 4)) {
+                        if (err) *err = "NORMAL ilegível (buffer corrompido?)";
                         return std::nullopt;
                     }
                     out.normals[base + i] = Vec3{tmp[0], tmp[1], tmp[2]};
                 }
                 if (uvAcc) {
                     if (!cgltf_accessor_read_float(uvAcc, i, tmp.data(), 4)) {
+                        if (err) *err = "TEXCOORD_0 ilegível (buffer corrompido?)";
                         return std::nullopt;
                     }
                     out.uvs[base + i] = Vec2{tmp[0], tmp[1]};
                 }
                 if (colAcc) {
                     if (!cgltf_accessor_read_float(colAcc, i, tmp.data(), 4)) {
+                        if (err) *err = "COLOR_0 ilegível (buffer corrompido?)";
                         return std::nullopt;
                     }
                     out.colors[base + i] = Vec3{tmp[0], tmp[1], tmp[2]};
@@ -156,7 +204,10 @@ std::optional<RawMeshData> GltfLoader::extractRaw(const cgltf_data* data) {
 
             if (prim.indices) {
                 const size_t icount = prim.indices->count;
-                if (icount % 3 != 0) return std::nullopt; // corrupt data
+                if (icount % 3 != 0) {
+                    if (err) *err = "índices não múltiplos de 3 (dados corrompidos)";
+                    return std::nullopt; // corrupt data
+                }
                 for (size_t t = 0; t + 2 < icount; t += 3) {
                     const int a = static_cast<int>(
                             cgltf_accessor_read_index(prim.indices, t));
@@ -168,7 +219,10 @@ std::optional<RawMeshData> GltfLoader::extractRaw(const cgltf_data* data) {
                 }
             } else {
                 // Non-indexed primitive: vertices are triangles in order.
-                if (count % 3 != 0) return std::nullopt;
+                if (count % 3 != 0) {
+                    if (err) *err = "primitiva não indexada não múltipla de 3";
+                    return std::nullopt;
+                }
                 for (size_t t = 0; t + 2 < count; t += 3) {
                     emitTriangle(static_cast<int>(t), static_cast<int>(t + 1),
                                  static_cast<int>(t + 2));
@@ -178,6 +232,9 @@ std::optional<RawMeshData> GltfLoader::extractRaw(const cgltf_data* data) {
     }
 
     if (out.positions.empty() || out.faceIndices.empty()) {
+        if (err) {
+            *err = "glTF sem geometria de triângulos utilizável";
+        }
         return std::nullopt; // no usable TRIANGLES geometry
     }
     return out;

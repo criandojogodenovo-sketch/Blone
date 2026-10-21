@@ -43,12 +43,18 @@ namespace blone::io {
 class GltfLoader {
 public:
     // Parses and validates the glTF/GLB document at `path` and extracts the
-    // geometry of all TRIANGLES primitives.
-    static std::optional<RawMeshData> load(const std::string& path);
+    // geometry of all TRIANGLES primitives. When `err` is non-null it
+    // receives a human-readable PT reason for the failure (hotfix D1: toast
+    // + logcat BloneIO); untouched on success. The default nullptr keeps
+    // the previous signature and every existing caller working.
+    static std::optional<RawMeshData> load(const std::string& path,
+                                           std::string* err = nullptr);
 
     // Extracts RawMeshData from an ALREADY parsed/loaded/validated cgltf
     // document (exposed for tests; load() is the production entry point).
-    static std::optional<RawMeshData> extractRaw(const cgltf_data* data);
+    // Same `err` contract as load().
+    static std::optional<RawMeshData> extractRaw(const cgltf_data* data,
+                                                 std::string* err = nullptr);
 };
 
 } // namespace blone::io

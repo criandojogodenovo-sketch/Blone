@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cmath>
 #include <deque>
+#include <fstream>
 #include <future>
 #include <mutex>
 #include <string>
@@ -125,11 +126,36 @@ void drainPendingImportsLocked() {
                                                    std::move(obj));
         if (st == blone::ops::Status::OK) {
             pruneSelectionsLocked();
+            // Stage (e): the object REALLY entered the scene (undo removes
+            // it, kMaxObjects respected by the SceneOps facade).
+            BLONE_IOI("(e) drenagem: '%s' entrou na cena via SceneOps "
+                      "(ObjAdd, objeto ativo = %d)",
+                      name.c_str(), gScene.active);
             setIoStatus("IMPORT_OK|" + name);
         } else {
             // kMaxObjects / budget / internal: the scene stays intact and
-            // the failure is reported against the source path.
-            setIoStatus("IMPORT_FAIL|" + item.sourcePath);
+            // the failure is reported against the source path WITH the PT
+            // reason (hotfix D1/R8 — nunca silencioso).
+            const char* motivo = "falha ao adicionar à cena";
+            switch (st) {
+                case blone::ops::Status::ErrLimit:
+                    motivo = "cena cheia: máximo de objetos atingido";
+                    break;
+                case blone::ops::Status::ErrBudget:
+                    motivo = "limite de histórico esgotado";
+                    break;
+                case blone::ops::Status::ErrInvalidArg:
+                    motivo = "malha vazia";
+                    break;
+                case blone::ops::Status::ErrInternal:
+                    motivo = "erro interno ao adicionar o objeto";
+                    break;
+                default:
+                    break;
+            }
+            BLONE_IOE("(e) drenagem: ObjAdd falhou para '%s': %s",
+                      name.c_str(), motivo);
+            setIoStatus("IMPORT_FAIL|" + item.sourcePath + "|" + motivo);
         }
     }
 }
@@ -650,22 +676,83 @@ Java_com_blone_app_gl_NativeLib_importMesh(JNIEnv* env, jobject /*thiz*/,
                                         // threads; the scene is NEVER touched
                                         // here — only the queue and the
                                         // status slot are.
+                                        // Stage (b): the worker opens the
+                                        // SAME path Kotlin copied — the size
+                                        // in logcat exposes a truncated/empty
+                                        // SAF copy at a glance.
+                                        std::ifstream probe(filePath,
+                                                            std::ios::binary |
+                                                            std::ios::ate);
+                                        if (!probe) {
+                                            BLONE_IOE("import '%s': (b) worker "
+                                                      "não abriu o path",
+                                                      filePath.c_str());
+                                            setIoStatus("IMPORT_FAIL|" +
+                                                        filePath +
+                                                        "|ficheiro não encontrado "
+                                                        "no armazenamento");
+                                            return;
+                                        }
+                                        const long long bytes =
+                                                static_cast<long long>(
+                                                        probe.tellg());
+                                        probe.close();
+                                        (void)bytes; // diagnostic only (logcat)
+                                        BLONE_IOI("import '%s': (b) worker abriu "
+                                                  "o ficheiro (%lld bytes, %s)",
+                                                  filePath.c_str(), bytes,
+                                                  isGltf ? "glTF/GLB"
+                                                         : "OBJ");
+
+                                        // Stage (c): parser with the PT error
+                                        // code (reason flows to the toast).
+                                        std::string err;
                                         std::optional<blone::io::RawMeshData>
                                                 raw = isGltf == JNI_TRUE
                                                           ? blone::io::GltfLoader::load(
-                                                                  filePath)
+                                                                  filePath, &err)
                                                           : blone::io::ObjLoader::load(
-                                                                  filePath);
-                                        std::optional<blone::HalfEdgeMesh> mesh;
-                                        if (raw) {
-                                            mesh = blone::io::MeshBuilder::build(
-                                                    *raw);
-                                        }
-                                        if (!mesh) {
+                                                                  filePath, &err);
+                                        if (!raw) {
+                                            if (err.empty()) {
+                                                err = "formato não reconhecido";
+                                            }
+                                            BLONE_IOE("import '%s': (c) parser "
+                                                      "falhou: %s",
+                                                      filePath.c_str(),
+                                                      err.c_str());
                                             setIoStatus("IMPORT_FAIL|" +
-                                                        filePath);
+                                                        filePath + "|" + err);
                                             return;
                                         }
+                                        BLONE_IOI("import '%s': (c) parser OK "
+                                                  "(V=%zu faces=%zu)",
+                                                  filePath.c_str(),
+                                                  raw->positions.size(),
+                                                  raw->faceIndices.size());
+
+                                        // Stage (d): MeshBuilder (all-or-nothing).
+                                        std::optional<blone::HalfEdgeMesh>
+                                                mesh = blone::io::MeshBuilder::build(
+                                                        *raw, &err);
+                                        if (!mesh) {
+                                            if (err.empty()) {
+                                                err = "geometria inválida";
+                                            } else {
+                                                err = "geometria inválida: " + err;
+                                            }
+                                            BLONE_IOE("import '%s': (d) "
+                                                      "MeshBuilder falhou: %s",
+                                                      filePath.c_str(),
+                                                      err.c_str());
+                                            setIoStatus("IMPORT_FAIL|" +
+                                                        filePath + "|" + err);
+                                            return;
+                                        }
+                                        BLONE_IOI("import '%s': (d) malha "
+                                                  "construída e validada — "
+                                                  "em fila para a drenagem",
+                                                  filePath.c_str());
                                         {
                                             std::lock_guard<std::mutex> q(
                                                     gIoMutex);
@@ -711,7 +798,13 @@ Java_com_blone_app_gl_NativeLib_exportObj(JNIEnv* env, jobject /*thiz*/,
             }
         }
         const bool ok = blone::io::ObjExporter::exportScene(snapshot, filePath);
-        setIoStatus(std::string(ok ? "EXPORT_OK|" : "EXPORT_FAIL|") + filePath);
+        if (ok) {
+            BLONE_IOI("export: OBJ escrito em %s", filePath.c_str());
+        } else {
+            BLONE_IOE("export: falha ao escrever %s", filePath.c_str());
+        }
+        setIoStatus(std::string(ok ? "EXPORT_OK|" : "EXPORT_FAIL|") + filePath +
+                    (ok ? "" : "|não foi possível escrever o ficheiro OBJ"));
     }));
     return JNI_TRUE;
 }

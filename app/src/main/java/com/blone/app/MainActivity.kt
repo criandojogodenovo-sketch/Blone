@@ -48,6 +48,26 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+/** Hotfix D1 (a): the REAL file name for the SAF document — the provider's
+ *  DISPLAY_NAME, not the internal document id ("msf:1000123"). */
+private fun queryDisplayName(
+    resolver: android.content.ContentResolver,
+    uri: android.net.Uri,
+): String? {
+    resolver.query(
+        uri,
+        arrayOf(android.provider.OpenableColumns.DISPLAY_NAME),
+        null, null, null
+    )?.use { cursor ->
+        val idx = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+        if (idx >= 0 && cursor.moveToFirst()) {
+            val name = cursor.getString(idx)
+            if (!name.isNullOrBlank()) return name
+        }
+    }
+    return null
+}
+
 @Composable
 private fun BloneRoot() {
     val viewModel: BloneViewModel = viewModel()
@@ -98,29 +118,62 @@ private fun BloneRoot() {
     }
 
     // ---- Fase 4: I/O 3D (OBJ/glTF) — SAF resolve para ficheiro real -------
+    // Hotfix D1, etapa (a): o encaminhamento OBJ vs glTF usa o NOME REAL do
+    // ficheiro (OpenableColumns.DISPLAY_NAME). O uri.lastPathSegment é um id
+    // interno do provider (ex.: "msf:1000123") — não termina em .obj/.glb —
+    // e partia o encaminhamento: um GLB chegava ao parser OBJ e falhava no
+    // dispositivo. Cada etapa registada em logcat (tag BloneIO).
     val importLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocument()
     ) { uri ->
         if (uri != null) {
-            val raw = uri.lastPathSegment ?: ""
-            val isGltf = raw.endsWith(".glb", true) || raw.endsWith(".gltf", true)
-            val displayName = raw.substringAfterLast('/')
-                .substringBeforeLast('.').ifEmpty { "Importado" }
             scope.launch(Dispatchers.IO) {
+                val displayName = try {
+                    queryDisplayName(uri)
+                } catch (_: Exception) {
+                    null
+                } ?: uri.lastPathSegment ?: ""
+                val mime = try {
+                    resolver.getType(uri)
+                } catch (_: Exception) {
+                    null
+                }
+                val isGltf = displayName.endsWith(".glb", true) ||
+                    displayName.endsWith(".gltf", true) ||
+                    (mime?.contains("gltf", true) == true)
+                val safeName = displayName.substringBeforeLast('.')
+                    .ifEmpty { "Importado" }
+                android.util.Log.i(
+                    "BloneIO",
+                    "(a) SAF: nome='$displayName' mime=$mime -> rota=" +
+                        if (isGltf) "glTF/GLB" else "OBJ"
+                )
                 val tmp = java.io.File(
                     context.cacheDir,
                     "io-import-${System.currentTimeMillis()}${if (isGltf) ".glb" else ".obj"}"
                 )
+                var copiedBytes = 0L
                 val copied = try {
                     resolver.openInputStream(uri)?.use { input ->
-                        tmp.outputStream().use { input.copyTo(it) }
-                    } != null
-                } catch (_: Exception) {
+                        tmp.outputStream().use { out ->
+                            copiedBytes = input.copyTo(out)
+                        }
+                        true
+                    } ?: false
+                } catch (e: Exception) {
+                    android.util.Log.w(
+                        "BloneIO", "(a) SAF: cópia falhou: ${e.message}"
+                    )
                     false
                 }
+                val onDisk = if (copied) tmp.length() else -1L
+                android.util.Log.i(
+                    "BloneIO",
+                    "(a) SAF: lidos=$copiedBytes noDisco=$onDisk tmp=${tmp.name}"
+                )
                 withContext(Dispatchers.Main) {
-                    if (copied) {
-                        viewModel.requestImport(tmp.absolutePath, isGltf, displayName)
+                    if (copied && onDisk > 0 && onDisk == copiedBytes) {
+                        viewModel.requestImport(tmp.absolutePath, isGltf, safeName)
                     } else {
                         viewModel.importCopyFailed()
                     }

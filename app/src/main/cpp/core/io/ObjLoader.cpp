@@ -13,6 +13,18 @@ namespace blone::io {
 
 namespace {
 
+// ---- failure reason plumbing (hotfix D1): every rejection carries a PT
+// reason + the 1-based line number so the device toast says WHY. nullptr
+// callers (existing tests) pay nothing.
+std::optional<RawMeshData> reject(int lineNo, const char* what,
+                                  std::string* err) {
+    if (err) {
+        *err = "OBJ inv\u00e1lido (linha " + std::to_string(lineNo) +
+               "): " + what;
+    }
+    return std::nullopt;
+}
+
 // ---- strict numeric token parsing (whole token must be consumed) ----------
 
 bool parseStrictFloat(const std::string& tok, float& out) {
@@ -125,12 +137,18 @@ int expandCorner(ObjParserState& st, long long p, long long t, long long n) {
 
 } // namespace
 
-std::optional<RawMeshData> ObjLoader::parseFile(std::istream& in) {
-    if (!in) return std::nullopt;
+std::optional<RawMeshData> ObjLoader::parseFile(std::istream& in,
+                                                std::string* err) {
+    if (!in) {
+        if (err) *err = "OBJ inv\u00e1lido: stream n\u00e3o leg\u00edvel";
+        return std::nullopt;
+    }
 
     ObjParserState st;
     std::string line;
+    int lineNo = 0;
     while (std::getline(in, line)) {
+        ++lineNo;
         if (!line.empty() && line.back() == '\r') line.pop_back();
         const auto hash = line.find('#');
         if (hash != std::string::npos) line.resize(hash);
@@ -143,12 +161,12 @@ std::optional<RawMeshData> ObjLoader::parseFile(std::istream& in) {
             // 3 coords; or 4 = standard w (ignored); or 7 = x y z r g b
             // (Blone color extension). Anything else is malformed.
             if (tok.size() != 4 && tok.size() != 5 && tok.size() != 7) {
-                return std::nullopt;
+                return reject(lineNo, "v espera 3, 4 (w) ou 7 (r g b) valores", err);
             }
             Vec3 p{};
             if (!parseStrictFloat(tok[1], p.x) || !parseStrictFloat(tok[2], p.y) ||
                 !parseStrictFloat(tok[3], p.z)) {
-                return std::nullopt;
+                return reject(lineNo, "coordenada de v n\u00e3o num\u00e9rica ou NaN/Inf", err);
             }
             st.pos.push_back(p);
             if (tok.size() == 7) {
@@ -156,28 +174,36 @@ std::optional<RawMeshData> ObjLoader::parseFile(std::istream& in) {
                 if (!parseStrictFloat(tok[4], c.x) ||
                     !parseStrictFloat(tok[5], c.y) ||
                     !parseStrictFloat(tok[6], c.z)) {
-                    return std::nullopt;
+                    return reject(lineNo, "cor de v (r g b) n\u00e3o num\u00e9rica ou NaN/Inf", err);
                 }
                 st.color.push_back(c);
             } else {
                 st.color.push_back(Vec3{1.0f, 1.0f, 1.0f}); // default white
             }
         } else if (tok[0] == "vt") {
-            if (tok.size() < 2 || tok.size() > 4) return std::nullopt;
+            if (tok.size() < 2 || tok.size() > 4) {
+                return reject(lineNo, "vt espera 1 a 3 valores", err);
+            }
             Vec2 t{};
-            if (!parseStrictFloat(tok[1], t.x)) return std::nullopt;
-            if (tok.size() >= 3 && !parseStrictFloat(tok[2], t.y)) return std::nullopt;
+            if (!parseStrictFloat(tok[1], t.x)) {
+                return reject(lineNo, "u de vt n\u00e3o num\u00e9rico ou NaN/Inf", err);
+            }
+            if (tok.size() >= 3 && !parseStrictFloat(tok[2], t.y)) {
+                return reject(lineNo, "v de vt n\u00e3o num\u00e9rico ou NaN/Inf", err);
+            }
             st.uv.push_back(t);
         } else if (tok[0] == "vn") {
-            if (tok.size() != 4) return std::nullopt;
+            if (tok.size() != 4) return reject(lineNo, "vn espera 3 valores", err);
             Vec3 n{};
             if (!parseStrictFloat(tok[1], n.x) || !parseStrictFloat(tok[2], n.y) ||
                 !parseStrictFloat(tok[3], n.z)) {
-                return std::nullopt;
+                return reject(lineNo, "normal de vn n\u00e3o num\u00e9rica ou NaN/Inf", err);
             }
             st.nrm.push_back(n);
         } else if (tok[0] == "f") {
-            if (tok.size() < 4) return std::nullopt; // directive + 3 corners
+            if (tok.size() < 4) {
+                return reject(lineNo, "f precisa de pelo menos 3 cantos", err);
+            }
             std::vector<int> loop;
             loop.reserve(tok.size() - 1);
             for (size_t i = 1; i < tok.size(); ++i) {
@@ -203,9 +229,15 @@ std::optional<RawMeshData> ObjLoader::parseFile(std::istream& in) {
                     ++part;
                     start = c + 1;
                 }
-                if (bad) return std::nullopt;
+                if (bad) {
+                    return reject(lineNo,
+                                  "canto de face mal formado (espera v, v/vt, v//vn ou v/vt/vn)",
+                                  err);
+                }
                 const int id = expandCorner(st, p, t, n);
-                if (id < 0) return std::nullopt;
+                if (id < 0) {
+                    return reject(lineNo, "\u00edndice de face fora do intervalo ou refer\u00eancia para frente", err);
+                }
                 loop.push_back(id);
             }
             st.out.faceIndices.push_back(std::move(loop));
@@ -214,6 +246,9 @@ std::optional<RawMeshData> ObjLoader::parseFile(std::istream& in) {
     }
 
     if (st.out.positions.empty() || st.out.faceIndices.empty()) {
+        if (err) {
+            *err = "OBJ sem geometria utiliz\u00e1vel (sem v ou sem f)";
+        }
         return std::nullopt; // geometry-less file: nothing to build
     }
     if (!st.anyNormal) st.out.normals.clear(); // absent, not placeholders
@@ -221,10 +256,14 @@ std::optional<RawMeshData> ObjLoader::parseFile(std::istream& in) {
     return std::move(st.out);
 }
 
-std::optional<RawMeshData> ObjLoader::load(const std::string& path) {
+std::optional<RawMeshData> ObjLoader::load(const std::string& path,
+                                           std::string* err) {
     std::ifstream in(path, std::ios::binary);
-    if (!in) return std::nullopt;
-    return parseFile(in);
+    if (!in) {
+        if (err) *err = "n\u00e3o foi poss\u00edvel abrir o ficheiro";
+        return std::nullopt;
+    }
+    return parseFile(in, err);
 }
 
 } // namespace blone::io
