@@ -220,6 +220,33 @@ object NativeLib {
     /** Cancels the stroke and restores the captured start state. */
     external fun cancelBrushStroke()
 
+    // ---- I/O 3D (Fase 4: OBJ / glTF-GLB) ------------------------------------
+    //
+    // Threading contract: importMesh/exportObj only ENQUEUE a native worker
+    // (std::async) and return immediately — parse/build/write never run on
+    // the GL or UI threads. The result surfaces through the atomic status
+    // slot (ioStatusConsume), which the ViewModel polls every 400 ms while
+    // an operation is pending. Kotlin resolves SAF to real file paths
+    // BEFORE calling; the mesh itself never crosses the JNI boundary.
+
+    /**
+     * Enqueues an import job. [path] is a real file path (SAF resolved);
+     * [isGltf] selects the glTF (cgltf) or the OBJ loader; [name] is the
+     * display name of the new object. Returns true when the job was
+     * ACCEPTED (not when it finished — watch [ioStatusConsume]).
+     */
+    external fun importMesh(path: String, isGltf: Boolean, name: String): Boolean
+
+    /** Enqueues an OBJ export of the whole scene. True = job accepted. */
+    external fun exportObj(path: String): Boolean
+
+    /** Atomic I/O status: "" idle | "IMPORT_OK|<nome>" | "IMPORT_FAIL|<path>"
+     *  | "EXPORT_OK|<cachepath>" | "EXPORT_FAIL|<path>". */
+    external fun ioStatus(): String
+
+    /** Reads and CLEARS the atomic I/O status (single consumer). */
+    external fun ioStatusConsume(): String
+
     // History.
     external fun canUndo(): Boolean
     external fun canRedo(): Boolean

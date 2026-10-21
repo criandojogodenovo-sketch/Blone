@@ -55,6 +55,8 @@ private fun BloneRoot() {
     val lifecycleOwner = LocalLifecycleOwner.current
     val scope = rememberCoroutineScope()
     val resolver = LocalContext.current.contentResolver
+    val context = LocalContext.current
+    val pendingExportUri = remember { mutableStateOf<android.net.Uri?>(null) }
 
     // SAF: create a .bloneproj file (save) / open an existing one (open).
     val saveLauncher = rememberLauncherForActivityResult(
@@ -95,6 +97,80 @@ private fun BloneRoot() {
         }
     }
 
+    // ---- Fase 4: I/O 3D (OBJ/glTF) — SAF resolve para ficheiro real -------
+    val importLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) {
+            val raw = uri.lastPathSegment ?: ""
+            val isGltf = raw.endsWith(".glb", true) || raw.endsWith(".gltf", true)
+            val displayName = raw.substringAfterLast('/')
+                .substringBeforeLast('.').ifEmpty { "Importado" }
+            scope.launch(Dispatchers.IO) {
+                val tmp = java.io.File(
+                    context.cacheDir,
+                    "io-import-${System.currentTimeMillis()}${if (isGltf) ".glb" else ".obj"}"
+                )
+                val copied = try {
+                    resolver.openInputStream(uri)?.use { input ->
+                        tmp.outputStream().use { input.copyTo(it) }
+                    } != null
+                } catch (_: Exception) {
+                    false
+                }
+                withContext(Dispatchers.Main) {
+                    if (copied) {
+                        viewModel.requestImport(tmp.absolutePath, isGltf, displayName)
+                    } else {
+                        viewModel.importCopyFailed()
+                    }
+                }
+            }
+        }
+    }
+    val exportLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("model/obj")
+    ) { uri ->
+        if (uri != null) {
+            pendingExportUri.value = uri
+            scope.launch(Dispatchers.IO) {
+                val tmp = java.io.File(
+                    context.cacheDir,
+                    "io-export-${System.currentTimeMillis()}.obj"
+                )
+                withContext(Dispatchers.Main) { viewModel.requestExport(tmp.absolutePath) }
+            }
+        }
+    }
+    // I/O hooks: the VM owns polling + messages; MainActivity owns SAF I/O.
+    DisposableEffect(viewModel) {
+        viewModel.onExportFileReady = { cachePath ->
+            val uri = pendingExportUri.value
+            if (uri != null) {
+                scope.launch(Dispatchers.IO) {
+                    val written = try {
+                        resolver.openOutputStream(uri)?.use { out ->
+                            java.io.File(cachePath).inputStream().use { it.copyTo(out) }
+                        } != null
+                    } catch (_: Exception) {
+                        false
+                    }
+                    java.io.File(cachePath).delete() // temp consumed either way
+                    withContext(Dispatchers.Main) {
+                        if (!written) viewModel.exportCopyFailed()
+                    }
+                }
+            }
+        }
+        viewModel.onIoFileCleanup = { cachePath ->
+            scope.launch(Dispatchers.IO) { java.io.File(cachePath).delete() }
+        }
+        onDispose {
+            viewModel.onExportFileReady = null
+            viewModel.onIoFileCleanup = null
+        }
+    }
+
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -125,6 +201,23 @@ private fun BloneRoot() {
                     openLauncher.launch(arrayOf("*/*"))
                 } catch (_: Exception) {
                     viewModel.openProjectResult(-3)
+                }
+            },
+            onImportRequest = {
+                try {
+                    importLauncher.launch(
+                        arrayOf("model/obj", "model/gltf-binary",
+                                "application/octet-stream", "*/*")
+                    )
+                } catch (_: Exception) {
+                    viewModel.importCopyFailed()
+                }
+            },
+            onExportRequest = {
+                try {
+                    exportLauncher.launch("modelo-blone.obj")
+                } catch (_: Exception) {
+                    viewModel.exportCopyFailed()
                 }
             },
             onUsableViewportChanged = { topPx, bottomPx, leftPx, rightPx ->

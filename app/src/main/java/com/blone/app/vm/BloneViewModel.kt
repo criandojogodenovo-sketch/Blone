@@ -8,6 +8,8 @@ import androidx.lifecycle.viewModelScope
 import com.blone.app.gl.CameraState
 import com.blone.app.gl.NativeLib
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -395,6 +397,125 @@ class BloneViewModel : ViewModel() {
         NativeLib.cancelBrushStroke()
         statusText = "Traço cancelado (câmara assumiu)"
         refresh()
+    }
+
+    // ---- I/O 3D (Fase 4: OBJ/glTF) -----------------------------------------
+    //
+    // The ViewModel owns ONLY the polling and the messages; SAF file I/O
+    // stays in MainActivity through the two hooks below (the VM never
+    // touches android.net.Uri). The native side is asynchronous: parse/build
+    // happen on a worker, the object enters the scene at the GL-thread drain
+    // via the SceneOps facade (one undo entry per import).
+
+    /** True while an import/export job is pending (drives the polling). */
+    var ioBusy by mutableStateOf(false)
+        private set
+
+    /** MainActivity hook: copies the exported cache file to the SAF uri
+     *  (Dispatchers.IO) and deletes the temporary. */
+    var onExportFileReady: ((cachePath: String) -> Unit)? = null
+
+    /** MainActivity hook: deletes a temporary cache file. */
+    var onIoFileCleanup: ((cachePath: String) -> Unit)? = null
+
+    private var ioWatchJob: Job? = null
+    private var ioTempPath: String? = null
+
+    /** Enqueues an import job over an already-copied cache file. */
+    fun requestImport(cachePath: String, isGltf: Boolean, displayName: String) {
+        if (ioBusy) {
+            statusText = "Já existe uma operação de E/S em curso"
+            return
+        }
+        ioTempPath = cachePath
+        statusText = "A importar…"
+        if (NativeLib.importMesh(cachePath, isGltf, displayName)) {
+            beginIoWatch()
+        } else {
+            finishIo("Falha na importação")
+        }
+    }
+
+    /** Enqueues an OBJ export job over a fresh cache file. */
+    fun requestExport(cachePath: String) {
+        if (ioBusy) {
+            statusText = "Já existe uma operação de E/S em curso"
+            return
+        }
+        ioTempPath = cachePath
+        statusText = "A exportar…"
+        if (NativeLib.exportObj(cachePath)) {
+            beginIoWatch()
+        } else {
+            finishIo("Falha na exportação")
+        }
+    }
+
+    /** The SAF copy URI -> cache failed before any job was enqueued. */
+    fun importCopyFailed() {
+        statusText = "Falha na importação"
+        cleanupTemp()
+    }
+
+    /** The SAF copy cache -> uri failed after a successful export. */
+    fun exportCopyFailed() {
+        statusText = "Falha na exportação"
+    }
+
+    private fun finishIo(message: String) {
+        statusText = message
+        cleanupTemp()
+    }
+
+    private fun cleanupTemp() {
+        val path = ioTempPath
+        ioTempPath = null
+        if (path != null) onIoFileCleanup?.invoke(path)
+    }
+
+    /** 400 ms polling — runs ONLY while a job is pending (ioBusy). */
+    private fun beginIoWatch() {
+        ioBusy = true
+        ioWatchJob?.cancel()
+        ioWatchJob = viewModelScope.launch {
+            while (ioBusy) {
+                delay(400)
+                val status = NativeLib.ioStatusConsume()
+                if (status.isNotEmpty()) handleIoStatus(status)
+            }
+        }
+    }
+
+    private fun handleIoStatus(status: String) {
+        val parts = status.split("|", limit = 2)
+        when (parts.getOrElse(0) { "" }) {
+            "IMPORT_OK" -> {
+                statusText = "Importado: ${parts.getOrElse(1) { "" }}"
+                ioBusy = false
+                cleanupTemp() // the cache copy has served its purpose
+                refresh()
+            }
+            "IMPORT_FAIL" -> {
+                statusText = "Falha na importação"
+                ioBusy = false
+                cleanupTemp()
+                refresh()
+            }
+            "EXPORT_OK" -> {
+                statusText = "Exportado"
+                ioBusy = false
+                val path = ioTempPath
+                ioTempPath = null
+                // Cache -> SAF uri copy (and temp deletion) is the
+                // MainActivity hook — the VM does no Android I/O.
+                onExportFileReady?.invoke(path ?: parts.getOrElse(1) { "" })
+            }
+            "EXPORT_FAIL" -> {
+                statusText = "Falha na exportação"
+                ioBusy = false
+                cleanupTemp()
+            }
+        }
     }
 
     // ---- modeling operations ------------------------------------------------

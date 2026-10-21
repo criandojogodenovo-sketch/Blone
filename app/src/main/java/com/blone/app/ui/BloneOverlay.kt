@@ -209,6 +209,8 @@ fun BloneOverlay(
     viewModel: BloneViewModel,
     onSaveRequest: () -> Unit,
     onLoadRequest: () -> Unit,
+    onImportRequest: () -> Unit = {},
+    onExportRequest: () -> Unit = {},
     onUsableViewportChanged: (topPx: Int, bottomPx: Int, leftPx: Int, rightPx: Int) ->
         Unit = { _, _, _, _ -> },
 ) {
@@ -310,7 +312,12 @@ fun BloneOverlay(
 
                 // -------- Avançado (scene-level panel, capped + scrollable)
                 if (viewModel.advancedOpen) {
-                    AdvancedPanel(viewModel, maxHeightPx = rootHeightPx)
+                    AdvancedPanel(
+                        viewModel,
+                        maxHeightPx = rootHeightPx,
+                        onImportRequest = onImportRequest,
+                        onExportRequest = onExportRequest,
+                    )
                 }
 
                 // --------- middle band: side toolbar | viewport | properties
@@ -444,7 +451,12 @@ private fun rememberObjectLabel(index: Int): String {
 }
 
 @Composable
-private fun AdvancedPanel(viewModel: BloneViewModel, maxHeightPx: Int) {
+private fun AdvancedPanel(
+    viewModel: BloneViewModel,
+    maxHeightPx: Int,
+    onImportRequest: () -> Unit = {},
+    onExportRequest: () -> Unit = {},
+) {
     // The panel never eats the viewport: hard cap + internal scroll.
     val capDp = with(LocalDensity.current) { ((maxHeightPx * 0.40f).toInt()).toDp() }
     Column(
@@ -469,7 +481,11 @@ private fun AdvancedPanel(viewModel: BloneViewModel, maxHeightPx: Int) {
             ) { viewModel.deleteActiveObject() }
         }
         Spacer(modifier = Modifier.height(6.dp))
-        Text("Primitivas", color = ChromeDim, fontSize = 11.sp)
+        Text(
+            "Primitivas",
+            color = ChromeDim,
+            fontSize = 11.sp,
+        )
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -479,6 +495,23 @@ private fun AdvancedPanel(viewModel: BloneViewModel, maxHeightPx: Int) {
             ToolButton("Esfera", false) { viewModel.createPrimitive(1, "Esfera") }
             ToolButton("Cilindro", false) { viewModel.createPrimitive(2, "Cilindro") }
             ToolButton("Plano", false) { viewModel.createPrimitive(3, "Plano") }
+        }
+        Spacer(modifier = Modifier.height(6.dp))
+        // E/S 3D (Fase 4): real engine-backed import/export — no dead buttons.
+        // Export is pointless on an empty scene, so the button says so.
+        Text("E/S 3D", color = ChromeDim, fontSize = 11.sp)
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .horizontalScroll(rememberScrollState())
+        ) {
+            ToolButton("Importar OBJ/glTF", false, enabled = !viewModel.ioBusy) {
+                onImportRequest()
+            }
+            ToolButton(
+                "Exportar OBJ", false,
+                enabled = viewModel.objectCount > 0 && !viewModel.ioBusy,
+            ) { onExportRequest() }
         }
         Spacer(modifier = Modifier.height(6.dp))
         Text(
