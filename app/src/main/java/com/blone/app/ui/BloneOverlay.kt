@@ -237,12 +237,22 @@ fun BloneOverlay(
             var bottomEdge by remember { mutableIntStateOf(-1) }
             var leftEdge by remember { mutableIntStateOf(-1) }
             var rightEdge by remember { mutableIntStateOf(-1) }
-            LaunchedEffect(topEdge, bottomEdge, leftEdge, rightEdge) {
+            // CONTRATO Fase 2 (R9, hotfix D2): setViewportInsetsRect é
+            // reportado ao renderer SEMPRE que o retângulo medido do chrome
+            // muda — nas DUAS direções. Um painel fechado não mede nada (o
+            // onGloballyPositioned dele é descartado), por isso o seu bordo
+            // é reportado como 0 e as chaves incluem o estado dos painéis:
+            // abrir E fechar Propriedades/Avançado disparam o re-report na
+            // thread GL (via queueEvent em MainActivity -> BloneSurfaceView).
+            // Sem o re-report no fecho, o viewport ficava preso no retângulo
+            // estreito medido com o painel aberto (regressão).
+            LaunchedEffect(topEdge, bottomEdge, leftEdge, rightEdge,
+                           viewModel.propertiesOpen, viewModel.advancedOpen) {
                 onUsableViewportChanged(
                     if (topEdge > 0) topEdge else 0,
                     if (bottomEdge > 0) bottomEdge else 0,
                     if (leftEdge > 0) leftEdge else 0,
-                    if (rightEdge > 0) rightEdge else 0,
+                    if (viewModel.propertiesOpen && rightEdge > 0) rightEdge else 0,
                 )
             }
 
