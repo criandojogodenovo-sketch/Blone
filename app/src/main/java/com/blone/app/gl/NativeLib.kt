@@ -59,9 +59,12 @@ object NativeLib {
     /**
      * ATOMIC selection snapshot from the C++ engine (single source of truth):
      * [editMode, selectionMode, multiSelect, hasActiveObject,
-     *  nVerts, nEdges, nFaces, hasValidSelection].
+     *  nVerts, nEdges, nFaces, hasValidSelection, activeIndex].
      * Dead ids are never counted; hasValidSelection distinguishes an EMPTY
      * selection (all counts zero) from an INVALID one (stale ids dropped).
+     * activeIndex (hotfix D3) is the ENGINE's active object (-1 when none):
+     * the UI mirror MUST re-sync from it every refresh — keeping its own
+     * stale copy made the properties panel read the wrong object.
      */
     external fun selectionSnapshot(): IntArray?
 

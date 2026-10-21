@@ -181,9 +181,12 @@ std::vector<jint> selectionCounts() {
 // ATOMIC selection snapshot for the UI (single source of truth): the Kotlin
 // layer reads this instead of keeping a diverging copy of the selection.
 // Layout: [editMode, selectionMode, multiSelect, hasActiveObject,
-//          nVerts, nEdges, nFaces, hasValidSelection].
+//          nVerts, nEdges, nFaces, hasValidSelection, activeIndex].
 // Dead ids are NOT counted; hasValidSelection distinguishes an EMPTY
 // selection (all zero) from an INVALID one (ids kept but dead).
+// activeIndex (hotfix D3) is the ENGINE's active object — the Kotlin mirror
+// used to keep its own stale copy, which made the properties panel read the
+// wrong object ("Cubo 1 ativo" mostrava V0·A0·F0 e centro "—").
 std::vector<jint> selectionSnapshotLocked() {
     int counts[3] = {0, 0, 0};
     blone::sceneops::selectionCounts(gScene, counts);
@@ -193,7 +196,8 @@ std::vector<jint> selectionSnapshotLocked() {
             gScene.multiSelect ? 1 : 0,
             obj ? 1 : 0,
             counts[0], counts[1], counts[2],
-            blone::sceneops::hasValidSelection(gScene) ? 1 : 0};
+            blone::sceneops::hasValidSelection(gScene) ? 1 : 0,
+            obj ? gScene.active : -1};
 }
 
 jintArray toJIntArray(JNIEnv* env, const std::vector<jint>& v) {

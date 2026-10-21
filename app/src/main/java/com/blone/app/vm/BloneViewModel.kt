@@ -248,7 +248,14 @@ class BloneViewModel : ViewModel() {
         refresh()
     }
 
-    /** Applies one atomic engine snapshot to the mirrored UI state. */
+    /** Applies one atomic engine snapshot to the mirrored UI state.
+     *
+     *  Hotfix D3: index 8 is the ENGINE's active object. The Kotlin mirror
+     *  used to keep its own stale copy (set only by explicit activation), so
+     *  the properties panel showed "Nenhum objeto"/V0·A0·F0 with an active
+     *  object and the fixed steps had nothing to act on. From now on the
+     *  engine is the single source of truth — after a pick, a primitive,
+     *  an import drain, undo/redo, the mirror re-syncs every refresh(). */
     private fun applySnapshot(snap: IntArray?) {
         if (snap == null || snap.size < 8) return
         engineSelectionMode = SelectionMode.entries.firstOrNull { it.native == snap[1] }
@@ -258,6 +265,7 @@ class BloneViewModel : ViewModel() {
         selEdges = snap[5]
         selFaces = snap[6]
         hasValidSelection = snap[7] == 1
+        if (snap.size >= 9) activeObject = snap[8]
     }
 
     /** Called (UI thread) with the result of [NativeLib.pickAndSelect]:
@@ -629,22 +637,19 @@ class BloneViewModel : ViewModel() {
         // ONE atomic native read for every selection-derived UI state — the
         // Kotlin layer never derives selection state on its own.
         applySnapshot(NativeLib.selectionSnapshot())
-        // Properties readout: engine-reported name/counts/center only.
-        val idx = activeObject
-        if (idx < 0 || idx >= objectCount) {
-            propLabel = ""
-            propVerts = 0
-            propEdges = 0
-            propFaces = 0
-            propCenter = null
-        } else {
-            val base = NativeLib.objectName(idx)
-            propLabel = if (base.isNullOrEmpty()) "Objeto ${idx + 1}" else "$base ${idx + 1}"
-            val info = NativeLib.objectInfo(idx)
-            propVerts = info?.getOrNull(0) ?: 0
-            propEdges = info?.getOrNull(1) ?: 0
-            propFaces = info?.getOrNull(2) ?: 0
-            propCenter = NativeLib.objectCenter(idx)
-        }
+        // Properties readout: engine-reported name/counts/center only, keyed
+        // by the ENGINE active index synced above (hotfix D3).
+        val inRange = activeObject in 0 until objectCount
+        val readout = PropertiesReadout.compute(
+            activeObject, objectCount,
+            if (inRange) NativeLib.objectName(activeObject) else null,
+            if (inRange) NativeLib.objectInfo(activeObject) else null,
+            if (inRange) NativeLib.objectCenter(activeObject) else null,
+        )
+        propLabel = readout.label
+        propVerts = readout.verts
+        propEdges = readout.edges
+        propFaces = readout.faces
+        propCenter = readout.center
     }
 }
