@@ -477,7 +477,14 @@ Java_com_blone_app_gl_NativeLib_beginGizmoDrag(JNIEnv* /*env*/, jobject /*thiz*/
     int kind = 0;
     int axis = -1;
     if (handle >= 1 && handle <= 3) {
-        tool = static_cast<int>(blone::GizmoTool::Move);
+        // D4 (hotfix): axis tips are hit-tested for BOTH the Move and the
+        // Scale gizmos (Renderer::gizmoHitAt returns a+1 for either). The
+        // tip therefore belongs to the ACTIVE tool: with Escalar active an
+        // axial tip is an AXIAL SCALE (kind 1) — the old hard-coded Move
+        // mapping rejected it as "seleção inválida" in object mode.
+        tool = static_cast<int>(gGizmoTool == blone::GizmoTool::Scale
+                                    ? blone::GizmoTool::Scale
+                                    : blone::GizmoTool::Move);
         kind = 1;
         axis = handle - 1;
     } else if (handle == 4) {
