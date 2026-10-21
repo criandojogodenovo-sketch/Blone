@@ -129,7 +129,7 @@ private fun BloneRoot() {
         if (uri != null) {
             scope.launch(Dispatchers.IO) {
                 val displayName = try {
-                    queryDisplayName(uri)
+                    queryDisplayName(resolver, uri)
                 } catch (_: Exception) {
                     null
                 } ?: uri.lastPathSegment ?: ""
