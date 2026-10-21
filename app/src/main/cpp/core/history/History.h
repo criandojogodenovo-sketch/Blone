@@ -48,6 +48,12 @@ public:
     bool pushVerticesDelta(uint32_t objIndex,
                            std::vector<std::pair<ElemId, Vec3>> before,
                            std::vector<std::pair<ElemId, Vec3>> after);
+    // Paint stroke (Fase 3): exact color deltas for ONE gesture. Restores
+    // ONLY colors (sculpt entries restore only positions — each entry type
+    // restores exactly the data its operation modified).
+    bool pushColorDelta(uint32_t objIndex,
+                        std::vector<std::pair<ElemId, Vec3>> before,
+                        std::vector<std::pair<ElemId, Vec3>> after);
     bool pushMeshSwap(uint32_t objIndex, HalfEdgeMesh::Raw before,
                       HalfEdgeMesh::Raw after);
     // Mesh swap that ALSO restores the object selection on undo/redo
@@ -67,13 +73,15 @@ public:
 
 private:
     struct Entry {
-        enum class Kind { VertDelta, MeshSwap, ObjAdd, ObjRemove } kind =
-                Kind::VertDelta;
+        enum class Kind { VertDelta, ColorDelta, MeshSwap, ObjAdd, ObjRemove }
+                kind = Kind::VertDelta;
         uint32_t objIndex = 0;
         uint64_t bytes = 0;
-        // VertDelta
+        // VertDelta / ColorDelta (positions / vertex colors)
         std::vector<std::pair<ElemId, Vec3>> beforePos;
         std::vector<std::pair<ElemId, Vec3>> afterPos;
+        std::vector<std::pair<ElemId, Vec3>> beforeCol;
+        std::vector<std::pair<ElemId, Vec3>> afterCol;
         // MeshSwap
         HalfEdgeMesh::Raw beforeMesh;
         HalfEdgeMesh::Raw afterMesh;

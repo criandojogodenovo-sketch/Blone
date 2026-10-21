@@ -174,6 +174,52 @@ object NativeLib {
     /** Cancels the drag (second finger landed — the camera takes over). */
     external fun cancelGizmoDrag()
 
+    // ---- brush (Fase 3: Esculpir / Pintar) ----------------------------------
+    //
+    // Same threading contract as the gizmo drag: UI-thread, CPU-only, mutex
+    // guarded in native code. The mesh NEVER crosses to Kotlin — hits, the
+    // deformation, the painting and the history entry all live in C++; the
+    // renderer resyncs from Scene::version on the next frame.
+
+    /**
+     * Raw surface hit under the pixel (NO selection side effects). Returns
+     * [hit(0/1), objIndex, worldX, worldY, worldZ]; hit 0 = nothing under
+     * the finger (no stroke starts).
+     */
+    external fun brushHit(xPx: Float, yPx: Float): FloatArray?
+
+    /**
+     * Starts a stroke on the surface under (xPx,yPx) and applies the first
+     * dab. tool: 0 = sculpt, 1 = paint. mode: 0 = raise, 1 = dig (sculpt).
+     * r/g/b: paint color in [0,1]. opacity: paint blend in [0.01,1].
+     * Returns 0 (OK) or a negative status code.
+     */
+    external fun beginBrushStroke(
+        tool: Int,
+        xPx: Float,
+        yPx: Float,
+        radius: Float,
+        strength: Float,
+        mode: Int,
+        r: Float,
+        g: Float,
+        b: Float,
+        opacity: Float,
+    ): Int
+
+    /**
+     * Continues the stroke at the current finger position; radius/strength
+     * are the LIVE brush parameters. A miss (finger left the mesh) is a
+     * valid no-op. Returns 0 (OK) or a negative status code.
+     */
+    external fun moveBrushStroke(xPx: Float, yPx: Float, radius: Float, strength: Float): Int
+
+    /** Ends the stroke: commits exactly ONE history entry when it changed anything. */
+    external fun endBrushStroke(): Int
+
+    /** Cancels the stroke and restores the captured start state. */
+    external fun cancelBrushStroke()
+
     // History.
     external fun canUndo(): Boolean
     external fun canRedo(): Boolean

@@ -18,8 +18,8 @@ android {
         applicationId = "com.blone.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 5
-        versionName = "0.3.0-fase2"
+        versionCode = 6
+        versionName = "0.4.0-fase3"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables { useSupportLibrary = true }

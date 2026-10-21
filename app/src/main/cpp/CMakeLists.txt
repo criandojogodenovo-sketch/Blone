@@ -6,6 +6,7 @@ add_library(blone SHARED
         renderer/Renderer.cpp
         core/Mesh.cpp
         core/Scene.cpp
+        core/brush/Brush.cpp
         core/mesh/HalfEdgeMesh.cpp
         core/mesh/Primitives.cpp
         core/operations/Operations.cpp

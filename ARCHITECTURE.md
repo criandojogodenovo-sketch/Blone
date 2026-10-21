@@ -3,7 +3,8 @@
 Blone é uma aplicação Android nativa de modelagem 3D: gratuita, offline, com
 interface profissional simples de aprender pelo ecrã tátil, desenhada para
 telemóveis com recursos limitados. Este documento descreve a arquitetura
-implementada nas **Fases 0, 1 e 2** e as responsabilidades de cada camada.
+implementada nas **Fases 0, 1, 2 e 3** (esculpir e pintar) e as
+responsabilidades de cada camada.
 
 ---
 
@@ -28,13 +29,14 @@ implementada nas **Fases 0, 1 e 2** e as responsabilidades de cada camada.
 ├────────────────────────────────────────────────────────────┤
 │  C++ (app/src/main/cpp)                                    │
 │  renderer/Renderer (OpenGL ES 3.0, buffers por objeto,     │
-│    overlays de seleção, picking CPU por elemento)          │
-│  core/mesh/ HalfEdgeMesh · Primitives                      │
+│    overlays de seleção, picking CPU, hit de superfície e   │
+│    anel do pincel)                                         │
+│  core/mesh/ HalfEdgeMesh · Primitives (cor por vértice)    │
+│  core/brush/ Brush (Fase 3: esculpir/pintar)               │
 │  core/operations/ Operations · TransformMath               │
-│  core/history/History                                      │
-│  core/scene/ Scene · SceneOps                              │
-│  core/project/Project (formato BLONEPRJ, docs/PROJECT_FORMAT.md) │
-│  core/ io/ (vazio na Fase 2; preenchido na Fase 3)         │
+│  core/history/History (VertDelta + ColorDelta)             │
+│  core/scene/ Scene · SceneOps (sessões de ferramenta)      │
+│  core/project/Project (formato BLONEPRJ v2, docs/PROJECT_FORMAT.md) │
 │  tests/ suíte do núcleo em host (CMake + ctest, sem Android)│
 └────────────────────────────────────────────────────────────┘
 ```
@@ -429,9 +431,80 @@ correm fora da thread principal e a UI nunca bloqueia.
   no app, gestos, rotação, FPS real no contador. O objetivo de 60 FPS é
   avaliado no dispositivo, nunca prometido por padrão.
 
-## 8. Fases futuras (não implementadas aqui)
+## 8. Fase 3 — Esculpir e Pintar (pincel sobre a malha)
 
-Fase 3: tinygltf (glTF 2.0/GLB) com versão fixada e licença verificada,
-importador OBJ, exportação GLB/glTF, stb_image para texturas, xatlas para UV.
-Nenhuma destas dependências ou funcionalidades foi integrada na Fase 2 —
-`core/io/` está vazio de propósito.
+### 8.1 Arquitetura e fronteira JNI
+
+O pincel reutiliza TODA a infraestrutura existente — não existe um segundo
+sistema de geometria:
+
+- **Hit de superfície**: `Renderer::surfaceHitAt()` usa o MESMO raio
+  (`buildPickRay`) e a MESMA triangulação (`renderdata::faceTriangles`) do
+  picking de seleção — o que o pincel atinge é exatamente o que está
+  desenhado. Devolve o ponto em espaço do mundo E local (posição do objeto
+  subtraída), mais o id da face atingida.
+- **Núcleo (`core/brush/Brush.{h,cpp}`)**: funções puras,
+  `collectAffected()` (vértices vivos dentro do raio, esfera em espaço
+  local), `sculptApply()` (deslocamento ao longo da NORMAL DA FACE ATINGIDA
+  — previsível em malhas grosseiras — com atenuação cossenoidal 1→0 do
+  centro para a borda do raio) e `paintApply()` (mistura da cor albedo com
+  `opacidade × atenuação`). Todas validam os parâmetros (NaN/Inf/fora de
+  intervalo → rejeição) e revertem a aplicação inteira se algum resultado
+  não finito surgir (a malha fica intacta).
+- **Sessão (`sceneops::BrushSession`)**: o MESMO contrato da sessão de
+  gizmo — `begin` reserva o orçamento do histórico UMA VEZ (limite
+  superior = todos os vértices vivos), `move` aplica o pincel no novo hit,
+  `end` submete EXATAMENTE UMA entrada de histórico, `cancel` restaura o
+  estado inicial capturado.
+- **Kotlin**: `TouchTracker` ganhou o caminho BRUSH (prioridade no
+  touch-down: alça do gizmo → sonda do pincel → órbita; o 2.º dedo é SEMPRE
+  câmara e cancela o traço). `BloneViewModel` mantém os parâmetros REAIS
+  (raio, intensidade, modo levantar/cavar, opacidade, cor) que são passados
+  ao nativo em cada begin/move. Nenhuma malha cruza a ponte JNI: os eventos
+  enviam apenas pixels e parâmetros; o renderer ressincroniza via
+  `Scene::version`.
+
+### 8.2 Representação dos dados
+
+- **Cor por vértice**: `HalfEdgeMesh::Vertex.color` (RGB albedo em [0,1]).
+  O valor predefinido `kDefaultVertexColor` é igual à cor base histórica do
+  shader, por isso malhas não pintadas e ficheiros antigos mantêm o aspeto.
+- **Renderização**: `RenderData.fillCol` transporta a cor por vértice
+  duplicado (flat shading); o shader de preenchimento interpolou-a (GLES 3.0,
+  atributo location 2). O uniforme `uUseVertexColor` mantém os overlays de
+  seleção no caminho da cor base histórica (os VAOs de overlay não têm cor).
+- **Formato**: BLONEPRJ **v2** acrescenta `3 × f32` de cor por vértice;
+  o leitor aceita v1 (cores predefinidas) e v2; detalhes em
+  `docs/PROJECT_FORMAT.md`.
+
+### 8.3 Estratégia de Undo/Redo (Fase 6)
+
+- **Um gesto = uma entrada**: a sessão acumula a UNIÃO dos vértices
+  afetados com as posições/cores de PRIMEIRO toque; o `end` submete um
+  `VertDelta` (esculpir) ou `ColorDelta` (pintar, novo tipo de entrada) com
+  o antes/depois exato do gesto inteiro — nunca uma entrada por frame.
+- **Cancelar** restaura bit-exact as posições/cores iniciais e liberta a
+  reserva (gesto cancelado não deixa entrada).
+- Cada tipo de entrada restaura EXATAMENTE os dados que a sua operação
+  modificou (esculpir só posições, pintar só cores). O orçamento de 24 MB e
+  as regras de evicção existentes aplicam-se sem alterações.
+
+### 8.4 Limitações conhecidas (primeira versão)
+
+- Sem remalhagem dinâmica, subdivisão adaptativa ou ruído avançado: o
+  deslocamento é por aplicação `passo × intensidade × atenuação`
+  (`kBrushStepWorld`), aplicado na frequência dos eventos de toque.
+- Malhas densas pagem varredura O(V) por evento (sem índice espacial) —
+  aceitável para as primitivas atuais (≤ ~3 mil vértices), documentado
+  como ponto de otimização futura.
+- O seletor de cor é uma paleta fixa de 12 amostras (sintonia fina HSV
+  fica para uma extensão futura).
+- Teste físico pendente: latência e sensação do traço em hardware real
+  (os testes host cobrem a lógica, não a ergonomia tátil).
+
+## 9. Fases futuras (não implementadas aqui)
+
+Importação/exportação: tinygltf (glTF 2.0/GLB) com versão fixada e licença
+verificada, importador OBJ, exportação GLB/glTF, stb_image para texturas,
+xatlas para UV. Nenhuma destas dependências ou funcionalidades foi
+integrada — `core/io/` continua vazio de propósito.

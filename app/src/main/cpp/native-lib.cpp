@@ -32,6 +32,7 @@ blone::Renderer gRenderer;
 blone::Scene gScene;
 blone::History gHistory;
 blone::sceneops::ToolSession gTool;
+blone::sceneops::BrushSession gBrush; // Fase 3: um gesto = uma sessão
 blone::GizmoTool gGizmoTool = blone::GizmoTool::Move;
 std::mutex gMutex;
 
@@ -77,6 +78,29 @@ jintArray toJIntArray(JNIEnv* env, const std::vector<jint>& v) {
     env->SetIntArrayRegion(arr, 0, static_cast<jsize>(v.size()), v.data());
     return arr;
 }
+
+jfloatArray toJFloatArray(JNIEnv* env, const std::vector<jfloat>& v) {
+    jfloatArray arr = env->NewFloatArray(static_cast<jsize>(v.size()));
+    if (!arr) return nullptr;
+    env->SetFloatArrayRegion(arr, 0, static_cast<jsize>(v.size()), v.data());
+    return arr;
+}
+
+// Raw surface hit under the pixel (NO selection side effects) — the brush
+// entry point used by Kotlin before starting a stroke. Uses the camera
+// snapshot of the last rendered frame, exactly like pickAtPixel/gizmoHitAt
+// (single projection source). Returns [hit(0/1), objIndex, wX, wY, wZ].
+std::vector<jfloat> brushHitLocked(jfloat xPx, jfloat yPx) {
+    blone::Renderer::SurfaceHit hit;
+    const bool ok = gRenderer.surfaceHitAt(xPx, yPx, gScene, hit);
+    if (!ok) return {0.0f, -1.0f, 0.0f, 0.0f, 0.0f};
+    return {1.0f, static_cast<float>(hit.objectIndex), hit.world.x, hit.world.y,
+            hit.world.z};
+}
+
+// Brush ring color policy: paint uses the brush albedo (immediate feedback
+// of what will be painted); sculpt uses the amber of the other editing
+// overlays. (Kept next to the stroke entry points for clarity.)
 
 // Defensive hygiene after ANY scene mutation: selection ids that no longer
 // exist in the mesh are removed everywhere (belt and braces — the scene
@@ -370,6 +394,117 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_blone_app_gl_NativeLib_cancelGizmoDrag(JNIEnv* /*env*/, jobject /*thiz*/) {
     std::lock_guard<std::mutex> lock(gMutex);
     blone::sceneops::cancelTool(gScene, gHistory, gTool);
+}
+
+// ======================== Fase 3: Esculpir / Pintar ========================
+//
+// Threading: same contract as the gizmo drag — UI thread, CPU-only, mutex
+// guarded. The mesh NEVER crosses to Kotlin: the surface hit, the affected
+// vertices, the deformation and the history entry all live in C++; the
+// renderer resyncs from Scene::version on the next frame.
+
+// Surface hit under the pixel: [hit(0/1), objIndex, wX, wY, wZ].
+extern "C" JNIEXPORT jfloatArray JNICALL
+Java_com_blone_app_gl_NativeLib_brushHit(JNIEnv* env, jobject /*thiz*/,
+                                         jfloat xPx, jfloat yPx) {
+    std::lock_guard<std::mutex> lock(gMutex);
+    return toJFloatArray(env, brushHitLocked(xPx, yPx));
+}
+
+// Starts a stroke and applies the first dab. tool: 0 sculpt, 1 paint.
+// mode: 0 raise, 1 dig (sculpt only). r/g/b in [0,1] (paint only).
+// Returns 0 (OK) or a negative status code.
+extern "C" JNIEXPORT jint JNICALL
+Java_com_blone_app_gl_NativeLib_beginBrushStroke(JNIEnv* /*env*/, jobject /*thiz*/,
+                                                 jint tool, jfloat xPx, jfloat yPx,
+                                                 jfloat radius, jfloat strength,
+                                                 jint mode, jfloat r, jfloat g,
+                                                 jfloat b, jfloat opacity) {
+    std::lock_guard<std::mutex> lock(gMutex);
+    if (tool != 0 && tool != 1) {
+        return static_cast<jint>(blone::ops::Status::ErrInvalidArg);
+    }
+    blone::Renderer::SurfaceHit hit;
+    if (!gRenderer.surfaceHitAt(xPx, yPx, gScene, hit)) {
+        return static_cast<jint>(blone::ops::Status::ErrInvalidArg);
+    }
+    const blone::Vec3 hitNormal =
+            gScene.objects[static_cast<size_t>(hit.objectIndex)].mesh.faceNormal(
+                    hit.faceId);
+    blone::brush::BrushSettings s;
+    s.radius = radius;
+    s.strength = strength;
+    s.opacity = opacity;
+    s.mode = (mode == 1) ? blone::brush::SculptMode::Dig
+                         : blone::brush::SculptMode::Raise;
+    s.color = blone::Vec3{r, g, b};
+    const blone::sceneops::BrushTool bt =
+            (tool == 0) ? blone::sceneops::BrushTool::Sculpt
+                        : blone::sceneops::BrushTool::Paint;
+    const jint rc = static_cast<jint>(blone::sceneops::beginBrushStroke(
+            gScene, gHistory, gBrush, bt, hit.objectIndex, hit.local, hitNormal,
+            s));
+    if (rc == 0) {
+        // Ring at the actual first application point; paint shows the brush
+        // albedo, sculpt the amber of the other editing overlays.
+        const bool paint = (bt == blone::sceneops::BrushTool::Paint);
+        gRenderer.setBrushOverlay(true, hit.world, gBrush.settings.radius,
+                                  paint ? gBrush.settings.color.x : 1.0f,
+                                  paint ? gBrush.settings.color.y : 0.72f,
+                                  paint ? gBrush.settings.color.z : 0.20f,
+                                  0.95f);
+    }
+    return rc;
+}
+
+// Continues the stroke at the current finger position. A miss (finger slid
+// off the mesh) keeps the session alive and only hides the ring.
+extern "C" JNIEXPORT jint JNICALL
+Java_com_blone_app_gl_NativeLib_moveBrushStroke(JNIEnv* /*env*/, jobject /*thiz*/,
+                                                jfloat xPx, jfloat yPx,
+                                                jfloat radius, jfloat strength) {
+    std::lock_guard<std::mutex> lock(gMutex);
+    if (!gBrush.active) {
+        return static_cast<jint>(blone::ops::Status::ErrInvalidArg);
+    }
+    blone::Renderer::SurfaceHit hit;
+    if (!gRenderer.surfaceHitAt(xPx, yPx, gScene, hit)) {
+        gRenderer.setBrushOverlay(false, blone::Vec3{}, 0.0f, 0, 0, 0, 0);
+        return 0; // off-surface: valid no-op, stroke continues
+    }
+    const blone::Vec3 hitNormal =
+            gScene.objects[static_cast<size_t>(hit.objectIndex)].mesh.faceNormal(
+                    hit.faceId);
+    const jint rc = static_cast<jint>(blone::sceneops::moveBrushStroke(
+            gScene, gBrush, hit.local, hitNormal, radius, strength));
+    if (rc == 0) {
+        const bool paint =
+                (gBrush.tool == blone::sceneops::BrushTool::Paint);
+        gRenderer.setBrushOverlay(true, hit.world, gBrush.settings.radius,
+                                  paint ? gBrush.settings.color.x : 1.0f,
+                                  paint ? gBrush.settings.color.y : 0.72f,
+                                  paint ? gBrush.settings.color.z : 0.20f,
+                                  0.95f);
+    }
+    return rc;
+}
+
+// Ends the stroke: commits exactly ONE history entry when something changed.
+extern "C" JNIEXPORT jint JNICALL
+Java_com_blone_app_gl_NativeLib_endBrushStroke(JNIEnv* /*env*/, jobject /*thiz*/) {
+    std::lock_guard<std::mutex> lock(gMutex);
+    const jint rc = static_cast<jint>(
+            blone::sceneops::endBrushStroke(gScene, gHistory, gBrush));
+    gRenderer.setBrushOverlay(false, blone::Vec3{}, 0.0f, 0, 0, 0, 0);
+    return rc;
+}
+
+// Cancels the stroke: restores the captured start state (mesh and colors).
+extern "C" JNIEXPORT void JNICALL
+Java_com_blone_app_gl_NativeLib_cancelBrushStroke(JNIEnv* /*env*/, jobject /*thiz*/) {
+    std::lock_guard<std::mutex> lock(gMutex);
+    blone::sceneops::cancelBrushStroke(gScene, gHistory, gBrush);
+    gRenderer.setBrushOverlay(false, blone::Vec3{}, 0.0f, 0, 0, 0, 0);
 }
 
 extern "C" JNIEXPORT jint JNICALL

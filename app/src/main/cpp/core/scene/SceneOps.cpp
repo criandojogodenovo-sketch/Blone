@@ -707,6 +707,216 @@ Status transformDirect(Scene& s, History& h, Tool tool, int axis, float amount) 
     return Status::OK;
 }
 
+// ----------------------------------------------------------------- brush --
+//
+// Granularity (Fase 6 contract): ONE history entry per gesture. The session
+// accumulates the union of affected vertices; start states are captured on
+// FIRST touch, so undo restores exactly the pre-gesture data.
+
+namespace {
+
+// Inserts `v` into the sorted-unique `touched` vector and, when new,
+// captures its current position/color into the parallel start arrays.
+// Returns the insertion index.
+size_t touchVertex(BrushSession& b, const HalfEdgeMesh& m, ElemId v) {
+    auto it = std::lower_bound(b.touched.begin(), b.touched.end(), v);
+    if (it != b.touched.end() && *it == v) {
+        return static_cast<size_t>(it - b.touched.begin());
+    }
+    const size_t idx = static_cast<size_t>(it - b.touched.begin());
+    b.touched.insert(it, v);
+    b.startPos.insert(b.startPos.begin() + static_cast<long>(idx),
+                      m.vrt(v).pos);
+    b.startColor.insert(b.startColor.begin() + static_cast<long>(idx),
+                        m.vrt(v).color);
+    return idx;
+}
+
+// One brush application at `hitLocal`: collect -> record start states ->
+// apply -> mark change. Returns false only on a rejected application
+// (invalid hit data / non-finite result, mesh untouched in that case).
+bool applyBrushAt(Scene& s, BrushSession& b, const Vec3& hitLocal,
+                  const Vec3& hitNormal) {
+    if (b.objIndex < 0 || b.objIndex >= static_cast<int>(s.objects.size())) {
+        return false;
+    }
+    HalfEdgeMesh& m = s.objects[static_cast<size_t>(b.objIndex)].mesh;
+    if (!ops::isFiniteVec(hitLocal.x, hitLocal.y, hitLocal.z)) return false;
+
+    std::vector<ElemId> affected;
+    brush::collectAffected(m, hitLocal, b.settings.radius, affected);
+    if (affected.empty()) return true; // nothing in range: valid no-op
+
+    // Record start states BEFORE this application touches anything.
+    for (const ElemId v : affected) touchVertex(b, m, v);
+
+    const bool ok = (b.tool == BrushTool::Sculpt)
+                        ? brush::sculptApply(m, affected, hitLocal, hitNormal,
+                                             b.settings)
+                        : brush::paintApply(m, affected, hitLocal, b.settings);
+    if (!ok) return false;
+    b.anyChange = true;
+    return true;
+}
+
+} // namespace
+
+Status beginBrushStroke(Scene& s, History& h, BrushSession& b, BrushTool tool,
+                        int objIndex, const Vec3& hitLocal,
+                        const Vec3& hitNormal,
+                        const brush::BrushSettings& settings) {
+    if (b.active) cancelBrushStroke(s, h, b); // defensive: one stroke at a time
+    if (tool != BrushTool::Sculpt && tool != BrushTool::Paint) {
+        return Status::ErrInvalidArg;
+    }
+    if (objIndex < 0 || objIndex >= static_cast<int>(s.objects.size())) {
+        return Status::ErrNoActiveObject;
+    }
+    if (!brush::settingsValid(settings)) return Status::ErrInvalidArg;
+    if (!ops::isFiniteVec(hitLocal.x, hitLocal.y, hitLocal.z)) {
+        return Status::ErrInvalidArg;
+    }
+    if (!ops::isFiniteVec(hitNormal.x, hitNormal.y, hitNormal.z)) {
+        return Status::ErrInvalidArg;
+    }
+    SceneObject& obj = s.objects[static_cast<size_t>(objIndex)];
+    if (obj.mesh.empty()) return Status::ErrNoActiveObject;
+
+    // History reservation BEFORE any mutation (condition 3). Upper bound for
+    // the WHOLE stroke: every alive vertex could be touched (16 bytes per
+    // delta pair, before+after) + slack. Rejected up front if it cannot fit.
+    const uint64_t bound =
+            static_cast<uint64_t>(obj.mesh.aliveVertexCount()) * 32ull + 256ull;
+    if (!h.reserve(bound)) return Status::ErrBudget;
+
+    BrushSession session;
+    session.active = true;
+    session.tool = tool;
+    session.objIndex = objIndex;
+    session.settings = settings;
+
+    b = std::move(session);
+    if (!applyBrushAt(s, b, hitLocal, hitNormal)) {
+        // First dab rejected: clean cancellation, budget released.
+        cancelBrushStroke(s, h, b);
+        return Status::ErrInvalidArg;
+    }
+    s.bump(); // renderer resync (first dab is visible immediately)
+    return Status::OK;
+}
+
+Status moveBrushStroke(Scene& s, BrushSession& b, const Vec3& hitLocal,
+                       const Vec3& hitNormal, float radius, float strength) {
+    if (!b.active) return Status::ErrInvalidArg;
+    if (b.objIndex < 0 || b.objIndex >= static_cast<int>(s.objects.size())) {
+        return Status::ErrNoActiveObject;
+    }
+    if (!ops::isFiniteVec(hitLocal.x, hitLocal.y, hitLocal.z)) {
+        return Status::ErrInvalidArg;
+    }
+    if (!ops::isFiniteVec(hitNormal.x, hitNormal.y, hitNormal.z)) {
+        return Status::ErrInvalidArg;
+    }
+    // Live parameters (real inputs, clamped through the same sanitizer).
+    brush::BrushSettings next = b.settings;
+    next.radius = radius;
+    next.strength = strength;
+    if (!brush::settingsValid(next)) return Status::ErrInvalidArg;
+    b.settings.radius = brush::sanitized(next).radius;
+    b.settings.strength = brush::sanitized(next).strength;
+
+    if (!applyBrushAt(s, b, hitLocal, hitNormal)) return Status::ErrInternal;
+    s.bump();
+    return Status::OK;
+}
+
+Status endBrushStroke(Scene& s, History& h, BrushSession& b) {
+    if (!b.active) return Status::ErrInvalidArg;
+    const bool hadObject =
+            b.objIndex >= 0 && b.objIndex < static_cast<int>(s.objects.size());
+    HalfEdgeMesh* m = hadObject
+                          ? &s.objects[static_cast<size_t>(b.objIndex)].mesh
+                          : nullptr;
+
+    // Commit path: build the exact before/after delta of the WHOLE gesture
+    // from the accumulated union (touched) and push ONE history entry.
+    // `touched` is sorted-unique and iterated in order, so index i IS the
+    // parallel index into startPos/startColor.
+    bool ok = true;
+    bool committed = false;
+    if (m != nullptr && b.anyChange) {
+        std::vector<std::pair<ElemId, Vec3>> before, after;
+        before.reserve(b.touched.size());
+        after.reserve(b.touched.size());
+        for (size_t i = 0; i < b.touched.size(); ++i) {
+            const ElemId v = b.touched[i];
+            if (!m->vertexAlive(v)) continue;
+            if (b.tool == BrushTool::Sculpt) {
+                before.emplace_back(v, b.startPos[i]);
+                after.emplace_back(v, m->vrt(v).pos);
+            } else {
+                before.emplace_back(v, b.startColor[i]);
+                after.emplace_back(v, m->vrt(v).color);
+            }
+        }
+        const bool changed = [&] {
+            for (size_t i = 0; i < before.size(); ++i) {
+                const Vec3 d = before[i].second - after[i].second;
+                if (std::fabs(d.x) + std::fabs(d.y) + std::fabs(d.z) > 1e-7f) {
+                    return true;
+                }
+            }
+            return false;
+        }();
+        if (changed) {
+            committed = (b.tool == BrushTool::Sculpt)
+                            ? h.pushVerticesDelta(
+                                  static_cast<uint32_t>(b.objIndex),
+                                  std::move(before), std::move(after))
+                            : h.pushColorDelta(
+                                  static_cast<uint32_t>(b.objIndex),
+                                  std::move(before), std::move(after));
+            ok = committed;
+        } else {
+            h.rollbackReservation();
+            ok = true;
+        }
+    } else {
+        h.rollbackReservation();
+        ok = true;
+    }
+    if (!ok && m != nullptr) {
+        // Push failed after mutation: restore the start state (same contract
+        // as endTool) — the reservation is released either way.
+        for (size_t i = 0; i < b.touched.size(); ++i) {
+            const ElemId v = b.touched[i];
+            if (!m->vertexAlive(v)) continue;
+            if (b.tool == BrushTool::Sculpt) m->vrt(v).pos = b.startPos[i];
+            else m->vrt(v).color = b.startColor[i];
+        }
+        h.rollbackReservation();
+        s.bump();
+    }
+    b = BrushSession{};
+    return ok ? Status::OK : Status::ErrInternal;
+}
+
+void cancelBrushStroke(Scene& s, History& h, BrushSession& b) {
+    if (!b.active) return;
+    if (b.objIndex >= 0 && b.objIndex < static_cast<int>(s.objects.size())) {
+        HalfEdgeMesh& m = s.objects[static_cast<size_t>(b.objIndex)].mesh;
+        for (size_t i = 0; i < b.touched.size(); ++i) {
+            const ElemId v = b.touched[i];
+            if (!m.vertexAlive(v)) continue;
+            m.vrt(v).pos = b.startPos[i];
+            m.vrt(v).color = b.startColor[i];
+        }
+    }
+    h.rollbackReservation();
+    s.bump();
+    b = BrushSession{};
+}
+
 // -------------------------------------------------------- history / scene --
 
 Status undo(Scene& s, History& h) {

@@ -13,3 +13,5 @@ local.properties
 *.jks
 *.keystore
 keystore.properties
+# Host-side scratch build dirs (cmake -B build-*) next to build/.
+build-*/

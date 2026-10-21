@@ -31,6 +31,7 @@ struct RenderData {
     // (duplicação pedida na secção 3 do relatório de correção).
     std::vector<float> fillPos;    // 3 floats per duplicated vertex
     std::vector<float> fillNrm;    // 3 floats per duplicated vertex
+    std::vector<float> fillCol;    // 3 floats per duplicated vertex (albedo RGB, Fase 3)
     std::vector<uint32_t> fillIdx; // 3 per triangle (indices into fillPos)
     size_t fillVertexCount = 0;    // duplicated vertices in the render buffer
     size_t triangleCount = 0;

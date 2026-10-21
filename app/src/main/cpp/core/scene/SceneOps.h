@@ -8,6 +8,7 @@
 //   4. post-validate; on failure the pre-state is restored;
 //   5. push the exact-cost history entry and remap the selection.
 
+#include "../brush/Brush.h"
 #include "../history/History.h"
 #include "../mesh/Primitives.h"
 #include "../operations/Operations.h"
@@ -116,6 +117,49 @@ void cancelTool(Scene& s, History& h, ToolSession& t);
 // Validates finiteness BEFORE mutating; commits a verticesDelta history
 // entry when something moved. Reuses the TransformMath helpers — no new math.
 Status transformDirect(Scene& s, History& h, Tool tool, int axis, float amount);
+
+// ---- brush tools (Fase 3: Esculpir / Pintar) ------------------------------
+// One BRUSH SESSION per gesture — the same granularity contract as the gizmo
+// ToolSession: begin reserves the history budget ONCE, move applies the
+// brush at the new surface hit, end commits EXACTLY ONE history entry
+// (VertDelta for sculpt, ColorDelta for paint) and cancel restores the
+// captured start state. The session accumulates the union of affected
+// vertices with their start positions/colors, so a long drag remains one
+// coherent undo step (never one entry per frame).
+enum class BrushTool : int { Sculpt = 0, Paint = 1 };
+
+struct BrushSession {
+    bool active = false;
+    BrushTool tool = BrushTool::Sculpt;
+    int objIndex = -1;
+    brush::BrushSettings settings;          // live radius/strength; color/mode/opacity from begin
+    std::vector<ElemId> touched;            // sorted unique union of affected vertices
+    std::vector<Vec3> startPos;             // parallel to touched (positions at first touch)
+    std::vector<Vec3> startColor;           // parallel to touched (colors at first touch)
+    bool anyChange = false;                 // true once an application moved/painted something
+};
+
+// Begins a stroke on `objIndex` at `hitLocal` (LOCAL space, normal of the
+// hit face in `hitNormal`) and applies the first dab. Validates the settings
+// and the hit data; reserves the history upper bound for the WHOLE stroke
+// (aliveVertexCount-bound) BEFORE mutating. Returns OK, ErrInvalidArg (bad
+// tool/settings/hit) or ErrBudget.
+Status beginBrushStroke(Scene& s, History& h, BrushSession& b, BrushTool tool,
+                        int objIndex, const Vec3& hitLocal,
+                        const Vec3& hitNormal,
+                        const brush::BrushSettings& settings);
+// Continues the stroke at a new surface hit. radius/strength update the
+// session settings live (real parameters); no surface hit (finger left the
+// mesh) is a no-op that keeps the session valid. Bumps the scene version on
+// any change so the renderer resyncs.
+Status moveBrushStroke(Scene& s, BrushSession& b, const Vec3& hitLocal,
+                       const Vec3& hitNormal, float radius, float strength);
+// Ends the stroke: pushes exactly one history entry when something changed,
+// releases the reservation otherwise. The session is left inactive.
+Status endBrushStroke(Scene& s, History& h, BrushSession& b);
+// Cancels the stroke: restores every touched vertex to its start
+// position/color, releases the reservation. The session is left inactive.
+void cancelBrushStroke(Scene& s, History& h, BrushSession& b);
 
 // ---- history / scene -------------------------------------------------------
 Status undo(Scene& s, History& h);

@@ -19,14 +19,17 @@ namespace {
 const char* kFillVertexShader = R"(#version 300 es
 layout(location = 0) in vec3 aPos;
 layout(location = 1) in vec3 aNormal;
+layout(location = 2) in vec3 aColor;
 uniform mat4 uMVP;
 uniform mat4 uModel;
 out vec3 vNormal;
 out vec3 vWorldPos;
+out vec3 vColor;
 void main() {
     vec4 world = uModel * vec4(aPos, 1.0);
     vWorldPos = world.xyz;
     vNormal = mat3(uModel) * aNormal;
+    vColor = aColor;
     gl_Position = uMVP * vec4(aPos, 1.0);
 }
 )";
@@ -39,13 +42,17 @@ const char* kFillFragmentShader = R"(#version 300 es
 precision mediump float;
 in vec3 vNormal;
 in vec3 vWorldPos;
+in vec3 vColor;
 uniform vec3 uLightDir;
 uniform vec3 uEyePos;
 uniform vec3 uTint;
 uniform float uTintMix;
+// 1.0 = use the per-vertex albedo (mesh objects); 0.0 = historical base
+// color (selection overlays, whose VAOs carry no color attribute).
+uniform float uUseVertexColor;
 out vec4 fragColor;
 void main() {
-    vec3 base = vec3(0.58, 0.66, 0.78);
+    vec3 base = mix(vec3(0.58, 0.66, 0.78), clamp(vColor, 0.0, 1.0), uUseVertexColor);
     vec3 n = normalize(vNormal);
     vec3 l = normalize(uLightDir);
     float diff = max(dot(n, l), 0.0);
@@ -144,7 +151,7 @@ GLuint linkProgram(const char* vsSource, const char* fsSource) {
 }
 
 struct FillVertex {
-    float px, py, pz, nx, ny, nz;
+    float px, py, pz, nx, ny, nz, cr, cg, cb;
 };
 // LineVertex comes from core/Scene.h (pos + rgba).
 
@@ -238,6 +245,7 @@ void Renderer::init() {
         fillEyeLoc_ = glGetUniformLocation(fillProgram_, "uEyePos");
         fillTintLoc_ = glGetUniformLocation(fillProgram_, "uTint");
         fillTintMixLoc_ = glGetUniformLocation(fillProgram_, "uTintMix");
+        fillUseVColLoc_ = glGetUniformLocation(fillProgram_, "uUseVertexColor");
     }
     if (lineProgram_ != 0) {
         lineMvpLoc_ = glGetUniformLocation(lineProgram_, "uMVP");
@@ -337,13 +345,15 @@ void Renderer::buildObjectGeometry(ObjectGpu& g, const SceneObject& obj) {
     renderdata::buildObject(obj, rd);
     g.bounds = rd.bounds;
 
-    // Interleave pos+normal for the fill pass.
+    // Interleave pos+normal+color for the fill pass (Fase 3: vertex color).
     std::vector<FillVertex> verts;
     verts.reserve(rd.fillVertexCount);
     for (size_t i = 0; i < rd.fillVertexCount; ++i) {
         verts.push_back({rd.fillPos[i * 3 + 0], rd.fillPos[i * 3 + 1],
                          rd.fillPos[i * 3 + 2], rd.fillNrm[i * 3 + 0],
-                         rd.fillNrm[i * 3 + 1], rd.fillNrm[i * 3 + 2]});
+                         rd.fillNrm[i * 3 + 1], rd.fillNrm[i * 3 + 2],
+                         rd.fillCol[i * 3 + 0], rd.fillCol[i * 3 + 1],
+                         rd.fillCol[i * 3 + 2]});
     }
 
     // Fill buffers.
@@ -365,6 +375,9 @@ void Renderer::buildObjectGeometry(ObjectGpu& g, const SceneObject& obj) {
     glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, stride,
                           reinterpret_cast<void*>(3 * sizeof(float)));
     glEnableVertexAttribArray(1);
+    glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, stride,
+                          reinterpret_cast<void*>(6 * sizeof(float)));
+    glEnableVertexAttribArray(2);
     glBindVertexArray(0);
     g.indexCount = static_cast<GLsizei>(rd.fillIdx.size());
 
@@ -445,7 +458,8 @@ void Renderer::buildSelectionOverlays(ObjectGpu& g, const SceneObject& obj) {
         fv.reserve(sd.facePos.size() / 3);
         for (size_t i = 0; i + 2 < sd.facePos.size(); i += 3) {
             fv.push_back({sd.facePos[i], sd.facePos[i + 1], sd.facePos[i + 2],
-                          sd.faceNrm[i], sd.faceNrm[i + 1], sd.faceNrm[i + 2]});
+                          sd.faceNrm[i], sd.faceNrm[i + 1], sd.faceNrm[i + 2],
+                          0.0f, 0.0f, 0.0f}); // color unused (uUseVertexColor=0)
         }
         glGenVertexArrays(1, &g.selFaceVao);
         glGenBuffers(1, &g.selFaceVbo);
@@ -614,6 +628,7 @@ void Renderer::render(const OrbitCamera& camera, const Scene& scene,
         glUniform3f(fillEyeLoc_, eye_.x, eye_.y, eye_.z);
         glUniform3f(fillTintLoc_, 0.0f, 0.0f, 0.0f);
         glUniform1f(fillTintMixLoc_, 0.0f);
+        glUniform1f(fillUseVColLoc_, 1.0f); // Fase 3: mesh albedo from vertex colors
         glBindVertexArray(g.vao);
         // Z-fighting fix: the SOLID pass is pushed slightly back in depth
         // (GL_POLYGON_OFFSET_FILL, GLES3-compatible) so the wireframe and the
@@ -647,6 +662,7 @@ void Renderer::render(const OrbitCamera& camera, const Scene& scene,
                 glUniformMatrix4fv(fillMvpLoc_, 1, GL_FALSE, mvp.m);
                 glUniform3f(fillTintLoc_, 1.0f, 0.72f, 0.20f);
                 glUniform1f(fillTintMixLoc_, 0.55f);
+                glUniform1f(fillUseVColLoc_, 0.0f); // overlay: base color path
                 glBindVertexArray(g.selFaceVao);
                 glDrawElements(GL_TRIANGLES, g.selFaceIndexCount, GL_UNSIGNED_INT,
                                nullptr);
@@ -704,6 +720,13 @@ void Renderer::render(const OrbitCamera& camera, const Scene& scene,
     const bool editModeGizmo = scene.editMode && sceneops::hasValidSelection(scene);
     if (gizmoTool != GizmoTool::None && (objectModeGizmo || editModeGizmo)) {
         drawGizmo(scene, vp, gizmoTool);
+    }
+
+    // Brush overlay (Fase 3): billboard circle at the last surface hit with
+    // the REAL brush radius in world units. Depth-independent so the ring
+    // stays readable while aiming. Set by the JNI stroke functions.
+    if (brushOverlayActive_ && brushRadiusWorld_ > 0.0f) {
+        drawBrushRing();
     }
 }
 
@@ -957,11 +980,8 @@ Renderer::GizmoHit Renderer::gizmoHitAt(float xPx, float yPx, const Scene& scene
 
 // ----------------------------------------------------------------- picking --
 
-Renderer::PickHit Renderer::pickAtPixel(float xPx, float yPx, const Scene& scene,
-                                        float snapRadiusPx) const {
-    PickHit out;
-    if (width_ <= 0 || height_ <= 0) return out;
-
+bool Renderer::buildPickRay(float xPx, float yPx, Vec3& dirOut) const {
+    if (width_ <= 0 || height_ <= 0) return false;
     // SAME usable viewport rect the renderer drew with — taps map through the
     // exact projection used on screen (model centered in the visible area).
     const int usableW = usableWidth_ > 0 ? usableWidth_ : width_;
@@ -972,9 +992,17 @@ Renderer::PickHit Renderer::pickAtPixel(float xPx, float yPx, const Scene& scene
             1.0f - (2.0f * (yPx - static_cast<float>(usableTop_)) /
                     static_cast<float>(usableH));
     const float tanHalf = std::tan(cam_.fovYDeg * static_cast<float>(M_PI) / 180.0f * 0.5f);
-    const Vec3 dir = normalize(cam_.forward() +
-                               cam_.right() * (ndcX * tanHalf * aspect_) +
-                               cam_.up() * (ndcY * tanHalf));
+    dirOut = normalize(cam_.forward() +
+                       cam_.right() * (ndcX * tanHalf * aspect_) +
+                       cam_.up() * (ndcY * tanHalf));
+    return true;
+}
+
+Renderer::PickHit Renderer::pickAtPixel(float xPx, float yPx, const Scene& scene,
+                                        float snapRadiusPx) const {
+    PickHit out;
+    Vec3 dir{};
+    if (!buildPickRay(xPx, yPx, dir)) return out;
 
     // 1) Nearest face hit across all objects — SAME triangulation the
     //    renderer draws (renderdata::faceTriangles), so what you tap is what
@@ -1088,6 +1116,121 @@ Renderer::PickHit Renderer::pickAtPixel(float xPx, float yPx, const Scene& scene
     out.objectIndex = bestObj;
     out.elemId = bestFace;
     return out;
+}
+
+// ------------------------------------------------------------------- brush --
+
+bool Renderer::surfaceHitAt(float xPx, float yPx, const Scene& scene,
+                            SurfaceHit& out) const {
+    out = SurfaceHit{};
+    Vec3 dir{};
+    if (!buildPickRay(xPx, yPx, dir)) return false;
+
+    // Nearest face across all objects — the SAME triangulation the renderer
+    // draws (renderdata::faceTriangles): the brush hits exactly what is on
+    // screen. No snapping, no selection side effects.
+    // The triangle id buffer is reused across faces/objects (cleared before
+    // each call — faceTriangles() appends, it never clears): this raycast
+    // runs on EVERY touch-move event, so no allocation may depend on the
+    // face count (Fase 5: evitar alocações por frame).
+    float bestT = std::numeric_limits<float>::max();
+    int bestObj = -1;
+    ElemId bestFace = kNull;
+    std::vector<ElemId> tris;
+    for (size_t i = 0; i < scene.objects.size(); ++i) {
+        const SceneObject& obj = scene.objects[i];
+        if (obj.mesh.empty()) continue;
+        const Vec3 local = Vec3{eye_.x - obj.position.x, eye_.y - obj.position.y,
+                                eye_.z - obj.position.z};
+        for (const ElemId f : obj.mesh.aliveFaceIds()) {
+            tris.clear();
+            renderdata::faceTriangles(obj.mesh, f, tris);
+            for (size_t k = 0; k + 2 < tris.size(); k += 3) {
+                const float t = rayTriangle(local, dir,
+                                            obj.mesh.vrt(tris[k + 0]).pos,
+                                            obj.mesh.vrt(tris[k + 1]).pos,
+                                            obj.mesh.vrt(tris[k + 2]).pos);
+                if (t > 0.0f && t < bestT) {
+                    bestT = t;
+                    bestObj = static_cast<int>(i);
+                    bestFace = f;
+                }
+            }
+        }
+    }
+    if (bestObj < 0) return false;
+    if (!std::isfinite(bestT)) return false;
+
+    const SceneObject& obj = scene.objects[static_cast<size_t>(bestObj)];
+    out.hit = true;
+    out.objectIndex = bestObj;
+    out.faceId = bestFace;
+    out.world = eye_ + dir * bestT;
+    out.local = Vec3{out.world.x - obj.position.x, out.world.y - obj.position.y,
+                     out.world.z - obj.position.z};
+    return blone::ops::isFiniteVec(out.local.x, out.local.y, out.local.z);
+}
+
+void Renderer::setBrushOverlay(bool active, const Vec3& world, float radiusWorld,
+                               float r, float g, float b, float a) {
+    brushOverlayActive_ = active;
+    brushOverlayWorld_ = world;
+    brushRadiusWorld_ = std::isfinite(radiusWorld) ? std::max(0.0f, radiusWorld) : 0.0f;
+    brushRingRgba_[0] = std::isfinite(r) ? r : 1.0f;
+    brushRingRgba_[1] = std::isfinite(g) ? g : 0.72f;
+    brushRingRgba_[2] = std::isfinite(b) ? b : 0.20f;
+    brushRingRgba_[3] = std::isfinite(a) ? a : 0.9f;
+}
+
+void Renderer::drawBrushRing() {
+    if (lineProgram_ == 0) return;
+    // Billboard circle in the camera plane at the last hit point: constant
+    // apparent radius regardless of the surface orientation, so it reads as
+    // the REAL brush extent (world units, like the deformation itself).
+    Vec3 u = cam_.right();
+    Vec3 v = cam_.up();
+    if (length(u) < 0.5f || length(v) < 0.5f) return; // degenerate camera
+
+    gizmoLineScratch_.clear();
+    constexpr int kSegs = 40;
+    Vec3 prev = brushOverlayWorld_ + u * brushRadiusWorld_;
+    for (int s = 1; s <= kSegs; ++s) {
+        const float ang = static_cast<float>(M_PI) * 2.0f *
+                          static_cast<float>(s) / static_cast<float>(kSegs);
+        const Vec3 cur = brushOverlayWorld_ +
+                         (u * (brushRadiusWorld_ * std::cos(ang)) +
+                          v * (brushRadiusWorld_ * std::sin(ang)));
+        gizmoLineScratch_.push_back(
+                {prev.x, prev.y, prev.z, brushRingRgba_[0], brushRingRgba_[1],
+                 brushRingRgba_[2], brushRingRgba_[3]});
+        gizmoLineScratch_.push_back(
+                {cur.x, cur.y, cur.z, brushRingRgba_[0], brushRingRgba_[1],
+                 brushRingRgba_[2], brushRingRgba_[3]});
+        prev = cur;
+    }
+    // A center dot marks the exact application point.
+    const float cx = brushOverlayWorld_.x, cy = brushOverlayWorld_.y,
+                cz = brushOverlayWorld_.z;
+    gizmoLineScratch_.push_back(
+            {cx - 0.02f * length(u), cy, cz, brushRingRgba_[0], brushRingRgba_[1],
+             brushRingRgba_[2], brushRingRgba_[3]});
+    gizmoLineScratch_.push_back(
+            {cx + 0.02f * length(u), cy, cz, brushRingRgba_[0], brushRingRgba_[1],
+             brushRingRgba_[2], brushRingRgba_[3]});
+
+    glDisable(GL_DEPTH_TEST);
+    glUseProgram(lineProgram_);
+    const Mat4 vp = proj_ * view_;
+    glUniformMatrix4fv(lineMvpLoc_, 1, GL_FALSE, vp.m);
+    glUniform1f(lineUseOverrideLoc_, 0.0f);
+    glBindVertexArray(gizmoLineVao_);
+    glBindBuffer(GL_ARRAY_BUFFER, gizmoLineVbo_);
+    glBufferData(GL_ARRAY_BUFFER,
+                 static_cast<GLsizeiptr>(gizmoLineScratch_.size() * sizeof(LineVertex)),
+                 gizmoLineScratch_.data(), GL_DYNAMIC_DRAW);
+    glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(gizmoLineScratch_.size()));
+    glBindVertexArray(0);
+    glEnable(GL_DEPTH_TEST);
 }
 
 } // namespace blone

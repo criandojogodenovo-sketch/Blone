@@ -1,7 +1,10 @@
 package com.blone.app.ui
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -21,6 +24,8 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Slider
+import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -194,7 +199,10 @@ private fun StepButton(label: String, enabled: Boolean, onClick: () -> Unit) {
  * leaves the C++ engine when panels open/close — only insets change.
  *
  * Avançado: primitivas, lista de objetos ("Cubo 1"), nova cena, apagar objeto.
- * Esculpir/Pintar remain documented as unavailable — no dead buttons.
+ * Fase 3: Esculpir/Pintar are REAL brush modes (bottom bar, 4 segments) with
+ * a contextual brush panel (radius/intensity/mode/color — real parameters);
+ * the transform tools are disabled while a brush owns the viewport (no dead
+ * active buttons).
  */
 @Composable
 fun BloneOverlay(
@@ -375,20 +383,33 @@ private fun SideToolbar(viewModel: BloneViewModel, modifier: Modifier = Modifier
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.spacedBy(4.dp),
     ) {
-        // Transform tools — BOTH modes. "Sel." turns the gizmo off (taps
-        // select); the engine owns the gate (no ghost handles).
+        // Transform tools — BOTH selection modes. In the brush modes
+        // (Esculpir/Pintar) the gizmo is off by design, so these stay
+        // DISABLED (never active-without-effect; Fase 4 rule).
+        val brushMode = viewModel.brushModeActive
         Tool.entries.forEach { t ->
             if (t == Tool.NONE) {
-                SideToolButton("Sel.", viewModel.gizmoTool == Tool.NONE) {
+                SideToolButton("Sel.", viewModel.gizmoTool == Tool.NONE,
+                               enabled = !brushMode && !viewModel.busy) {
                     viewModel.chooseGizmoTool(Tool.NONE)
                 }
             } else {
                 SideToolButton(
                     t.label,
                     viewModel.gizmoTool == t,
-                    enabled = !viewModel.busy,
+                    enabled = !brushMode && !viewModel.busy,
                 ) { viewModel.chooseGizmoTool(t) }
             }
+        }
+        if (brushMode) {
+            // Brush mode hint (NOT a button — no dead affordances).
+            Text(
+                text = "Pincel ativo",
+                color = Accent,
+                fontSize = 9.sp,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+            )
         }
         if (viewModel.mode == ViewportMode.OBJECT) {
             // Object-mode contextual actions (DECISÃO C).
@@ -399,7 +420,7 @@ private fun SideToolbar(viewModel: BloneViewModel, modifier: Modifier = Modifier
                            container = Danger) {
                 viewModel.deleteActiveObject()
             }
-        } else {
+        } else if (viewModel.mode == ViewportMode.EDIT) {
             // Edit-mode contextual modeling operations (engine-backed).
             SideToolButton("Extrudir", false, enabled = !viewModel.busy) { viewModel.extrude() }
             SideToolButton("Subdiv.", false, enabled = !viewModel.busy) { viewModel.subdivide() }
@@ -599,7 +620,8 @@ private fun BottomBar(viewModel: BloneViewModel) {
                 .background(ChromeBg, RoundedCornerShape(14.dp))
                 .padding(6.dp)
         ) {
-            // Explicit, predictable, reversible mode toggle (DECISÃO C).
+            // Explicit, predictable, reversible mode toggle (DECISÃO C;
+            // Fase 3 adds the two REAL brush modes as segments).
             Segment(
                 "Objeto",
                 viewModel.mode == ViewportMode.OBJECT,
@@ -610,6 +632,20 @@ private fun BottomBar(viewModel: BloneViewModel) {
                 viewModel.mode == ViewportMode.EDIT,
                 modifier = Modifier.weight(1f),
             ) { viewModel.selectMode(ViewportMode.EDIT) }
+            Segment(
+                "Esculpir",
+                viewModel.mode == ViewportMode.SCULPT,
+                modifier = Modifier.weight(1f),
+            ) { viewModel.selectMode(ViewportMode.SCULPT) }
+            Segment(
+                "Pintar",
+                viewModel.mode == ViewportMode.PAINT,
+                modifier = Modifier.weight(1f),
+            ) { viewModel.selectMode(ViewportMode.PAINT) }
+        }
+        if (viewModel.brushModeActive) {
+            Spacer(modifier = Modifier.height(6.dp))
+            BrushPanel(viewModel)
         }
         if (viewModel.mode == ViewportMode.EDIT) {
             Spacer(modifier = Modifier.height(6.dp))
@@ -643,5 +679,172 @@ private fun BottomBar(viewModel: BloneViewModel) {
                     .padding(horizontal = 10.dp, vertical = 2.dp)
             )
         }
+    }
+}
+
+// Curated paint palette (Fase 3): honest, fixed swatches — the selector is
+// the row itself. 12 colors cover skin/landscape/contrast needs for now;
+// fine HSV tuning is a documented future extension.
+private val PaintPalette = listOf(
+    0xFFF44336.toInt(), // vermelho
+    0xFFFF7043.toInt(), // laranja
+    0xFFFFD54F.toInt(), // amarelo
+    0xFF66BB6A.toInt(), // verde
+    0xFF26A69A.toInt(), // teal
+    0xFF42A5F5.toInt(), // azul
+    0xFF5C6BC0.toInt(), // indigo
+    0xFFAB47BC.toInt(), // roxo
+    0xFFEC407A.toInt(), // rosa
+    0xFF8D6E63.toInt(), // castanho
+    0xFFECEFF1.toInt(), // branco
+    0xFF263238.toInt(), // quase preto
+)
+
+/** One selectable color swatch (44 dp target, ring when selected). */
+@Composable
+private fun ColorSwatch(argb: Int, selected: Boolean, onPick: () -> Unit) {
+    Box(
+        modifier = Modifier
+            .padding(horizontal = 4.dp)
+            .width(40.dp)
+            .height(40.dp)
+            .background(Color(argb), CircleShape)
+            .border(
+                width = if (selected) 3.dp else 1.dp,
+                color = if (selected) Accent else ChromeDim,
+                shape = CircleShape,
+            )
+            .clickable(onClick = onPick),
+    )
+}
+
+/** Labeled slider row for the brush panel (real engine parameters). */
+@Composable
+private fun BrushSliderRow(
+    label: String,
+    valueText: String,
+    value: Float,
+    range: ClosedFloatingPointRange<Float>,
+    enabled: Boolean,
+    onValueChange: (Float) -> Unit,
+) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Text(
+            text = label,
+            color = ChromeDim,
+            fontSize = 11.sp,
+            modifier = Modifier.width(78.dp),
+        )
+        Slider(
+            value = value,
+            onValueChange = onValueChange,
+            valueRange = range,
+            enabled = enabled,
+            colors = SliderDefaults.colors(
+                thumbColor = Accent,
+                activeTrackColor = AccentDark,
+                inactiveTrackColor = DisabledBg,
+            ),
+            modifier = Modifier
+                .weight(1f)
+                .height(34.dp),
+        )
+        Text(
+            text = valueText,
+            color = ChromeFg,
+            fontSize = 11.sp,
+            fontFamily = FontFamily.Monospace,
+            modifier = Modifier.width(52.dp),
+            textAlign = TextAlign.End,
+        )
+    }
+}
+
+/**
+ * Contextual brush panel (zone D, bottom bar) for the REAL Esculpir/Pintar
+ * modes. Every control feeds a real native parameter: radius (brush extent),
+ * intensity (displacement/blend scale), mode (raise/dig) and, for paint, the
+ * opacity and the selected color. No decorative controls.
+ */
+@Composable
+private fun BrushPanel(viewModel: BloneViewModel) {
+    val sculpt = viewModel.mode == ViewportMode.SCULPT
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(ChromeBg, RoundedCornerShape(14.dp))
+            .padding(8.dp)
+    ) {
+        BrushSliderRow(
+            label = "Raio",
+            valueText = "%.2f".format(viewModel.brushRadius),
+            value = viewModel.brushRadius,
+            range = 0.05f..3.0f,
+            enabled = true,
+            onValueChange = { viewModel.brushRadius = it },
+        )
+        BrushSliderRow(
+            label = "Intensidade",
+            valueText = "%d%%".format((viewModel.brushStrength * 100).toInt()),
+            value = viewModel.brushStrength,
+            range = 0.05f..1.0f,
+            enabled = true,
+            onValueChange = { viewModel.brushStrength = it },
+        )
+        if (sculpt) {
+            // Surface displacement mode: raise / dig (real SculptMode).
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 2.dp)
+            ) {
+                Segment(
+                    "Levantar",
+                    !viewModel.sculptDig,
+                    modifier = Modifier.weight(1f),
+                ) { viewModel.sculptDig = false }
+                Spacer(modifier = Modifier.width(6.dp))
+                Segment(
+                    "Cavar",
+                    viewModel.sculptDig,
+                    modifier = Modifier.weight(1f),
+                ) { viewModel.sculptDig = true }
+            }
+        } else {
+            BrushSliderRow(
+                label = "Opacidade",
+                valueText = "%d%%".format((viewModel.brushOpacity * 100).toInt()),
+                value = viewModel.brushOpacity,
+                range = 0.05f..1.0f,
+                enabled = true,
+                onValueChange = { viewModel.brushOpacity = it },
+            )
+            Spacer(modifier = Modifier.height(6.dp))
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState())
+            ) {
+                PaintPalette.forEach { argb ->
+                    ColorSwatch(
+                        argb = argb,
+                        selected = viewModel.brushColorArgb == argb,
+                        onPick = { viewModel.brushColorArgb = argb },
+                    )
+                }
+            }
+        }
+        Text(
+            text = if (sculpt) {
+                "Arraste sobre a malha para deformar · um gesto = um passo de desfazer"
+            } else {
+                "Arraste sobre a malha para pintar · as cores são guardadas no projeto"
+            },
+            color = ChromeDim,
+            fontSize = 10.sp,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.padding(top = 6.dp),
+        )
     }
 }

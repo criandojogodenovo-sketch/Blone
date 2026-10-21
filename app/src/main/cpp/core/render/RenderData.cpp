@@ -142,6 +142,7 @@ void buildObject(const SceneObject& obj, RenderData& out) {
     const size_t faceGuess = mesh.aliveFaceCount();
     out.fillPos.reserve(faceGuess * 4 * 3);
     out.fillNrm.reserve(faceGuess * 4 * 3);
+    out.fillCol.reserve(faceGuess * 4 * 3);
     out.fillIdx.reserve(faceGuess * 6);
     out.wirePos.reserve(mesh.aliveEdgeCount() * 2 * 3);
     out.pointPos.reserve(mesh.aliveVertexCount() * 3);
@@ -154,12 +155,16 @@ void buildObject(const SceneObject& obj, RenderData& out) {
         const uint32_t base = static_cast<uint32_t>(out.fillVertexCount);
         for (const ElemId v : loop) {
             const Vec3& p = mesh.vrt(v).pos;
+            const Vec3& c = mesh.vrt(v).color;
             out.fillPos.push_back(p.x);
             out.fillPos.push_back(p.y);
             out.fillPos.push_back(p.z);
             out.fillNrm.push_back(nrm.x);
             out.fillNrm.push_back(nrm.y);
             out.fillNrm.push_back(nrm.z);
+            out.fillCol.push_back(c.x);
+            out.fillCol.push_back(c.y);
+            out.fillCol.push_back(c.z);
             ++out.fillVertexCount;
         }
         tris.clear();
