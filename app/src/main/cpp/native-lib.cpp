@@ -10,12 +10,18 @@
 #include <jni.h>
 
 #include <cmath>
+#include <deque>
+#include <future>
 #include <mutex>
 #include <string>
 #include <vector>
 
 #include "core/Log.h"
 #include "core/history/History.h"
+#include "core/io/GltfLoader.h"
+#include "core/io/MeshBuilder.h"
+#include "core/io/ObjExporter.h"
+#include "core/io/ObjLoader.h"
 #include "core/mesh/Primitives.h"
 #include "core/operations/Operations.h"
 #include "core/operations/TransformMath.h"
@@ -35,6 +41,93 @@ blone::sceneops::ToolSession gTool;
 blone::sceneops::BrushSession gBrush; // Fase 3: um gesto = uma sessão
 blone::GizmoTool gGizmoTool = blone::GizmoTool::Move;
 std::mutex gMutex;
+
+// ============ Fase 4: I/O assíncrono (OBJ/glTF) ============================
+//
+// Threading contract (Regra 3 — a GL e a UI nunca bloqueiam em disco):
+//  - workers (std::async): parse + MeshBuilder::build — NUNCA tocam na cena
+//    viva; empurram para a fila e escrevem o estado de I/O;
+//  - drenagem: no ponto por-frame já existente (drawFrame, thread GL), sob
+//    gMutex, SEMPRE através da fachada SceneOps (1 entrada ObjAdd => undo
+//    remove o import);
+//  - exportação: snapshot profundo sob gMutex (captureRaw/restoreRaw por
+//    objeto); a worker escreve o ficheiro apenas sobre o snapshot.
+struct PendingImport {
+    std::string name;      // sanitized display name
+    std::string sourcePath; // for IMPORT_FAIL reporting at drain time
+    blone::HalfEdgeMesh mesh;
+};
+std::mutex gIoMutex;                      // guards the queue AND the futures
+std::deque<PendingImport> gPendingImports;
+std::vector<std::future<void>> gIoFutures;
+std::mutex gIoStatusMutex;                // guards the atomic status slot
+std::string gIoStatus;
+
+// Atomic status slot (protocol: "" idle | "IMPORT_OK|<nome>" |
+// "IMPORT_FAIL|<path>" | "EXPORT_OK|<cachepath>" | "EXPORT_FAIL|<path>").
+// Written by workers/drain, read+consumed by Kotlin OUTSIDE the GL thread.
+void setIoStatus(std::string s) {
+    std::lock_guard<std::mutex> lock(gIoStatusMutex);
+    gIoStatus = std::move(s);
+}
+
+std::string takeIoStatus() {
+    std::lock_guard<std::mutex> lock(gIoStatusMutex);
+    std::string s = std::move(gIoStatus);
+    gIoStatus.clear();
+    return s;
+}
+
+std::string peekIoStatus() {
+    std::lock_guard<std::mutex> lock(gIoStatusMutex);
+    return gIoStatus;
+}
+
+// std::async trap: destroying a future whose shared state never finished
+// BLOCKS the destroying thread. Futures are therefore kept in this vector
+// and pruned ONLY when finished (is_ready) — a pending worker simply stays
+// listed for the next prune. Called before every new launch.
+void pruneFinishedFutures() {
+    std::lock_guard<std::mutex> lock(gIoMutex);
+    gIoFutures.erase(std::remove_if(gIoFutures.begin(), gIoFutures.end(),
+                                    [](std::future<void>& f) {
+                                        return !f.valid() || f.is_ready();
+                                    }),
+                     gIoFutures.end());
+}
+
+// DRAIN — runs on the GL thread inside drawFrame, caller holds gMutex.
+// Imports enter the scene ONLY here: via the SceneOps facade, so every
+// import is one history entry (undo removes it), respects kMaxObjects and
+// bumps the scene for renderer resync. Queue swap happens under gIoMutex;
+// the (possibly slow) scene mutation runs under gMutex but does NO disk I/O.
+void pruneSelectionsLocked(); // defined below (shared selection hygiene)
+void drainPendingImportsLocked() {
+    std::deque<PendingImport> pending;
+    {
+        std::lock_guard<std::mutex> lock(gIoMutex);
+        pending.swap(gPendingImports);
+    }
+    while (!pending.empty()) {
+        PendingImport item = std::move(pending.front());
+        pending.pop_front();
+        const std::string name = item.name;
+        blone::SceneObject obj;
+        obj.name = std::move(item.name);
+        obj.mesh = std::move(item.mesh);
+        const blone::Status st =
+                blone::sceneops::addImportedObject(gScene, gHistory,
+                                                   std::move(obj));
+        if (st == blone::Status::OK) {
+            pruneSelectionsLocked();
+            setIoStatus("IMPORT_OK|" + name);
+        } else {
+            // kMaxObjects / budget / internal: the scene stays intact and
+            // the failure is reported against the source path.
+            setIoStatus("IMPORT_FAIL|" + item.sourcePath);
+        }
+    }
+}
 
 blone::OrbitCamera cameraFrom(jfloat azimuthDeg, jfloat elevationDeg,
                               jfloat distance, jfloat tx, jfloat ty, jfloat tz) {
@@ -285,6 +378,9 @@ Java_com_blone_app_gl_NativeLib_drawFrame(JNIEnv* /*env*/, jobject /*thiz*/,
                                           jfloat distance, jfloat tx, jfloat ty,
                                           jfloat tz, jfloat pointRadiusPx) {
     std::lock_guard<std::mutex> lock(gMutex);
+    // Fase 4: drain finished imports BEFORE rendering — the new object is
+    // visible the same frame (SceneOps facade bumps the scene version).
+    drainPendingImportsLocked();
     const blone::OrbitCamera cam =
             cameraFrom(azimuthDeg, elevationDeg, distance, tx, ty, tz);
     gRenderer.render(cam, gScene, pointRadiusPx, gGizmoTool);
@@ -505,6 +601,128 @@ Java_com_blone_app_gl_NativeLib_cancelBrushStroke(JNIEnv* /*env*/, jobject /*thi
     std::lock_guard<std::mutex> lock(gMutex);
     blone::sceneops::cancelBrushStroke(gScene, gHistory, gBrush);
     gRenderer.setBrushOverlay(false, blone::Vec3{}, 0.0f, 0, 0, 0, 0);
+}
+
+// ======================== Fase 4: I/O OBJ/glTF =============================
+//
+// Kotlin resolves SAF to real file paths BEFORE calling these. Both entry
+// points only VALIDATE arguments and enqueue a worker — they never parse,
+// build or write inline (no disk I/O on the GL/UI threads, Regra 3).
+
+// Sanitizes an import display name: printable ASCII only, no separators,
+// non-empty (JNI strings are modified-UTF-8 — do not gamble on exotic input).
+static std::string sanitizeImportName(const char* raw) {
+    std::string in = raw ? raw : "";
+    std::string out;
+    for (const char c : in) {
+        const unsigned char u = static_cast<unsigned char>(c);
+        if (u >= 0x20 && u <= 0x7E && c != '/' && c != '\\') out.push_back(c);
+    }
+    if (out.empty()) out = "Importado";
+    return out;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_blone_app_gl_NativeLib_importMesh(JNIEnv* env, jobject /*thiz*/,
+                                           jstring path, jboolean isGltf,
+                                           jstring name) {
+    const char* pathChars = env->GetStringUTFChars(path, nullptr);
+    if (!pathChars) return JNI_FALSE;
+    const std::string filePath(pathChars);
+    env->ReleaseStringUTFChars(path, pathChars);
+    const char* nameChars = env->GetStringUTFChars(name, nullptr);
+    if (!nameChars) return JNI_FALSE;
+    const std::string displayName = sanitizeImportName(nameChars);
+    env->ReleaseStringUTFChars(name, nameChars);
+
+    if (filePath.empty()) return JNI_FALSE;
+
+    pruneFinishedFutures();
+    std::lock_guard<std::mutex> lock(gIoMutex);
+    gIoFutures.push_back(std::async(std::launch::async,
+                                    [filePath, isGltf, displayName]() {
+                                        // Worker: parse + build OFF the GL/UI
+                                        // threads; the scene is NEVER touched
+                                        // here — only the queue and the
+                                        // status slot are.
+                                        std::optional<blone::io::RawMeshData>
+                                                raw = isGltf == JNI_TRUE
+                                                          ? blone::io::GltfLoader::load(
+                                                                  filePath)
+                                                          : blone::io::ObjLoader::load(
+                                                                  filePath);
+                                        std::optional<blone::HalfEdgeMesh> mesh;
+                                        if (raw) {
+                                            mesh = blone::io::MeshBuilder::build(
+                                                    *raw);
+                                        }
+                                        if (!mesh) {
+                                            setIoStatus("IMPORT_FAIL|" +
+                                                        filePath);
+                                            return;
+                                        }
+                                        {
+                                            std::lock_guard<std::mutex> q(
+                                                    gIoMutex);
+                                            gPendingImports.push_back(
+                                                    PendingImport{displayName,
+                                                                  filePath,
+                                                                  std::move(
+                                                                          *mesh)});
+                                        }
+                                        // NOTE: no IMPORT_OK here — the
+                                        // drain reports the final state once
+                                        // the object REALLY entered the scene
+                                        // (kMaxObjects/budget can still fail
+                                        // at drain time).
+                                    }));
+    return JNI_TRUE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_blone_app_gl_NativeLib_exportObj(JNIEnv* env, jobject /*thiz*/,
+                                          jstring path) {
+    const char* pathChars = env->GetStringUTFChars(path, nullptr);
+    if (!pathChars) return JNI_FALSE;
+    const std::string filePath(pathChars);
+    env->ReleaseStringUTFChars(path, pathChars);
+    if (filePath.empty()) return JNI_FALSE;
+
+    pruneFinishedFutures();
+    std::lock_guard<std::mutex> lock(gIoMutex);
+    gIoFutures.push_back(std::async(std::launch::async, [filePath]() {
+        // Deep snapshot under gMutex (captureRaw/restoreRaw per object —
+        // Raw carries vertex colors since Fase 3). The worker writes the
+        // file ONLY over the snapshot; the live scene is untouched.
+        blone::Scene snapshot;
+        {
+            std::lock_guard<std::mutex> lock(gMutex);
+            snapshot.objects.resize(gScene.objects.size());
+            for (size_t i = 0; i < gScene.objects.size(); ++i) {
+                snapshot.objects[i].name = gScene.objects[i].name;
+                snapshot.objects[i].position = gScene.objects[i].position;
+                snapshot.objects[i].mesh.restoreRaw(
+                        gScene.objects[i].mesh.captureRaw());
+            }
+        }
+        const bool ok = blone::io::ObjExporter::exportScene(snapshot, filePath);
+        setIoStatus(std::string(ok ? "EXPORT_OK|" : "EXPORT_FAIL|") + filePath);
+    }));
+    return JNI_TRUE;
+}
+
+// Atomic I/O status for Kotlin: peek (ioStatus) and read-and-clear
+// (ioStatusConsume). Both are plain JNI reads — safe from any thread.
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_blone_app_gl_NativeLib_ioStatus(JNIEnv* env, jobject /*thiz*/) {
+    const std::string s = peekIoStatus();
+    return env->NewStringUTF(s.c_str());
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_blone_app_gl_NativeLib_ioStatusConsume(JNIEnv* env, jobject /*thiz*/) {
+    const std::string s = takeIoStatus();
+    return env->NewStringUTF(s.c_str());
 }
 
 extern "C" JNIEXPORT jint JNICALL

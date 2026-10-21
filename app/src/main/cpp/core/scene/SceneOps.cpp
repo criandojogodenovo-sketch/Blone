@@ -79,6 +79,32 @@ int createPrimitive(Scene& s, History& h, PrimType type, int segsU, int segsV) {
     return index;
 }
 
+Status addImportedObject(Scene& s, History& h, SceneObject&& obj) {
+    if (s.objects.size() >= Scene::kMaxObjects) return Status::ErrLimit;
+    if (obj.mesh.empty()) return Status::ErrInvalidArg;
+
+    // History reservation BEFORE the scene changes (same contract as
+    // createPrimitive). One ObjectAdded entry: undo removes the import.
+    const uint64_t cost = obj.mesh.rawBytes() * 2 + 256;
+    if (!h.reserve(cost)) return Status::ErrBudget;
+
+    obj.position = Vec3{0.0f, 0.0f, 0.0f}; // files carry world coordinates
+    obj.sel.clear();
+    s.objects.push_back(std::move(obj));
+    const uint32_t index = static_cast<uint32_t>(s.objects.size() - 1);
+    if (!h.pushObjectAdded(index, s.objects[index])) {
+        // Push failed: restore the pre-mutation state exactly (stricter
+        // than createPrimitive — the object leaves the scene again).
+        h.rollbackReservation();
+        s.objects.pop_back();
+        return Status::ErrInternal;
+    }
+    s.active = static_cast<int>(index);
+    pruneAllSelections(s); // defensive hygiene, mirrors the JNI drain
+    s.bump();              // renderer resync on the next frame
+    return Status::OK;
+}
+
 Status deleteActiveObject(Scene& s, History& h) {
     SceneObject* obj = s.activeObject();
     if (!obj) return Status::ErrNoActiveObject;

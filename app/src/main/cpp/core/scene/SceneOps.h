@@ -62,6 +62,14 @@ struct ToolSession {
 // Returns the new object index, or a negative ops::Status code.
 int createPrimitive(Scene& s, History& h, PrimType type, int segsU, int segsV);
 Status deleteActiveObject(Scene& s, History& h);
+// Fase 4: adds an imported mesh as a new object through the SAME facade
+// contract as createPrimitive: Scene::kMaxObjects respected, history
+// reservation BEFORE mutation, exactly ONE ObjectAdded entry (undo removes
+// the import, redo restores it), selections pruned and Scene::bump() for
+// renderer resync. The object is MOVED in (mesh built by core/io away from
+// the scene — the worker never touches the live scene); its position is
+// (0,0,0) because imported files already carry world-space coordinates.
+Status addImportedObject(Scene& s, History& h, SceneObject&& obj);
 // Duplicates the ACTIVE object (whole mesh clone, selection NOT copied,
 // offset +1.5 X so the copy is visible), activates the copy and pushes an
 // ObjectAdded history entry (undo removes the copy). Returns the new index
