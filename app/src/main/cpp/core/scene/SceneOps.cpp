@@ -840,23 +840,22 @@ Status endBrushStroke(Scene& s, History& h, BrushSession& b) {
 
     // Commit path: build the exact before/after delta of the WHOLE gesture
     // from the accumulated union (touched) and push ONE history entry.
+    // `touched` is sorted-unique and iterated in order, so index i IS the
+    // parallel index into startPos/startColor.
     bool ok = true;
     bool committed = false;
     if (m != nullptr && b.anyChange) {
         std::vector<std::pair<ElemId, Vec3>> before, after;
         before.reserve(b.touched.size());
         after.reserve(b.touched.size());
-        for (const ElemId v : b.touched) {
+        for (size_t i = 0; i < b.touched.size(); ++i) {
+            const ElemId v = b.touched[i];
             if (!m->vertexAlive(v)) continue;
-            const size_t idx = [&] {
-                auto it = std::lower_bound(b.touched.begin(), b.touched.end(), v);
-                return static_cast<size_t>(it - b.touched.begin());
-            }();
             if (b.tool == BrushTool::Sculpt) {
-                before.emplace_back(v, b.startPos[idx]);
+                before.emplace_back(v, b.startPos[i]);
                 after.emplace_back(v, m->vrt(v).pos);
             } else {
-                before.emplace_back(v, b.startColor[idx]);
+                before.emplace_back(v, b.startColor[i]);
                 after.emplace_back(v, m->vrt(v).color);
             }
         }

@@ -8,12 +8,14 @@
 //  - collectAffected() selects every ALIVE vertex whose distance to the hit
 //    point (LOCAL space) is <= radius. No vertex outside the radius is ever
 //    returned; the mesh is never mutated by this function.
-//  - sculptApply() displaces ONLY the given vertices along their vertex
-//    normal (area-weighted average of the incident face normals). The
-//    displacement is applied per vertex with a smooth falloff that is 1 at
-//    the hit point and 0 at the radius edge. After the call every affected
-//    position is finite; if any non-finite value would be produced the
-//    whole application is REVERTED and false is returned (mesh intact).
+//  - sculptApply() displaces ONLY the given vertices along the NORMAL OF
+//    THE HIT FACE (the surface actually under the finger, unit-normalized
+//    inside — see the note below for why the per-vertex normal is NOT
+//    used). The displacement is applied per vertex with a smooth falloff
+//    that is 1 at the hit point and 0 at the radius edge. After the call
+//    every affected position is finite; if any non-finite value would be
+//    produced the whole application is REVERTED and false is returned
+//    (mesh intact).
 //  - paintApply() mixes the brush color into the vertex colors of the given
 //    vertices with factor = opacity * falloff. Outside vertices keep their
 //    exact color. Non-finite results are reverted the same way.

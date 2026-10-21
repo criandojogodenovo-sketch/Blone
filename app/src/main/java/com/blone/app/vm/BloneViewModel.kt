@@ -11,7 +11,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
-/** Viewport tool modes. Sculpt and Paint stay visibly unavailable. */
+/** Viewport tool modes. SCULPT and PAINT are the Fase 3 brush modes. */
 enum class ViewportMode(val label: String) {
     OBJECT("Objeto"),
     EDIT("Editar"),

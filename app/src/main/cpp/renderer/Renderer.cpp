@@ -1129,16 +1129,21 @@ bool Renderer::surfaceHitAt(float xPx, float yPx, const Scene& scene,
     // Nearest face across all objects — the SAME triangulation the renderer
     // draws (renderdata::faceTriangles): the brush hits exactly what is on
     // screen. No snapping, no selection side effects.
+    // The triangle id buffer is reused across faces/objects (cleared before
+    // each call — faceTriangles() appends, it never clears): this raycast
+    // runs on EVERY touch-move event, so no allocation may depend on the
+    // face count (Fase 5: evitar alocações por frame).
     float bestT = std::numeric_limits<float>::max();
     int bestObj = -1;
     ElemId bestFace = kNull;
+    std::vector<ElemId> tris;
     for (size_t i = 0; i < scene.objects.size(); ++i) {
         const SceneObject& obj = scene.objects[i];
         if (obj.mesh.empty()) continue;
         const Vec3 local = Vec3{eye_.x - obj.position.x, eye_.y - obj.position.y,
                                 eye_.z - obj.position.z};
         for (const ElemId f : obj.mesh.aliveFaceIds()) {
-            std::vector<ElemId> tris;
+            tris.clear();
             renderdata::faceTriangles(obj.mesh, f, tris);
             for (size_t k = 0; k + 2 < tris.size(); k += 3) {
                 const float t = rayTriangle(local, dir,
