@@ -9,6 +9,7 @@
 //    observes a half-applied operation.
 #include <jni.h>
 
+#include <chrono>
 #include <cmath>
 #include <deque>
 #include <future>
@@ -85,13 +86,17 @@ std::string peekIoStatus() {
 
 // std::async trap: destroying a future whose shared state never finished
 // BLOCKS the destroying thread. Futures are therefore kept in this vector
-// and pruned ONLY when finished (is_ready) — a pending worker simply stays
-// listed for the next prune. Called before every new launch.
+// and pruned ONLY when finished — a pending worker simply stays listed for
+// the next prune. wait_for(0) is used instead of is_ready(): libc++ (NDK)
+// does not expose is_ready on std::future (libstdc++ extension).
+// Called before every new launch.
 void pruneFinishedFutures() {
     std::lock_guard<std::mutex> lock(gIoMutex);
     gIoFutures.erase(std::remove_if(gIoFutures.begin(), gIoFutures.end(),
                                     [](std::future<void>& f) {
-                                        return !f.valid() || f.is_ready();
+                                        return !f.valid() ||
+                                               f.wait_for(std::chrono::seconds(0)) ==
+                                               std::future_status::ready;
                                     }),
                      gIoFutures.end());
 }
@@ -115,10 +120,10 @@ void drainPendingImportsLocked() {
         blone::SceneObject obj;
         obj.name = std::move(item.name);
         obj.mesh = std::move(item.mesh);
-        const blone::Status st =
+        const blone::ops::Status st =
                 blone::sceneops::addImportedObject(gScene, gHistory,
                                                    std::move(obj));
-        if (st == blone::Status::OK) {
+        if (st == blone::ops::Status::OK) {
             pruneSelectionsLocked();
             setIoStatus("IMPORT_OK|" + name);
         } else {

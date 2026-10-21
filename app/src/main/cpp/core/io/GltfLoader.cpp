@@ -149,7 +149,8 @@ std::optional<RawMeshData> GltfLoader::extractRaw(const cgltf_data* data) {
                     return true;
                 }
                 out.faceIndices.push_back(
-                        {base + a, base + b, base + c});
+                        {static_cast<int>(base + a), static_cast<int>(base + b),
+                         static_cast<int>(base + c)});
                 return true;
             };
 
