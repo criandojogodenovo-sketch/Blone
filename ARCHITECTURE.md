@@ -502,9 +502,119 @@ sistema de geometria:
 - Teste físico pendente: latência e sensação do traço em hardware real
   (os testes host cobrem a lógica, não a ergonomia tátil).
 
-## 9. Fases futuras (não implementadas aqui)
+## 9. Fase 4 — I/O 3D (OBJ + glTF/GLB, round-trip de pintura)
 
-Importação/exportação: tinygltf (glTF 2.0/GLB) com versão fixada e licença
-verificada, importador OBJ, exportação GLB/glTF, stb_image para texturas,
-xatlas para UV. Nenhuma destas dependências ou funcionalidades foi
-integrada — `core/io/` continua vazio de propósito.
+### 9.1 Arquitetura e contratos (`core/io/`)
+
+O módulo `core/io/` é a ÚNICA porta entre ficheiros e a cena viva. Quatro
+pares `.h/.cpp`:
+
+- **`MeshBuilder`** — `RawMeshData` (geometria flat agnóstica de formato:
+  `positions` + arrays paralelos opcionais `normals/colors/uvs` +
+  `faceIndices`) → `std::optional<HalfEdgeMesh>`, construído pelo pipeline
+  EXISTENTE (`addVertex → addFace → relinkBoundaryLoops → validate`).
+  Rejeita (nullopt, zero efeitos): listas vazias, limites `MeshLimits`,
+  arrays paralelos inconsistentes, posições não finitas, índices fora de
+  range, vértice duplicado num laço, faces <3 ou >256 lados, `addFace`
+  falhado (non-manifold). `colors` vazio = tudo branco; presente = aplicado
+  por vértice (com clamp [0,1], mesma política do carregador de projetos).
+  **Não é um segundo sistema de geometria** — é a ponte para o existente.
+- **`ObjLoader`** — parser linha-a-linha próprio (sem libs): `v/vn/vt/f`,
+  cantos `v`, `v/vt`, `v//vn`, `v/vt/vn`, índices 1-based E negativos
+  relativos; expansão de cantos (cada tuplo (pos,uv,normal) único = 1
+  vértice do RawMeshData, arrays paralelos mantidos); cor da extensão
+  `v x y z r g b` (branco por defeito); diretivas desconhecidas ignoradas;
+  qualquer linha malformada rejeita o ficheiro INTEIRO (nullopt).
+- **`ObjExporter`** — `exportScene(const Scene&, path) -> bool`, READ-ONLY
+  sobre um snapshot: `o <nome sanitizado>`, `v x y z r g b` em espaço do
+  mundo (aplica `obj.position`; PONTO DE EXTENSÃO MARCADO no código para
+  rotação/escala), `vn` suaves área-ponderadas (Newell não normalizado
+  acumulado por vértice, normalizado uma vez no fim) e `f v//vn` com dedup
+  de tuplos (pos,uv,normal) via `unordered_map` partilhado pela cena inteira
+  (slot de uv = 0 até existir storage por canto — o mecanismo já está
+  completo). Floats com `%.9g` (round-trip bit-exact de float32).
+- **`GltfLoader`** — cgltf v1.14 vendorizado é o ÚNICO parser (proibido
+  JSON/binário à mão); `cgltf_parse_file → cgltf_load_buffers (uri_root=
+  path) → cgltf_validate`, guard RAII com `cgltf_free` em TODOS os
+  caminhos. POSITION obrigatório; NORMAL/TEXCOORD_0/COLOR_0 opcionais
+  (COLOR vec3/vec4); primitivas TRIANGLES concatenadas com offset;
+  índices u8/u16/u32 e atributos SEMPRE via `cgltf_accessor_read_index/
+  read_float` (nunca ponteiros crus); triângulos degenerados saltados (não
+  fatais); paralelismo de cores com a regra
+  `if (colAcc || !out.colors.empty()) resize(base+count, branco)`.
+
+Vendoring: `third_party/cgltf/` — `cgltf.h` e `LICENSE` oficiais v1.14
+intactos; desde a v1.14 o cgltf é single-header, pelo que `cgltf.c` local é
+a instanciação canónica de uma única TU (`#define CGLTF_IMPLEMENTATION` +
+`#include "cgltf.h"`), documentada no README do diretório. O CMake passou a
+`project(blone LANGUAGES C CXX)`.
+
+### 9.2 Threading de I/O (Regra 3: GL e UI nunca bloqueiam em disco)
+
+```text
+UI thread (Kotlin)                    GL thread (drawFrame, por frame)
+--------------------                  -------------------------------
+SAF: URI -> cacheDir (IO dispatcher)        lock gMutex
+requestImport(cachePath,…)                    |
+  \_ NativeLib.importMesh                     |
+       \_ std::async(worker)                  |
+            parse + MeshBuilder::build        |
+            fila gPendingImports (gIoMutex)   v
+                                     drainPendingImportsLocked():
+                                       troca da fila (gIoMutex)
+                                       addImportedObject() POR OBJETO:
+                                         kMaxObjects + reserva +
+                                         1 entrada ObjAdd + prune + bump
+exportObj(cachePath)                                 
+  \_ NativeLib.exportObj                             
+       \_ std::async(worker)                         
+            snapshot profundo sob gMutex             
+            (captureRaw/restoreRaw por objeto)       
+            ObjExporter::exportScene(snapshot)       
+            gIoStatus = EXPORT_OK|FAIL               
+```
+
+- **Estado atómico para o Kotlin**: `gIoStatus` (mutex próprio) com o
+  protocolo `"" idle | "IMPORT_OK|<nome>" | "IMPORT_FAIL|<path>" |
+  "EXPORT_OK|<cachepath>" | "EXPORT_FAIL|<path>"`; escrito por
+  workers/drenagem, lido/consumido (`ioStatus`/`ioStatusConsume`) pelo
+  Kotlin FORA da thread GL — o ViewModel faz polling de 400 ms APENAS
+  enquanto há operação pendente.
+- **Armadilha dos futures**: destruir um `std::future` de `std::async`
+  sem o terminado BLOQUEIA a thread que o destrói; os futures ficam num
+  vector global e são PODADOS só quando terminados (`is_ready()`), antes
+  de cada novo lançamento.
+- A malha NUNCA cruza a ponte JNI: o Kotlin envia caminhos e nomes; o
+  worker devolve só o estado textual.
+
+### 9.3 Representação e histórico
+
+- O import entra na cena EXCLUSIVamente pela fachada
+  `SceneOps::addImportedObject` (mesmo contrato de `createPrimitive`):
+  `kMaxObjects`, reserva de orçamento ANTES da mutação, UMA entrada
+  ObjectAdded (undo remove o import; redo repõe), prune de seleção e
+  `Scene::bump()` para o resync do renderer.
+- O snapshot de exportação usa `captureRaw/restoreRaw` — o `Raw` guarda
+  `Vertex` completos (posição + COR, herdado da Fase 3), pelo que a
+  pintura sobrevive ao ciclo exportar → importar (testado bit-exact).
+
+### 9.4 Limitações conhecidas (Fase 4)
+
+- **OBJ é mono-malha**: o export funde posições coincidentes entre
+  objetos num só par v/vn e o import reconstrói UMA malha — objetos
+  sobrepostos podem fundir-se no round-trip.
+- **Sem UV por canto** (faces saem `f v//vn`); TEXCOORD_0 de glTF é lido
+  mas ainda não armazenado — mecanismo de tuplos já preparado (Fase 5).
+- **Export glTF** adiado; **materiais PBR/texturas** = Fase 5.
+- Accessors **sparse** do glTF falham limpo (`cgltf_accessor_read_float`
+  devolve 0 → nullopt) — raros, rejeitados em vez de adivinhados.
+- Normais/uvs de cantos sem `vn`/`vt` ficam com placeholder (0,0,0)/(0,0)
+  quando o ficheiro mistura cantos com e sem atributo — documentado no
+  header; o motor recalcula normais de qualquer forma.
+
+## 10. Fases futuras (não implementadas aqui)
+
+Exportação GLB/glTF, storage de UV por canto, stb_image para texturas,
+xatlas para UV, materiais PBR. Nenhuma destas dependências ou
+funcionalidades foi integrada além do parsing (cgltf vendorizado, usado
+só para importação de geometria).
