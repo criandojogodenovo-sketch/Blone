@@ -240,6 +240,8 @@ void Renderer::init() {
     if (gizmoPtVbo_ != 0) glDeleteBuffers(1, &gizmoPtVbo_);
     for (ObjectGpu& g : gpu_) destroyObjectGpu(g);
     gpu_.clear();
+    for (ObjectGpu& g : gpuPool_) destroyObjectGpu(g); // P7 pool teardown
+    gpuPool_.clear();
     sceneVersion_ = 0;
 
     fillProgram_ = linkProgram(kFillVertexShader, kFillFragmentShader);
@@ -346,8 +348,40 @@ void Renderer::destroyObjectGpu(ObjectGpu& g) {
     g = ObjectGpu{};
 }
 
+// F4-LIMITS (P7): the retired entry keeps its live GL names; the next
+// build* reuses them via glBufferData (no allocation churn on resync).
+void Renderer::retireObjectGpu(ObjectGpu& g) {
+    const bool empty = g.vao == 0 && g.wireVao == 0 && g.ptVao == 0 &&
+                       g.boxVao == 0 && g.selFaceVao == 0;
+    if (empty) {
+        g = ObjectGpu{};
+        return;
+    }
+    if (gpuPool_.size() < kGpuPoolMax) {
+        gpuPool_.push_back(g);
+        g = ObjectGpu{};
+    } else {
+        destroyObjectGpu(g); // pool full: real teardown (zeroes g)
+    }
+}
+
+void Renderer::acquireObjectGpu(ObjectGpu& g) {
+    if (!gpuPool_.empty()) {
+        g = gpuPool_.back();
+        gpuPool_.pop_back();
+    }
+}
+
 void Renderer::buildObjectGeometry(ObjectGpu& g, const SceneObject& obj) {
-    destroyObjectGpu(g);
+    retireObjectGpu(g);
+    acquireObjectGpu(g);
+    // P7: acquired entries carry live names — generate only what is missing.
+    auto genVAO = [](GLuint& id) {
+        if (id == 0) glGenVertexArrays(1, &id);
+    };
+    auto genBuf = [](GLuint& id) {
+        if (id == 0) glGenBuffers(1, &id);
+    };
 
     // Single geometric source (render == edit mesh == picking).
     renderdata::RenderData rd;
@@ -368,9 +402,9 @@ void Renderer::buildObjectGeometry(ObjectGpu& g, const SceneObject& obj) {
     // Fill buffers. Index type per object (P2): 16-bit IBO when the
     // duplicated fill vertex count allows it, uint32 otherwise (verified —
     // a mismatched downcast falls back to uint32, never a truncated IBO).
-    glGenVertexArrays(1, &g.vao);
-    glGenBuffers(1, &g.vbo);
-    glGenBuffers(1, &g.ebo);
+    genVAO(g.vao);
+    genBuf(g.vbo);
+    genBuf(g.ebo);
     glBindVertexArray(g.vao);
     glBindBuffer(GL_ARRAY_BUFFER, g.vbo);
     glBufferData(GL_ARRAY_BUFFER,
@@ -416,8 +450,8 @@ void Renderer::buildObjectGeometry(ObjectGpu& g, const SceneObject& obj) {
         wire.push_back({rd.wirePos[i], rd.wirePos[i + 1], rd.wirePos[i + 2],
                         0.08f, 0.09f, 0.11f, 0.9f});
     }
-    glGenVertexArrays(1, &g.wireVao);
-    glGenBuffers(1, &g.wireVbo);
+    genVAO(g.wireVao);
+    genBuf(g.wireVbo);
     glBindVertexArray(g.wireVao);
     glBindBuffer(GL_ARRAY_BUFFER, g.wireVbo);
     glBufferData(GL_ARRAY_BUFFER,
@@ -433,8 +467,8 @@ void Renderer::buildObjectGeometry(ObjectGpu& g, const SceneObject& obj) {
     g.wireCount = static_cast<GLsizei>(wire.size());
 
     // Vertex points (true editable vertices).
-    glGenVertexArrays(1, &g.ptVao);
-    glGenBuffers(1, &g.ptVbo);
+    genVAO(g.ptVao);
+    genBuf(g.ptVbo);
     glBindVertexArray(g.ptVao);
     glBindBuffer(GL_ARRAY_BUFFER, g.ptVbo);
     glBufferData(GL_ARRAY_BUFFER,
@@ -448,8 +482,8 @@ void Renderer::buildObjectGeometry(ObjectGpu& g, const SceneObject& obj) {
 
     // Object-mode outline, cached in local space.
     std::vector<LineVertex> box = boxEdgesLines(rd.bounds);
-    glGenVertexArrays(1, &g.boxVao);
-    glGenBuffers(1, &g.boxVbo);
+    genVAO(g.boxVao);
+    genBuf(g.boxVbo);
     glBindVertexArray(g.boxVao);
     glBindBuffer(GL_ARRAY_BUFFER, g.boxVbo);
     glBufferData(GL_ARRAY_BUFFER,
@@ -561,7 +595,32 @@ void Renderer::buildReadGeometry(ObjectGpu& g, const SceneObject& obj) {
     if (g.readUploaded == static_cast<const void*>(rm) && g.indexCount > 0) {
         return;
     }
-    destroyObjectGpu(g);
+    retireObjectGpu(g);
+    acquireObjectGpu(g);
+    auto genVAO = [](GLuint& id) {
+        if (id == 0) glGenVertexArrays(1, &id);
+    };
+    auto genBuf = [](GLuint& id) {
+        if (id == 0) glGenBuffers(1, &id);
+    };
+    // Read objects carry NO overlays: pooled overlay buffers are RELEASED
+    // (GPU memory stays proportional to what is actually drawn).
+    glDeleteVertexArrays(1, &g.wireVao);
+    glDeleteBuffers(1, &g.wireVbo);
+    glDeleteVertexArrays(1, &g.ptVao);
+    glDeleteBuffers(1, &g.ptVbo);
+    glDeleteVertexArrays(1, &g.selFaceVao);
+    glDeleteBuffers(1, &g.selFaceVbo);
+    glDeleteBuffers(1, &g.selFaceEbo);
+    glDeleteVertexArrays(1, &g.selEdgeVao);
+    glDeleteBuffers(1, &g.selEdgeVbo);
+    glDeleteVertexArrays(1, &g.selPtVao);
+    glDeleteBuffers(1, &g.selPtVbo);
+    g.wireVao = g.wireVbo = g.ptVao = g.ptVbo = 0;
+    g.selFaceVao = g.selFaceVbo = g.selFaceEbo = 0;
+    g.selEdgeVao = g.selEdgeVbo = g.selPtVao = g.selPtVbo = 0;
+    g.wireCount = g.ptCount = g.selFaceIndexCount = g.selEdgeCount =
+            g.selPtCount = 0;
 
     // Same FillVertex layout as editable objects (shared upload path, P7
     // pool compatible); the normal attribute is unused in read mode (the
@@ -576,9 +635,9 @@ void Renderer::buildReadGeometry(ObjectGpu& g, const SceneObject& obj) {
         verts.push_back({p.x, p.y, p.z, 0.0f, 0.0f, 0.0f, c.x, c.y, c.z});
     }
 
-    glGenVertexArrays(1, &g.vao);
-    glGenBuffers(1, &g.vbo);
-    glGenBuffers(1, &g.ebo);
+    genVAO(g.vao);
+    genBuf(g.vbo);
+    genBuf(g.ebo);
     glBindVertexArray(g.vao);
     glBindBuffer(GL_ARRAY_BUFFER, g.vbo);
     glBufferData(GL_ARRAY_BUFFER,
@@ -620,8 +679,8 @@ void Renderer::buildReadGeometry(ObjectGpu& g, const SceneObject& obj) {
     // Object-mode outline from the read bounds (same cached-local-space
     // scheme as editable objects).
     std::vector<LineVertex> box = boxEdgesLines(rm->bounds);
-    glGenVertexArrays(1, &g.boxVao);
-    glGenBuffers(1, &g.boxVbo);
+    genVAO(g.boxVao);
+    genBuf(g.boxVbo);
     glBindVertexArray(g.boxVao);
     glBindBuffer(GL_ARRAY_BUFFER, g.boxVbo);
     glBufferData(GL_ARRAY_BUFFER,
@@ -640,6 +699,13 @@ void Renderer::buildReadGeometry(ObjectGpu& g, const SceneObject& obj) {
 void Renderer::syncObjects(const Scene& scene) {
     if (scene.version == sceneVersion_ && gpu_.size() == scene.objects.size()) {
         return;
+    }
+    // P7: shrinking the object list must RETIRE the dropped entries first —
+    // a plain resize would leak their GL names (pre-existing behaviour).
+    if (gpu_.size() > scene.objects.size()) {
+        for (size_t i = scene.objects.size(); i < gpu_.size(); ++i) {
+            retireObjectGpu(gpu_[i]);
+        }
     }
     gpu_.resize(scene.objects.size());
     for (size_t i = 0; i < scene.objects.size(); ++i) {
@@ -745,6 +811,17 @@ void Renderer::render(const OrbitCamera& camera, const Scene& scene,
         const ObjectGpu& g = gpu_[i];
         const Mat4 model = Mat4::translate(obj.position.x, obj.position.y, obj.position.z);
         const Mat4 mvp = vp * model;
+
+        // F4-LIMITS (P7): frustum culling per object AABB — world bounds =
+        // local bounds translated by obj.position (SceneObject has no
+        // rotation/scale). Objects fully outside the frustum skip ALL their
+        // passes (fill, overlays, outline). The gizmo is independent (it
+        // follows the pivot, not the drawn geometry).
+        const Aabb worldBounds{
+                g.bounds.minX + obj.position.x, g.bounds.minY + obj.position.y,
+                g.bounds.minZ + obj.position.z, g.bounds.maxX + obj.position.x,
+                g.bounds.maxY + obj.position.y, g.bounds.maxZ + obj.position.z};
+        if (!aabbInFrustum(worldBounds, vp)) continue;
 
         glUseProgram(fillProgram_);
         glUniformMatrix4fv(fillMvpLoc_, 1, GL_FALSE, mvp.m);

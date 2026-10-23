@@ -146,6 +146,12 @@ private:
     void buildSceneLines();
     void syncObjects(const Scene& scene);
     void destroyObjectGpu(ObjectGpu& g);
+    // F4-LIMITS (P7) buffer pool: retired ObjectGpu entries keep their live
+    // GL names for reuse (glBufferData refills them) — the per-edit full
+    // resync no longer churns GL allocations. Capped; overflow is destroyed.
+    static constexpr size_t kGpuPoolMax = 8;
+    void retireObjectGpu(ObjectGpu& g);
+    void acquireObjectGpu(ObjectGpu& g);
     void buildObjectGeometry(ObjectGpu& g, const SceneObject& obj);
     void buildSelectionOverlays(ObjectGpu& g, const SceneObject& obj);
     // READ-MODE upload (F4-LIMITS P3): indexed unique-vertex buffers from
@@ -178,6 +184,7 @@ private:
     GLsizei sceneVertexCount_ = 0;
 
     std::vector<ObjectGpu> gpu_;
+    std::vector<ObjectGpu> gpuPool_; // retired entries with live GL names (P7)
     uint32_t sceneVersion_ = 0;
 
     // Gizmo GPU resources + reused scratch (no per-frame allocation).

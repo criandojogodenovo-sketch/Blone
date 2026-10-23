@@ -345,7 +345,50 @@ void testRingRotationSign() {
     CHECK(after.x > before.x - 1e-4f); // still on the right side
 }
 
-// ------------------------------------------------ F4-LIMITS P2 ------------
+// ------------------------------------------------ F4-LIMITS P7 ------------
+void testFrustumCullingAabb() {
+    // Camera at distance 8 on +Z looking at the origin (orbit convention:
+    // forward = -Z), 60 deg vertical FOV, near 0.1 / far 200.
+    OrbitCamera cam;
+    cam.azimuthDeg = 0.0f;
+    cam.elevationDeg = 0.0f;
+    cam.distance = 8.0f;
+    cam.target = Vec3{0, 0, 0};
+    const Mat4 vp = Mat4::perspective(60.0f, 1.0f, 0.1f, 200.0f) *
+                    cam.viewMatrix();
+
+    // Unit box at the look-at point: inside the frustum.
+    Aabb center;
+    center.minX = -1; center.minY = -1; center.minZ = -1;
+    center.maxX =  1; center.maxY =  1; center.maxZ =  1;
+    CHECK(aabbInFrustum(center, vp));
+
+    // Box straddling a frustum plane: still visible (conservative test).
+    Aabb straddle;
+    straddle.minX = -1; straddle.minY = -1; straddle.minZ = -1;
+    straddle.maxX =  1; straddle.maxY =  1; straddle.maxZ = 20;
+    CHECK(aabbInFrustum(straddle, vp));
+
+    // Box BEHIND the camera (camera sits at z = +8; box spans z 9..12):
+    // every corner fails the near plane -> culled.
+    Aabb behind;
+    behind.minX = -1; behind.minY = -1; behind.minZ = 9;
+    behind.maxX =  1; behind.maxY =  1; behind.maxZ = 12;
+    CHECK(!aabbInFrustum(behind, vp));
+
+    // Box far outside the horizontal FOV (x ~ +200): culled.
+    Aabb side;
+    side.minX = 199; side.minY = -1; side.minZ = -1;
+    side.maxX = 201; side.maxY =  1; side.maxZ =  1;
+    CHECK(!aabbInFrustum(side, vp));
+
+    // Box beyond the far plane (z = -300): culled.
+    Aabb farBox;
+    farBox.minX = -1; farBox.minY = -1; farBox.minZ = -310;
+    farBox.maxX =  1; farBox.maxY =  1; farBox.maxZ = -300;
+    CHECK(!aabbInFrustum(farBox, vp));
+}
+
 void testIndexTypeChoicePerObject() {
     using renderdata::buildObject;
     using renderdata::fitsUint16Index;
@@ -451,5 +494,6 @@ void runRenderGizmoTests() {
     testGizmoTransformsWithHistory();
     testRingRotationSign();
     testIndexTypeChoicePerObject(); // F4-LIMITS P2
+    testFrustumCullingAabb();       // F4-LIMITS P7
 }
 } // namespace blone::test
