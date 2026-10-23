@@ -56,9 +56,14 @@ bool samePos(const Vec3& a, const Vec3& b) {
 } // namespace
 
 std::optional<RawMeshData> GltfLoader::load(const std::string& path,
-                                            std::string* err) {
+                                            std::string* err,
+                                            IoProgress* progress) {
     if (path.empty()) {
         if (err) *err = "caminho vazio";
+        return std::nullopt;
+    }
+    if (progress && progress->cancelled()) {
+        if (err) *err = "importação cancelada";
         return std::nullopt;
     }
 
@@ -70,6 +75,37 @@ std::optional<RawMeshData> GltfLoader::load(const std::string& path,
         return std::nullopt;
     }
     CgltfGuard guard(data);
+
+    // ---- P4 PRE-COUNT from the JSON (anti-crash): the accessor counts are
+    // already known after the parse — a document above the hard ceiling is
+    // rejected BEFORE cgltf_load_buffers reads/copies any buffer.
+    if (progress) {
+        size_t totalVerts = 0;
+        size_t totalTris = 0;
+        for (size_t mi = 0; mi < data->meshes_count; ++mi) {
+            const cgltf_mesh& mesh = data->meshes[mi];
+            for (size_t pi = 0; pi < mesh.primitives_count; ++pi) {
+                const cgltf_primitive& prim = mesh.primitives[pi];
+                if (prim.type != cgltf_primitive_type_triangles) continue;
+                const cgltf_accessor* pos = findAttr(prim, "POSITION");
+                if (pos) totalVerts += pos->count;
+                if (prim.indices) totalTris += prim.indices->count / 3;
+                else if (pos) totalTris += pos->count / 3;
+            }
+        }
+        if (totalVerts > MeshLimits::maxVertices ||
+            totalTris > MeshLimits::maxFaces) {
+            if (err) {
+                *err = "excede o teto do motor (" +
+                       formatCount(MeshLimits::maxVertices) + " v / " +
+                       formatCount(MeshLimits::maxFaces) + " f); documento tem " +
+                       formatCount(totalVerts) + " v e " +
+                       formatCount(totalTris) + " triângulos";
+            }
+            return std::nullopt;
+        }
+        progress->set(300); // JSON parsed + counted (buffers not yet loaded)
+    }
 
     // uri_root = the document path: external .bin buffers of a .gltf file
     // resolve next to it. GLB buffers are embedded and need no root.
@@ -87,21 +123,35 @@ std::optional<RawMeshData> GltfLoader::load(const std::string& path,
         }
         return std::nullopt;
     }
-    return extractRaw(data, err);
+    if (progress) progress->set(400);
+    return extractRaw(data, err, progress);
 }
 
 std::optional<RawMeshData> GltfLoader::extractRaw(const cgltf_data* data,
-                                                  std::string* err) {
+                                                  std::string* err,
+                                                  IoProgress* progress) {
     if (!data) {
         if (err) *err = "documento glTF nulo";
         return std::nullopt;
     }
     RawMeshData out;
+    size_t done = 0; // primitives processed (progress baseline)
 
     for (size_t mi = 0; mi < data->meshes_count; ++mi) {
         const cgltf_mesh& mesh = data->meshes[mi];
         for (size_t pi = 0; pi < mesh.primitives_count; ++pi) {
             const cgltf_primitive& prim = mesh.primitives[pi];
+            // P4: periodic cancel/progress checks during extraction.
+            if (progress) {
+                if (++done % 8 == 0) {
+                    if (progress->cancelled()) {
+                        if (err) *err = "importação cancelada";
+                        return std::nullopt;
+                    }
+                    const int p = 400 + static_cast<int>(done % 1000) / 4;
+                    progress->set(p < 900 ? p : 900);
+                }
+            }
             if (prim.type != cgltf_primitive_type_triangles) continue;
 
             const cgltf_accessor* posAcc = findAttr(prim, "POSITION");

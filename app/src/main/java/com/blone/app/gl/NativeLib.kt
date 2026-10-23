@@ -262,6 +262,18 @@ object NativeLib {
     /** Reads and CLEARS the atomic I/O status (single consumer). */
     external fun ioStatusConsume(): String
 
+    /**
+     * F4-LIMITS (P4): import progress 0..1000 (map to % by /10). Polled by
+     * the ViewModel together with the status slot; 0 before the first stage.
+     */
+    external fun importProgress(): Int
+
+    /**
+     * F4-LIMITS (P4): raises the cancel flag — the loaders unwind cleanly
+     * (all-or-nothing: nothing reaches the scene) and report "cancelada".
+     */
+    external fun cancelImport()
+
     // History.
     external fun canUndo(): Boolean
     external fun canRedo(): Boolean

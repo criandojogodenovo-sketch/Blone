@@ -20,7 +20,8 @@ float clamp01(float v) {
 } // namespace
 
 std::optional<HalfEdgeMesh> MeshBuilder::build(const RawMeshData& data,
-                                               std::string* err) {
+                                               std::string* err,
+                                               IoProgress* progress) {
     // 1) Empty input is always a rejection (nothing to build).
     if (data.positions.empty() || data.faceIndices.empty()) {
         if (err) *err = "sem vértices ou sem faces";
@@ -114,7 +115,21 @@ std::optional<HalfEdgeMesh> MeshBuilder::build(const RawMeshData& data,
     std::vector<ElemId> ids;
     ids.reserve(data.positions.size());
     const bool hasColors = !data.colors.empty();
+    size_t built = 0;
     for (size_t i = 0; i < data.positions.size(); ++i) {
+        // P4: periodic cancel/progress during the vertex pass (owns 800..950).
+        if (progress) {
+            if (++built % kProgressCheckInterval == 0) {
+                if (progress->cancelled()) {
+                    if (err) *err = "importação cancelada";
+                    return std::nullopt;
+                }
+                const int p = 800 + static_cast<int>(
+                                          built * 150 /
+                                          (data.positions.size() + 1));
+                progress->set(p < 950 ? p : 950);
+            }
+        }
         const ElemId id = mesh.addVertex(data.positions[i]);
         if (id == kNull) {
             if (err) *err = "limite de vértices atingido durante a construção";
@@ -129,7 +144,20 @@ std::optional<HalfEdgeMesh> MeshBuilder::build(const RawMeshData& data,
                                  : Vec3{1.0f, 1.0f, 1.0f};
         ids.push_back(id);
     }
+    size_t faced = 0;
     for (const std::vector<int>& loop : data.faceIndices) {
+        // P4: cancel check in the face pass (owns 950..1000).
+        if (progress) {
+            if (++faced % kCancelCheckInterval == 0) {
+                if (progress->cancelled()) {
+                    if (err) *err = "importação cancelada";
+                    return std::nullopt;
+                }
+                progress->set(950 + static_cast<int>(
+                                        faced * 50 /
+                                        (data.faceIndices.size() + 1)));
+            }
+        }
         std::vector<ElemId> face;
         face.reserve(loop.size());
         for (const int idx : loop) face.push_back(ids[static_cast<size_t>(idx)]);
@@ -138,6 +166,7 @@ std::optional<HalfEdgeMesh> MeshBuilder::build(const RawMeshData& data,
             return std::nullopt;
         }
     }
+    if (progress) progress->set(1000);
 
     // 7) Same finishing contract as every other construction site.
     mesh.relinkBoundaryLoops();

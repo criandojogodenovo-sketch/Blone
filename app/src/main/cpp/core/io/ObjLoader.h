@@ -36,6 +36,8 @@
 #include <optional>
 #include <string>
 
+#include "IoProgress.h"
+
 namespace blone::io {
 
 class ObjLoader {
@@ -45,14 +47,22 @@ public:
     // failure (hotfix D1: the reason reaches the user's toast and logcat
     // BloneIO); it is untouched when the call succeeds. The default nullptr
     // keeps the previous signature and every existing caller working.
+    // `progress` (F4-LIMITS P4, optional): an anti-crash pass ORDER matters
+    // here — load() first runs a cheap COUNTING pass (line directives, no
+    // tokenization) and rejects files above the hard ceiling BEFORE any
+    // big allocation; only then the parse pass runs, publishing progress
+    // 0..600 and honouring the cancel flag every 4096 lines.
     static std::optional<RawMeshData> load(const std::string& path,
-                                           std::string* err = nullptr);
+                                           std::string* err = nullptr,
+                                           IoProgress* progress = nullptr);
 
     // Parses from an already-open stream (load() calls this; tests use it
     // for hand-written OBJ without touching the filesystem). Same `err`
-    // contract as load(); reasons carry the 1-based line number.
+    // contract as load(); reasons carry the 1-based line number. Progress
+    // 0..600 + cancel checks (P4); nullptr keeps the old behaviour.
     static std::optional<RawMeshData> parseFile(std::istream& in,
-                                                std::string* err = nullptr);
+                                                std::string* err = nullptr,
+                                                IoProgress* progress = nullptr);
 };
 
 } // namespace blone::io

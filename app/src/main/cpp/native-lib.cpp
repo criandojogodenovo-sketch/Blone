@@ -85,6 +85,12 @@ std::vector<std::future<void>> gIoFutures;
 std::mutex gIoStatusMutex;                // guards the atomic status slot
 std::string gIoStatus;
 
+// P4 anti-crash: ONE shared progress/cancel slot. The Kotlin layer runs at
+// most one I/O job at a time (ioBusy guard), so a single slot is enough:
+// the worker resets it at start and publishes 0..1000; cancelImport()
+// raises the flag and the loaders unwind cleanly.
+blone::io::IoProgress gIoProgress;
+
 // Atomic status slot (protocol: "" idle | "IMPORT_OK|<nome>" |
 // "IMPORT_FAIL|<path>" | "EXPORT_OK|<cachepath>" | "EXPORT_FAIL|<path>").
 // Written by workers/drain, read+consumed by Kotlin OUTSIDE the GL thread.
@@ -792,8 +798,7 @@ Java_com_blone_app_gl_NativeLib_importMesh(JNIEnv* env, jobject /*thiz*/,
 
     pruneFinishedFutures();
     std::lock_guard<std::mutex> lock(gIoMutex);
-    gIoFutures.push_back(std::async(std::launch::async,
-                                    [filePath, isGltf, displayName]() {
+    auto importWorker = [filePath, isGltf, displayName]() {
                                         // Worker: parse + build OFF the GL/UI
                                         // threads; the scene is NEVER touched
                                         // here — only the queue and the
@@ -827,6 +832,7 @@ Java_com_blone_app_gl_NativeLib_importMesh(JNIEnv* env, jobject /*thiz*/,
                                                   filePath.c_str(), bytes,
                                                   isGltf ? "glTF/GLB"
                                                          : "OBJ");
+                                        gIoProgress.reset();
 
                                         // Stage (c): parser with the PT error
                                         // code (reason flows to the toast).
@@ -834,9 +840,11 @@ Java_com_blone_app_gl_NativeLib_importMesh(JNIEnv* env, jobject /*thiz*/,
                                         std::optional<blone::io::RawMeshData>
                                                 raw = isGltf == JNI_TRUE
                                                           ? blone::io::GltfLoader::load(
-                                                                  filePath, &err)
+                                                                  filePath, &err,
+                                                                  &gIoProgress)
                                                           : blone::io::ObjLoader::load(
-                                                                  filePath, &err);
+                                                                  filePath, &err,
+                                                                  &gIoProgress);
                                         if (!raw) {
                                             if (err.empty()) {
                                                 err = "formato não reconhecido";
@@ -992,7 +1000,7 @@ Java_com_blone_app_gl_NativeLib_importMesh(JNIEnv* env, jobject /*thiz*/,
                                         // Stage (d): MeshBuilder (all-or-nothing).
                                         std::optional<blone::HalfEdgeMesh>
                                                 mesh = blone::io::MeshBuilder::build(
-                                                        *raw, &err);
+                                                        *raw, &err, &gIoProgress);
                                         if (!mesh) {
                                             if (err.empty()) {
                                                 err = "geometria inválida";
@@ -1038,6 +1046,41 @@ Java_com_blone_app_gl_NativeLib_importMesh(JNIEnv* env, jobject /*thiz*/,
                                         // the object REALLY entered the scene
                                         // (kMaxObjects/budget can still fail
                                         // at drain time).
+    };
+    // P4 anti-crash: the worker boundary catches allocation failures — a
+    // hopeless file reports IMPORT_FAIL with a PT reason instead of
+    // crashing the process (mission: "catch std::bad_alloc -> motivo PT").
+    gIoFutures.push_back(std::async(std::launch::async,
+                                    [importWorker, filePath]() {
+                                        try {
+                                            importWorker();
+                                        } catch (const std::bad_alloc&) {
+                                            BLONE_IOE("import '%s': memória "
+                                                      "insuficiente "
+                                                      "(bad_alloc)",
+                                                      filePath.c_str());
+                                            setIoStatus(importFailStatus(
+                                                    filePath,
+                                                    "memória insuficiente: o "
+                                                    "ficheiro é demasiado "
+                                                    "grande para este "
+                                                    "dispositivo",
+                                                    -1, -1,
+                                                    blone::io::
+                                                            currentProfile()));
+                                        } catch (const std::exception& e) {
+                                            BLONE_IOE("import '%s': erro "
+                                                      "inesperado: %s",
+                                                      filePath.c_str(),
+                                                      e.what());
+                                            setIoStatus(importFailStatus(
+                                                    filePath,
+                                                    "erro inesperado durante a "
+                                                    "leitura",
+                                                    -1, -1,
+                                                    blone::io::
+                                                            currentProfile()));
+                                        }
                                     }));
     return JNI_TRUE;
 }
@@ -1053,7 +1096,7 @@ Java_com_blone_app_gl_NativeLib_exportObj(JNIEnv* env, jobject /*thiz*/,
 
     pruneFinishedFutures();
     std::lock_guard<std::mutex> lock(gIoMutex);
-    gIoFutures.push_back(std::async(std::launch::async, [filePath]() {
+    auto exportWorker = [filePath]() {
         // Deep snapshot under gMutex (captureRaw/restoreRaw per object —
         // Raw carries vertex colors since Fase 3). The worker writes the
         // file ONLY over the snapshot; the live scene is untouched.
@@ -1076,6 +1119,21 @@ Java_com_blone_app_gl_NativeLib_exportObj(JNIEnv* env, jobject /*thiz*/,
         }
         setIoStatus(std::string(ok ? "EXPORT_OK|" : "EXPORT_FAIL|") + filePath +
                     (ok ? "" : "|não foi possível escrever o ficheiro OBJ"));
+    };
+    gIoFutures.push_back(std::async(std::launch::async, [exportWorker, filePath]() {
+        try {
+            exportWorker();
+        } catch (const std::bad_alloc&) {
+            BLONE_IOE("export '%s': memória insuficiente (bad_alloc)",
+                      filePath.c_str());
+            setIoStatus("EXPORT_FAIL|" + filePath +
+                        "|memória insuficiente para exportar esta cena");
+        } catch (const std::exception& e) {
+            BLONE_IOE("export '%s': erro inesperado: %s", filePath.c_str(),
+                      e.what());
+            setIoStatus("EXPORT_FAIL|" + filePath +
+                        "|erro inesperado durante a exportação");
+        }
     }));
     return JNI_TRUE;
 }
@@ -1103,8 +1161,7 @@ Java_com_blone_app_gl_NativeLib_promoteActiveObject(JNIEnv* /*env*/,
 
     pruneFinishedFutures();
     std::lock_guard<std::mutex> lock(gIoMutex);
-    gIoFutures.push_back(std::async(std::launch::async,
-                                    [index, name, geometry]() {
+    auto promoteWorker = [index, name, geometry]() {
                                         // Profile gate FIRST (fail before any
                                         // heavy build): promotion must fit
                                         // the EDIT budget of the profile.
@@ -1161,7 +1218,21 @@ Java_com_blone_app_gl_NativeLib_promoteActiveObject(JNIEnv* /*env*/,
                                                 PendingPromotion{index, name,
                                                                  std::move(
                                                                          *mesh)});
-                                    }));
+    };
+    gIoFutures.push_back(std::async(std::launch::async, [promoteWorker, name]() {
+        try {
+            promoteWorker();
+        } catch (const std::bad_alloc&) {
+            BLONE_IOE("promoção '%s': memória insuficiente (bad_alloc)",
+                      name.c_str());
+            setIoStatus("PROMOTE_FAIL|" + name +
+                        "|memória insuficiente para tornar editável");
+        } catch (const std::exception& e) {
+            BLONE_IOE("promoção '%s': erro inesperado: %s", name.c_str(),
+                      e.what());
+            setIoStatus("PROMOTE_FAIL|" + name + "|erro inesperado");
+        }
+    }));
     return JNI_TRUE;
 }
 
@@ -1177,6 +1248,21 @@ extern "C" JNIEXPORT jstring JNICALL
 Java_com_blone_app_gl_NativeLib_ioStatusConsume(JNIEnv* env, jobject /*thiz*/) {
     const std::string s = takeIoStatus();
     return env->NewStringUTF(s.c_str());
+}
+
+// P4: import progress (0..1000; -1 when idle) and the cancel request. Both
+// are plain atomic reads/writes — safe from any thread, cheap to poll.
+extern "C" JNIEXPORT jint JNICALL
+Java_com_blone_app_gl_NativeLib_importProgress(JNIEnv* /*env*/,
+                                               jobject /*thiz*/) {
+    return gIoProgress.get();
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_blone_app_gl_NativeLib_cancelImport(JNIEnv* /*env*/,
+                                             jobject /*thiz*/) {
+    BLONE_IOI("import: cancelamento pedido pelo utilizador");
+    gIoProgress.requestCancel();
 }
 
 extern "C" JNIEXPORT jint JNICALL

@@ -24,6 +24,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
@@ -239,6 +240,45 @@ private fun ImportIssueDialog(viewModel: BloneViewModel) {
 }
 
 /**
+ * Import progress dialog (missão F4-LIMITS, P4): atomic 0..1000 from the
+ * engine shown as a percentage + bar, with a REAL Cancel button — the
+ * loaders unwind cleanly (all-or-nothing) and report "cancelada".
+ */
+@Composable
+private fun ImportProgressDialog(viewModel: BloneViewModel) {
+    if (!viewModel.ioBusy || viewModel.ioJobKind != BloneViewModel.IoJobKind.IMPORT) return
+    val percent = viewModel.ioProgress / 10
+    AlertDialog(
+        onDismissRequest = { /* no dismiss outside the button: the job owns it */ },
+        containerColor = ChromeSolid,
+        titleContentColor = ChromeFg,
+        textContentColor = ChromeFg,
+        title = { Text("A importar…", fontSize = 16.sp, fontWeight = FontWeight.Bold) },
+        text = {
+            Column {
+                LinearProgressIndicator(
+                    progress = { (percent / 100f).coerceIn(0f, 1f) },
+                    modifier = Modifier.fillMaxWidth(),
+                    color = Accent,
+                    trackColor = DisabledBg,
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text = "$percent% — grandes ficheiros podem demorar; pode cancelar sem danificar a cena.",
+                    color = ChromeDim,
+                    fontSize = 11.sp,
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { viewModel.cancelIoJob() }) {
+                Text("Cancelar", color = Danger)
+            }
+        },
+    )
+}
+
+/**
  * Compose chrome in FOUR zones (DECISÃO B) over the fullscreen GL viewport:
  *  A. compact TOP BAR — undo/redo, project file actions, mode chip, FPS and
  *     access to the advanced/properties panels (single scrollable row);
@@ -445,6 +485,8 @@ fun BloneOverlay(
 
         // Multi-line import-failure dialog (F4-LIMITS, P1) — above everything.
         ImportIssueDialog(viewModel)
+        // Import progress + real cancel (F4-LIMITS, P4).
+        ImportProgressDialog(viewModel)
     }
 }
 

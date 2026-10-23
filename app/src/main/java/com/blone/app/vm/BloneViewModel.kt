@@ -459,6 +459,16 @@ class BloneViewModel : ViewModel() {
     var ioBusy by mutableStateOf(false)
         private set
 
+    /** F4-LIMITS (P4): the kind of the running job (dialog title/labels). */
+    enum class IoJobKind { IMPORT, EXPORT, PROMOTE }
+
+    var ioJobKind by mutableStateOf(IoJobKind.IMPORT)
+        private set
+
+    /** Import progress 0..1000 from the engine (P4; polled with the status). */
+    var ioProgress by mutableStateOf(0)
+        private set
+
     /** MainActivity hook: copies the exported cache file to the SAF uri
      *  (Dispatchers.IO) and deletes the temporary. */
     var onExportFileReady: ((cachePath: String) -> Unit)? = null
@@ -476,6 +486,8 @@ class BloneViewModel : ViewModel() {
             return
         }
         ioTempPath = cachePath
+        ioJobKind = IoJobKind.IMPORT
+        ioProgress = 0
         statusText = "A importar…"
         if (NativeLib.importMesh(cachePath, isGltf, displayName)) {
             beginIoWatch()
@@ -491,6 +503,7 @@ class BloneViewModel : ViewModel() {
             return
         }
         ioTempPath = cachePath
+        ioJobKind = IoJobKind.EXPORT
         statusText = "A exportar…"
         if (NativeLib.exportObj(cachePath)) {
             beginIoWatch()
@@ -529,9 +542,21 @@ class BloneViewModel : ViewModel() {
         ioWatchJob = viewModelScope.launch {
             while (ioBusy) {
                 delay(400)
+                // P4: keep the progress dialog alive while the job runs.
+                if (ioJobKind == IoJobKind.IMPORT) {
+                    ioProgress = NativeLib.importProgress()
+                }
                 val status = NativeLib.ioStatusConsume()
                 if (status.isNotEmpty()) handleIoStatus(status)
             }
+        }
+    }
+
+    /** P4: user pressed Cancelar — the loaders unwind cleanly. */
+    fun cancelIoJob() {
+        if (ioJobKind == IoJobKind.IMPORT) {
+            NativeLib.cancelImport()
+            statusText = "A cancelar…"
         }
     }
 
@@ -614,6 +639,7 @@ class BloneViewModel : ViewModel() {
             statusText = "Já existe uma operação de E/S em curso"
             return
         }
+        ioJobKind = IoJobKind.PROMOTE
         statusText = "A tornar editável…"
         if (NativeLib.promoteActiveObject()) {
             beginIoWatch()

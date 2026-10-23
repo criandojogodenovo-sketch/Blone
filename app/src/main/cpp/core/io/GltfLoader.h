@@ -36,6 +36,8 @@
 #include <optional>
 #include <string>
 
+#include "IoProgress.h"
+
 struct cgltf_data;
 
 namespace blone::io {
@@ -47,14 +49,21 @@ public:
     // receives a human-readable PT reason for the failure (hotfix D1: toast
     // + logcat BloneIO); untouched on success. The default nullptr keeps
     // the previous signature and every existing caller working.
+    // `progress` (F4-LIMITS P4, optional): the counts come straight from
+    // the parsed JSON — a document whose accessors exceed the hard ceiling
+    // is rejected BEFORE cgltf_load_buffers (no buffer allocation at all);
+    // the extraction then publishes progress 400..900 and honours the
+    // cancel flag every chunk.
     static std::optional<RawMeshData> load(const std::string& path,
-                                           std::string* err = nullptr);
+                                           std::string* err = nullptr,
+                                           IoProgress* progress = nullptr);
 
     // Extracts RawMeshData from an ALREADY parsed/loaded/validated cgltf
     // document (exposed for tests; load() is the production entry point).
-    // Same `err` contract as load().
+    // Same `err` contract as load(); optional progress/cancel (P4).
     static std::optional<RawMeshData> extractRaw(const cgltf_data* data,
-                                                 std::string* err = nullptr);
+                                                 std::string* err = nullptr,
+                                                 IoProgress* progress = nullptr);
 };
 
 } // namespace blone::io

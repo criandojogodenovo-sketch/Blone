@@ -48,6 +48,8 @@
 #include <string>
 #include <vector>
 
+#include "IoProgress.h"
+
 namespace blone::io {
 
 // Texture coordinate (Math3D.h has no Vec2 by design; this type is local
@@ -73,8 +75,12 @@ public:
     // has zero side effects on every rejection listed above. When `err` is
     // non-null it receives a human-readable PT reason (hotfix D1); untouched
     // on success. The default nullptr keeps the previous signature.
+    // `progress` (F4-LIMITS P4, optional): owns the 800..1000 range of the
+    // import scale and honours the cancel flag every chunk (a cancelled
+    // build discards the local temporary — all-or-nothing holds).
     static std::optional<HalfEdgeMesh> build(const RawMeshData& data,
-                                             std::string* err = nullptr);
+                                             std::string* err = nullptr,
+                                             IoProgress* progress = nullptr);
 };
 
 // Exact triangle count of a RawMeshData: sum of (sides - 2) over the faces

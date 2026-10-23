@@ -171,7 +171,8 @@ int expandCorner(ObjParserState& st, long long p, long long t, long long n) {
 } // namespace
 
 std::optional<RawMeshData> ObjLoader::parseFile(std::istream& in,
-                                                std::string* err) {
+                                                std::string* err,
+                                                IoProgress* progress) {
     if (!in) {
         if (err) *err = "OBJ inv\u00e1lido: stream n\u00e3o leg\u00edvel";
         return std::nullopt;
@@ -182,6 +183,18 @@ std::optional<RawMeshData> ObjLoader::parseFile(std::istream& in,
     int lineNo = 0;
     while (std::getline(in, line)) {
         ++lineNo;
+        // P4: cancellation unwinds cleanly every 4096 lines (all-or-nothing
+        // — nothing outside this local state exists).
+        if (progress) {
+            if (progress->cancelled()) {
+                if (err) *err = "importa\u00e7\u00e3o cancelada";
+                return std::nullopt;
+            }
+            if (lineNo % kProgressCheckInterval == 0) {
+                progress->set(lineNo / 10); // parse phase ceiling: 600
+                if (progress->get() > 600) progress->set(600);
+            }
+        }
         if (!line.empty() && line.back() == '\r') line.pop_back();
         const auto hash = line.find('#');
         if (hash != std::string::npos) line.resize(hash);
@@ -304,13 +317,72 @@ std::optional<RawMeshData> ObjLoader::parseFile(std::istream& in,
 }
 
 std::optional<RawMeshData> ObjLoader::load(const std::string& path,
-                                           std::string* err) {
+                                           std::string* err,
+                                           IoProgress* progress) {
     std::ifstream in(path, std::ios::binary);
     if (!in) {
         if (err) *err = "n\u00e3o foi poss\u00edvel abrir o ficheiro";
         return std::nullopt;
     }
-    return parseFile(in, err);
+
+    // ---- P4 PRE-COUNT pass (anti-crash): cheap line scan, NO tokenization
+    // and NO geometry allocation. A file whose v/f directives exceed the
+    // hard ceiling is rejected HERE, before the parse pass can reserve
+    // gigabytes for a hopeless file.
+    if (progress && progress->cancelled()) {
+        if (err) *err = "importa\u00e7\u00e3o cancelada";
+        return std::nullopt;
+    }
+    {
+        size_t countV = 0, countF = 0;
+        std::string line;
+        int scanned = 0;
+        while (std::getline(in, line)) {
+            ++scanned;
+            if (progress) {
+                if (progress->cancelled()) {
+                    if (err) *err = "importa\u00e7\u00e3o cancelada";
+                    return std::nullopt;
+                }
+                if (scanned % kProgressCheckInterval == 0) {
+                    // Counting phase owns 0..200 of the scale (total lines
+                    // unknown — clamp so the parse phase keeps its range).
+                    const int p = scanned / 20 < 200 ? scanned / 20 : 200;
+                    progress->set(p);
+                }
+            }
+            // Cheap directive sniff: skip whitespace, first char decides.
+            size_t i = 0;
+            while (i < line.size() &&
+                   (line[i] == ' ' || line[i] == '\t')) {
+                ++i;
+            }
+            if (i >= line.size() || line[i] == '#') continue;
+            if (line.compare(i, 2, "v ") == 0 ||
+                line.compare(i, 2, "v\t") == 0 ||
+                line.compare(i, 2, "vt") == 0 ||
+                line.compare(i, 2, "vn") == 0) {
+                ++countV;
+            } else if (line.compare(i, 2, "f ") == 0 ||
+                       line.compare(i, 2, "f\t") == 0) {
+                ++countF;
+            }
+        }
+        if (countV > MeshLimits::maxVertices || countF > MeshLimits::maxFaces) {
+            if (err) {
+                *err = "excede o teto do motor (" +
+                       formatCount(MeshLimits::maxVertices) + " v / " +
+                       formatCount(MeshLimits::maxFaces) + " f); ficheiro tem " +
+                       formatCount(countV) + " v e " + formatCount(countF) +
+                       " f";
+            }
+            return std::nullopt;
+        }
+        if (progress) progress->set(200); // counting done
+        in.clear();
+        in.seekg(0, std::ios::beg); // rewind for the real parse
+    }
+    return parseFile(in, err, progress);
 }
 
 } // namespace blone::io

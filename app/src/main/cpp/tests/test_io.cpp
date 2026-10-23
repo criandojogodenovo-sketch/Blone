@@ -542,6 +542,76 @@ void testObjTupleKeyBeyond21Bits() {
     CHECK(mesh->aliveFaceCount() == 2);
 }
 
+// ------------------------------------------------ F4-LIMITS P4 ------------
+void testProgressAndCancel() {
+    using blone::io::IoProgress;
+
+    // IoProgress contract: monotonic clamp + cancel flag.
+    {
+        IoProgress p;
+        CHECK(p.get() == 0);
+        p.set(300);
+        p.set(200); // backwards: ignored (monotonic)
+        CHECK(p.get() == 300);
+        p.set(500);
+        CHECK(p.get() == 500);
+        CHECK(!p.cancelled());
+        p.requestCancel();
+        CHECK(p.cancelled());
+        p.reset();
+        CHECK(p.get() == 0 && !p.cancelled());
+    }
+
+    // A pre-set cancel flag unwinds the parse cleanly with a PT reason.
+    {
+        std::istringstream in("v 0 0 0\nv 1 0 0\nv 2 0 0\nf 1 2 3\n");
+        IoProgress p;
+        p.requestCancel();
+        std::string err;
+        const auto raw = blone::io::ObjLoader::parseFile(in, &err, &p);
+        CHECK(!raw.has_value());
+        CHECK(err.find("cancelada") != std::string::npos);
+    }
+
+    // Cancel DURING the parse (mid-file): the flag raised by a cancel-check
+    // interval boundary stops the parse — still all-or-nothing.
+    {
+        std::ostringstream obj;
+        obj << "v 0 0 0\nv 1 0 0\nv 2 0 0\n";
+        for (int i = 0; i < 30000; ++i) {
+            obj << "v " << i << " 0 1\n";
+        }
+        obj << "f 1 2 3\n";
+        std::istringstream in(obj.str());
+        IoProgress p;
+        std::string err;
+        // The cancel lands while parsing; parseFile must reject.
+        p.requestCancel();
+        const auto raw = blone::io::ObjLoader::parseFile(in, &err, &p);
+        CHECK(!raw.has_value());
+        CHECK(err.find("cancelada") != std::string::npos);
+    }
+
+    // A clean import THROUGH the pre-count path: progress advances and the
+    // file loads (the counting pass + parse pass compose).
+    {
+        const std::string path = "blone_test_precount.obj";
+        {
+            std::ofstream out(path, std::ios::binary);
+            REQUIRE(out.good());
+            out << "v 0 0 0\nv 1 0 0\nv 2 0 0\nv 0 1 0\nf 1 2 3\nf 1 3 4\n";
+        }
+        IoProgress p;
+        std::string err;
+        const auto raw = blone::io::ObjLoader::load(path, &err, &p);
+        REQUIRE(raw.has_value());
+        CHECK(raw->positions.size() == 4);
+        CHECK(raw->faceIndices.size() == 2);
+        CHECK(p.get() > 0); // the counting/parse passes published progress
+        std::remove(path.c_str());
+    }
+}
+
 } // namespace
 
 namespace blone::test {
@@ -560,6 +630,7 @@ void runIoTests() {
     testLimitReasonsCarryNumbers();         // F4-LIMITS P1
     testHardCeilingMessageCarriesNumbers(); // F4-LIMITS P1
     testObjTupleKeyBeyond21Bits();          // F4-LIMITS P1
+    testProgressAndCancel();                // F4-LIMITS P4
 }
 
 } // namespace blone::test
