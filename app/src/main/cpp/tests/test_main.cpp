@@ -13,6 +13,7 @@ void runUiModeTests();
 void runBrushTests();
 void runIoTests();
 void runReadModeTests();
+void runBigMeshTests();
 } // namespace blone::test
 
 int main() {
@@ -29,6 +30,7 @@ int main() {
     runBrushTests();
     runIoTests();
     runReadModeTests(); // F4-LIMITS P3
+    runBigMeshTests();  // F4-LIMITS P8 (malhas grandes)
     std::printf("\nVerificações: %d | Falhas: %d\n", g_checks, g_failures);
     if (g_failures == 0) {
         std::printf("RESULTADO: TODOS OS TESTES PASSARAM\n");

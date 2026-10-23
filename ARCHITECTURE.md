@@ -316,18 +316,38 @@ temporária; erro algum destrói o projeto aberto. Ver tabela de erros em
 
 ## 5. Limites de geometria e memória
 
+Dois níveis (F4-LIMITS):
+
+**Teto HARD** (`MeshLimits`, HalfEdgeMesh.h) — rede de segurança absoluta
+dos pools; nenhum caminho consegue passar disto:
+
 | Limite | Valor |
 |---|---|
-| Vértices por objeto | 200 000 |
-| Arestas por objeto | 400 000 |
-| Half-edges por objeto | 800 000 |
-| Faces por objeto | 200 000 |
+| Vértices por objeto (teto) | 4 000 000 |
+| Arestas por objeto (teto) | 12 000 000 |
+| Half-edges por objeto (teto) | 24 000 000 |
+| Faces por objeto (teto) | 8 000 000 |
 | Lados por face | 256 |
 | Objetos por cena | 32 |
 | Segmentos U (cilindro/esfera) | 3..96 |
 | Bandas V (esfera) | 2..48 |
 | Tamanho das primitivas | 0,01..64 unidades |
-| Orçamento do histórico | 24 MB / 64 entradas (o que chegar primeiro) |
+
+**Limites RUNTIME por perfil** (`core/io/GeometryLimits.h`) — decidem
+edição vs modo leitura vs rejeição ANTES de qualquer alocação pesada
+(classificação no worker de I/O; o usuário escolhe o perfil em
+Propriedades, persistido em SharedPreferences, default por RAM):
+
+| Perfil | editVerts | editTris | viewTris (leitura) | historyBytes |
+|---|---|---|---|---|
+| Baixo  |  40 000 |  80 000 |   500 000 | 32 MB |
+| Médio  |  75 000 | 150 000 | 1 000 000 | 48 MB |
+| Alto   | 150 000 | 300 000 | 2 000 000 | 96 MB |
+
+O `historyBytes` é dimensionado para caber a entrada ObjAdd do MAIOR
+import editável do perfil (~270 B por triângulo editável) + margem;
+a eviction mantém a utilização <= orçamento. Objetos acima do orçamento
+de edição mas dentro de `viewTris` entram em MODO LEITURA (§10).
 
 Verificações de limites (com margem conservadora para o pior caso) correm
 ANTES das alocações; extrapolação devolve `ErrLimit`/`ErrBudget` com a malha
@@ -612,7 +632,45 @@ exportObj(cachePath)
   quando o ficheiro mistura cantos com e sem atributo — documentado no
   header; o motor recalcula normais de qualquer forma.
 
-## 10. Fases futuras (não implementadas aqui)
+## 10. Modo leitura (RenderMesh, F4-LIMITS)
+
+Imports acima do orçamento de edição do perfil mas dentro de `viewTris`
+tornam-se objetos READ-ONLY: nenhuma half-edge é construída (exatamente a
+memória que estourava). A geometria vive num `RenderMesh` imutável e
+partilhado (`std::shared_ptr`) — sopa de triângulos indexada, ~30 B por
+triângulo vs ~270 B por triângulo editável (pools + slot maps + pairMap +
+histórico). números medidos pelo suite: 1M triângulos = 17 MB de
+render mesh + ~56 MB de OBJ exportado.
+
+- **Renderização**: mesmo layout FillVertex; a normal da face vem de
+  `dFdx/dFdy` no fragment shader (`uFlatDeriv`) — ES 3.0 core, sem
+  duplicação de vértices. Sem overlays (wireframe/pontos/seleção).
+- **IBO por objeto** (P2): uint16 quando <= 65 535 vértices duplicados
+  (metade da memória), uint32 acima — malhas de 70k+ vértices desenham
+  com o caminho uint32 (nativo ES 3.0).
+- **Picking**: objetos de leitura são selecionáveis/movíveis em Modo
+  Objeto (raycast direto nos índices); em Edição são ignorados. O pincel
+  NUNCA mira objetos de leitura.
+- **Gizmo**: Mover funciona (só `obj.position`); Rodar/Escalar são
+  recusados (`ErrUnsupported`). Transformações de objetos de leitura não
+  são undoable (documentado).
+- **Promoção "Tornar editável"** (Propriedades): worker constrói a malha
+  editável fora da cena (classificada contra o orçamento de edição) e a
+  drenagem troca com UMA entrada `ObjectSwap` — undo devolve o objeto de
+  leitura, redo o editável, geometria bit-exact nos dois sentidos.
+- **Export/projeto**: objetos de leitura exportam do RenderMesh; o
+  formato BLONEPRJ v3 guarda a flag `editable` e a geometria verbatim.
+
+Otimizações (P7): frustum culling por AABB (Math3D::aabbInFrustum,
+Gribb-Hartmann — objeto inteiro fora do frustum salta todas as passadas)
+e pool de buffers GPU (até 8 entrados retirados com nomes GL vivos;
+glBufferData recarrega sem churn de alocação). Pré-contagem anti-crash
+(P4): OBJ conta diretivas numa passada barata e o glTF lê as contagens do
+JSON — ficheiros acima do teto são recusados ANTES de alocar; progresso
+0..1000 atómico + cancelamento limpo; `std::bad_alloc` é apanhado na
+fronteira das workers e vira IMPORT_FAIL com motivo PT.
+
+## 11. Fases futuras (não implementadas aqui)
 
 Exportação GLB/glTF, storage de UV por canto, stb_image para texturas,
 xatlas para UV, materiais PBR. Nenhuma destas dependências ou

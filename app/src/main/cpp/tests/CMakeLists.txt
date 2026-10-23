@@ -36,7 +36,8 @@ add_executable(blone_tests
         ${CPP_DIR}/core/render/RenderMesh.cpp
         ${CPP_DIR}/core/scene/SceneOps.cpp
         ${CPP_DIR}/core/project/Project.cpp
-        test_readmode.cpp)
+        test_readmode.cpp
+        test_big.cpp)
 
 target_include_directories(blone_tests PRIVATE ${CPP_DIR})
 # Fixture dir for the I/O tests (cube.glb lives in tests/data).
@@ -49,3 +50,9 @@ set_source_files_properties(${CPP_DIR}/third_party/cgltf/cgltf.c PROPERTIES
 
 enable_testing()
 add_test(NAME blone_core COMMAND blone_tests)
+
+# gen_mesh CLI (P8): generates big OBJ/GLB test files into tmp on demand —
+# no binaries are ever committed.
+add_executable(gen_mesh EXCLUDE_FROM_ALL tools/gen_mesh.cpp)
+target_include_directories(gen_mesh PRIVATE ${CPP_DIR})
+target_compile_options(gen_mesh PRIVATE -Wall -Wextra -Wno-unused-parameter)
