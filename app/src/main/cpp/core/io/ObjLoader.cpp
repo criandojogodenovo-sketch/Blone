@@ -1,4 +1,5 @@
 #include "ObjLoader.h"
+#include "GeometryLimits.h" // formatCount (numbered cap message, P1)
 
 #include <cmath>
 #include <cstdint>
@@ -21,6 +22,25 @@ std::optional<RawMeshData> reject(int lineNo, const char* what,
     if (err) {
         *err = "OBJ inv\u00e1lido (linha " + std::to_string(lineNo) +
                "): " + what;
+    }
+    return std::nullopt;
+}
+
+// ---- entry cap (missão F4-LIMITS, P1) --------------------------------------
+//
+// Hard cap on EVERY parsed list (positions, uvs, normals, colors, faces):
+// the hard ceiling plus one, so a file beyond the engine ceiling is rejected
+// DURING parsing — before any unbounded allocation — with a numbered PT
+// message instead of an out-of-memory crash (P4 anti-crash, first guard).
+constexpr size_t kMaxListEntries = MeshLimits::maxVertices + 1; // 4M + 1
+
+std::optional<RawMeshData> rejectCap(int lineNo, const char* list,
+                                     size_t count, std::string* err) {
+    if (err) {
+        *err = "OBJ inv\u00e1lido (linha " + std::to_string(lineNo) + "): " +
+               list + " excede o teto do motor (" +
+               formatCount(kMaxListEntries) + "; ficheiro tem pelo menos " +
+               formatCount(count) + ")";
     }
     return std::nullopt;
 }
@@ -74,7 +94,29 @@ std::vector<std::string> splitWhitespace(const std::string& line) {
 // empty parallel array is the RawMeshData way of saying "absent".
 
 constexpr int kAbsent = 0;      // corner field explicitly empty
-constexpr uint64_t kIdxMask = 0x1FFFFFull; // 21 bits per field in the key
+
+// Corner-tuple map key (missão F4-LIMITS, P1): the old implementation packed
+// (p,t,n) into 21-bit fields of one uint64 — the 4M hard ceiling needs 22
+// bits per field (66 bits total), which NO longer fits 64 bits: packed keys
+// overflowed and silently corrupted large meshes (caught by the host test
+// before it could reach a device). The key is therefore a plain struct —
+// correct for any ceiling ElemId can hold. Absent fields are -1.
+struct CornerKey {
+    int p = 0;
+    int t = -1; // -1 = absent
+    int n = -1; // -1 = absent
+    bool operator==(const CornerKey& o) const {
+        return p == o.p && t == o.t && n == o.n;
+    }
+};
+struct CornerKeyHash {
+    size_t operator()(const CornerKey& k) const {
+        size_t h = static_cast<size_t>(static_cast<uint32_t>(k.p)) * 0x9E3779B9u;
+        h ^= static_cast<size_t>(static_cast<uint32_t>(k.t)) * 0x85EBCA6Bu;
+        h ^= static_cast<size_t>(static_cast<uint32_t>(k.n)) * 0xC2B2AE35u;
+        return h;
+    }
+};
 
 struct ObjParserState {
     std::vector<Vec3> pos;
@@ -82,18 +124,12 @@ struct ObjParserState {
     std::vector<Vec2> uv;
     std::vector<Vec3> color; // per position (white default)
 
-    std::unordered_map<uint64_t, int> cornerMap; // tuple -> expanded id
+    std::unordered_map<CornerKey, int, CornerKeyHash> cornerMap; // tuple -> expanded id
     bool anyNormal = false;
     bool anyUv = false;
 
     RawMeshData out;
 };
-
-uint64_t tupleKey(int p, int t, int n) {
-    return (static_cast<uint64_t>(static_cast<uint32_t>(p)) << 42) |
-           (static_cast<uint64_t>(static_cast<uint32_t>(t)) << 21) |
-           static_cast<uint64_t>(static_cast<uint32_t>(n));
-}
 
 // Resolves an OBJ index against its list (1-based positive, negative
 // relative). Returns -1 on out-of-range / forward reference.
@@ -113,14 +149,11 @@ int expandCorner(ObjParserState& st, long long p, long long t, long long n) {
     if (pi < 0) return -1;
     if (t != kAbsent && ti < 0) return -1;
     if (n != kAbsent && ni < 0) return -1;
-    if (pi < 0 || pi >= 0x1FFFFE || ti >= 0x1FFFFE || ni >= 0x1FFFFE) return -1;
 
     if (ni >= 0) st.anyNormal = true;
     if (ti >= 0) st.anyUv = true;
 
-    const uint64_t key =
-            tupleKey(pi, ti >= 0 ? ti : static_cast<int>(kIdxMask),
-                     ni >= 0 ? ni : static_cast<int>(kIdxMask));
+    const CornerKey key{pi, ti, ni};
     const auto it = st.cornerMap.find(key);
     if (it != st.cornerMap.end()) return it->second;
 
@@ -169,6 +202,10 @@ std::optional<RawMeshData> ObjLoader::parseFile(std::istream& in,
                 return reject(lineNo, "coordenada de v n\u00e3o num\u00e9rica ou NaN/Inf", err);
             }
             st.pos.push_back(p);
+            // Entry cap (P1): reject beyond the engine ceiling DURING parse.
+            if (st.pos.size() > kMaxListEntries) {
+                return rejectCap(lineNo, "v (posições)", st.pos.size(), err);
+            }
             if (tok.size() == 7) {
                 Vec3 c{};
                 if (!parseStrictFloat(tok[4], c.x) ||
@@ -192,6 +229,9 @@ std::optional<RawMeshData> ObjLoader::parseFile(std::istream& in,
                 return reject(lineNo, "v de vt n\u00e3o num\u00e9rico ou NaN/Inf", err);
             }
             st.uv.push_back(t);
+            if (st.uv.size() > kMaxListEntries) {
+                return rejectCap(lineNo, "vt (uv)", st.uv.size(), err);
+            }
         } else if (tok[0] == "vn") {
             if (tok.size() != 4) return reject(lineNo, "vn espera 3 valores", err);
             Vec3 n{};
@@ -200,6 +240,9 @@ std::optional<RawMeshData> ObjLoader::parseFile(std::istream& in,
                 return reject(lineNo, "normal de vn n\u00e3o num\u00e9rica ou NaN/Inf", err);
             }
             st.nrm.push_back(n);
+            if (st.nrm.size() > kMaxListEntries) {
+                return rejectCap(lineNo, "vn (normais)", st.nrm.size(), err);
+            }
         } else if (tok[0] == "f") {
             if (tok.size() < 4) {
                 return reject(lineNo, "f precisa de pelo menos 3 cantos", err);
@@ -241,6 +284,10 @@ std::optional<RawMeshData> ObjLoader::parseFile(std::istream& in,
                 loop.push_back(id);
             }
             st.out.faceIndices.push_back(std::move(loop));
+            if (st.out.faceIndices.size() > kMaxListEntries) {
+                return rejectCap(lineNo, "f (faces)", st.out.faceIndices.size(),
+                                 err);
+            }
         }
         // Any other directive: ignored (documented in the header).
     }

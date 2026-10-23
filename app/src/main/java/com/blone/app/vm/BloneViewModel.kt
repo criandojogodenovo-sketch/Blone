@@ -57,6 +57,18 @@ object StatusMessages {
         else -> "$action: erro $code"
     }
 
+    /** PT thousands separator (1.000.000) — mirrors the native formatCount. */
+    fun formatCount(n: Long): String {
+        val digits = n.toString()
+        val sb = StringBuilder(digits)
+        var i = if (digits.length > 3) digits.length - 3 else 0
+        while (i > 0) {
+            sb.insert(i, ".")
+            i = if (i > 3) i - 3 else 0
+        }
+        return sb.toString()
+    }
+
     fun projectError(code: Int): String = when (code) {
         0 -> "Projeto aberto"
         -1 -> "Ficheiro inválido (cabeçalho)"
@@ -77,6 +89,29 @@ object StatusMessages {
  * GL thread) and post results back to the main thread.
  */
 class BloneViewModel : ViewModel() {
+
+    /**
+     * Import-failure details for the multi-line dialog (F4-LIMITS, P1).
+     * The old truncated toast hid the numbers; the dialog shows the file
+     * counts, the ACTIVE profile limits and the 3 suggestions. Counts are
+     * -1 when the failure happened before the file was parsed.
+     */
+    data class ImportIssue(
+        val motivo: String,
+        val fileVerts: Long,
+        val fileTris: Long,
+        val profileName: String,
+        val editVerts: Long,
+        val editTris: Long,
+        val viewTris: Long,
+    )
+
+    var importIssue by mutableStateOf<ImportIssue?>(null)
+        private set
+
+    fun dismissImportIssue() {
+        importIssue = null
+    }
 
     val camera = CameraState()
 
@@ -496,10 +531,14 @@ class BloneViewModel : ViewModel() {
     }
 
     private fun handleIoStatus(status: String) {
-        // Protocol (hotfix D1): "<KIND>|<payload>[|<motivo PT>]" — the third
-        // field is the human-readable reason produced by the native stage
-        // that failed (parser/builder/drain/export). Missing = legacy message.
-        val parts = status.split("|", limit = 3)
+        // Protocol (hotfix D1 + F4-LIMITS P1):
+        //   "<KIND>|<payload>[|<motivo PT>[|<fileVerts>|<fileTris>
+        //                |<perfil>|<editVerts>|<editTris>|<viewTris>]]"
+        // The third field is the human-readable reason produced by the
+        // native stage that failed; fields 4..9 carry the machine-readable
+        // counts/limits for the failure dialog (-1 = unknown). Missing
+        // fields = legacy message (statusText only).
+        val parts = status.split("|", limit = 9)
         when (parts.getOrElse(0) { "" }) {
             "IMPORT_OK" -> {
                 statusText = "Importado: ${parts.getOrElse(1) { "" }}"
@@ -511,6 +550,21 @@ class BloneViewModel : ViewModel() {
                 val motivo = parts.getOrElse(2) { "" }
                 statusText = if (motivo.isEmpty()) "Falha na importação"
                              else "Falha na importação: $motivo"
+                // Dialog whenever the file counts were reportable (parsed
+                // or drained). Open/parser failures keep the full reason in
+                // the status line (never a bare message, R8).
+                val fileVerts = parts.getOrNull(3)?.toLongOrNull()
+                if (fileVerts != null && fileVerts >= 0) {
+                    importIssue = ImportIssue(
+                        motivo = motivo.ifEmpty { "falha na importação" },
+                        fileVerts = fileVerts,
+                        fileTris = parts.getOrNull(4)?.toLongOrNull() ?: -1,
+                        profileName = parts.getOrElse(5) { "Médio" },
+                        editVerts = parts.getOrNull(6)?.toLongOrNull() ?: 0,
+                        editTris = parts.getOrNull(7)?.toLongOrNull() ?: 0,
+                        viewTris = parts.getOrNull(8)?.toLongOrNull() ?: 0,
+                    )
+                }
                 ioBusy = false
                 cleanupTemp()
                 refresh()

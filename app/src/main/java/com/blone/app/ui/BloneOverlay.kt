@@ -21,12 +21,14 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -179,6 +181,61 @@ private fun StepButton(label: String, enabled: Boolean, onClick: () -> Unit) {
     ) {
         Text(text = label, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
     }
+}
+
+/**
+ * Multi-line import-failure dialog (missão F4-LIMITS, P1). Replaces the old
+ * truncated toast: the reason carries the numbers, the file counts, the
+ * ACTIVE profile limits and the 3 suggestions — every line in PT, nothing
+ * truncated. Shown whenever the engine reports a parseable-file failure
+ * (fields 4..9 of the IMPORT_FAIL protocol present).
+ */
+@Composable
+private fun ImportIssueDialog(viewModel: BloneViewModel) {
+    val issue = viewModel.importIssue ?: return
+    AlertDialog(
+        onDismissRequest = { viewModel.dismissImportIssue() },
+        containerColor = ChromeSolid,
+        titleContentColor = ChromeFg,
+        textContentColor = ChromeFg,
+        title = { Text("Falha na importação", fontSize = 16.sp, fontWeight = FontWeight.Bold) },
+        text = {
+            Column {
+                Text(
+                    text = issue.motivo,
+                    color = ChromeFg,
+                    fontSize = 12.sp,
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text = "Ficheiro: ${com.blone.app.vm.StatusMessages.formatCount(issue.fileVerts)} vértices · " +
+                        "${com.blone.app.vm.StatusMessages.formatCount(issue.fileTris)} triângulos",
+                    color = ChromeDim,
+                    fontSize = 11.sp,
+                    fontFamily = FontFamily.Monospace,
+                )
+                Text(
+                    text = "Perfil ativo: ${issue.profileName} — edição: " +
+                        "${com.blone.app.vm.StatusMessages.formatCount(issue.editVerts)} vértices / " +
+                        "${com.blone.app.vm.StatusMessages.formatCount(issue.editTris)} triângulos · " +
+                        "leitura: ${com.blone.app.vm.StatusMessages.formatCount(issue.viewTris)} triângulos",
+                    color = ChromeDim,
+                    fontSize = 11.sp,
+                    fontFamily = FontFamily.Monospace,
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                Text("Sugestões:", color = Accent, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+                Text("1. Escolha um ficheiro mais leve (menos triângulos).", color = ChromeDim, fontSize = 11.sp)
+                Text("2. Mude o perfil de limites para Alto em Propriedades (dispositivos com RAM suficiente).", color = ChromeDim, fontSize = 11.sp)
+                Text("3. Simplifique o modelo noutro programa (decimação) antes de importar.", color = ChromeDim, fontSize = 11.sp)
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { viewModel.dismissImportIssue() }) {
+                Text("Fechar", color = Accent)
+            }
+        },
+    )
 }
 
 /**
@@ -385,6 +442,9 @@ fun BloneOverlay(
                 }
             }
         }
+
+        // Multi-line import-failure dialog (F4-LIMITS, P1) — above everything.
+        ImportIssueDialog(viewModel)
     }
 }
 

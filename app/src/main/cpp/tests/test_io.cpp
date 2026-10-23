@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "../core/history/History.h"
+#include "../core/io/GeometryLimits.h"
 #include "../core/io/GltfLoader.h"
 #include "../core/io/MeshBuilder.h"
 #include "../core/io/ObjExporter.h"
@@ -395,6 +396,150 @@ void testRawAboveLimitsRejected() {
     }
 }
 
+// ------------------------------------------------ F4-LIMITS P1 ------------
+void testFormatCountAndClassify() {
+    using blone::io::formatCount;
+    using blone::io::limitsFor;
+    using blone::io::classifyImport;
+    using blone::io::ImportClass;
+    using blone::io::LimitsProfile;
+    // PT thousands separator.
+    CHECK(formatCount(0) == "0");
+    CHECK(formatCount(999) == "999");
+    CHECK(formatCount(1000) == "1.000");
+    CHECK(formatCount(40000) == "40.000");
+    CHECK(formatCount(1000000) == "1.000.000");
+    CHECK(formatCount(4000000) == "4.000.000");
+    CHECK(formatCount(4000001) == "4.000.001");
+
+    // Approved table (values pinned so a silent change is caught).
+    const auto baixo = limitsFor(LimitsProfile::Baixo);
+    const auto medio = limitsFor(LimitsProfile::Medio);
+    const auto alto = limitsFor(LimitsProfile::Alto);
+    CHECK(baixo.editVerts == 40000 && baixo.editTris == 80000 &&
+          baixo.viewTris == 500000 && baixo.historyBytes == 8ull * 1024 * 1024);
+    CHECK(medio.editVerts == 75000 && medio.editTris == 150000 &&
+          medio.viewTris == 1000000 && medio.historyBytes == 16ull * 1024 * 1024);
+    CHECK(alto.editVerts == 150000 && alto.editTris == 300000 &&
+          alto.viewTris == 2000000 && alto.historyBytes == 24ull * 1024 * 1024);
+
+    // P8 acceptance criteria encoded in the classification:
+    // 50k tri -> EDITABLE on every profile.
+    CHECK(classifyImport(25000, 50000, baixo) == ImportClass::Editable);
+    CHECK(classifyImport(25000, 50000, medio) == ImportClass::Editable);
+    CHECK(classifyImport(25000, 50000, alto) == ImportClass::Editable);
+    // 200k tri -> editable ONLY on Alto, read-only elsewhere.
+    CHECK(classifyImport(100000, 200000, alto) == ImportClass::Editable);
+    CHECK(classifyImport(100000, 200000, medio) == ImportClass::ReadOnly);
+    CHECK(classifyImport(100000, 200000, baixo) == ImportClass::ReadOnly);
+    // 500k tri -> read-only everywhere; 1M tri -> read on Médio/Alto.
+    CHECK(classifyImport(250000, 500000, baixo) == ImportClass::ReadOnly);
+    CHECK(classifyImport(250000, 500000, medio) == ImportClass::ReadOnly);
+    CHECK(classifyImport(250000, 500000, alto) == ImportClass::ReadOnly);
+    CHECK(classifyImport(500000, 1000000, medio) == ImportClass::ReadOnly);
+    CHECK(classifyImport(500000, 1000000, alto) == ImportClass::ReadOnly);
+    // Above the view limit / above the hard ceiling -> rejected.
+    CHECK(classifyImport(500000, 1000001, medio) == ImportClass::Rejected);
+    CHECK(classifyImport(500000, 1000001, baixo) == ImportClass::Rejected);
+    CHECK(classifyImport(MeshLimits::maxVertices + 1, 10, alto) ==
+          ImportClass::Rejected);
+    // Boundary: exactly at the limits stays editable.
+    CHECK(classifyImport(baixo.editVerts, baixo.editTris, baixo) ==
+          ImportClass::Editable);
+    // rawTriangleCount: quad + tri = 2 + 1.
+    {
+        RawMeshData d;
+        d.positions = {Vec3{0, 0, 0}, Vec3{1, 0, 0}, Vec3{1, 1, 0},
+                       Vec3{0, 1, 0}, Vec3{2, 0, 0}};
+        d.faceIndices.push_back({0, 1, 2, 3});
+        d.faceIndices.push_back({1, 4, 2});
+        CHECK(blone::io::rawTriangleCount(d) == 3);
+    }
+}
+
+void testLimitReasonsCarryNumbers() {
+    using blone::io::LimitsProfile;
+    const std::string edit = blone::io::reasonAboveEditLimit(
+            LimitsProfile::Medio, 25000, 200000);
+    CHECK(edit.find("Médio") != std::string::npos);
+    CHECK(edit.find("150.000") != std::string::npos);
+    CHECK(edit.find("200.000") != std::string::npos);
+    CHECK(edit.find("25.000") != std::string::npos);
+    const std::string view = blone::io::reasonAboveViewLimit(
+            LimitsProfile::Baixo, 300000, 600000);
+    CHECK(view.find("Baixo") != std::string::npos);
+    CHECK(view.find("500.000") != std::string::npos);
+    CHECK(view.find("600.000") != std::string::npos);
+    const std::string hard =
+            blone::io::reasonAboveHardCeiling(4000001, 8100000);
+    CHECK(hard.find("4.000.000") != std::string::npos);
+    CHECK(hard.find("8.000.000") != std::string::npos);
+}
+
+void testHardCeilingMessageCarriesNumbers() {
+    // 4M+1 positions (48 MB transient) — the same contract test 6 pins, but
+    // now asserting the REJECTION MESSAGE carries the numbers (R8): the
+    // device dialog quotes them verbatim.
+    RawMeshData data;
+    data.positions.resize(MeshLimits::maxVertices + 1);
+    data.faceIndices.push_back({0, 1, 2});
+    std::string err;
+    const auto built = MeshBuilder::build(data, &err);
+    CHECK(!built.has_value());
+    CHECK(err.find("4.000.000") != std::string::npos);
+    CHECK(err.find("4.000.001") != std::string::npos);
+}
+
+void testObjTupleKeyBeyond21Bits() {
+    // Regression (missão F4-LIMITS, P1): the corner-tuple key packed
+    // (p,t,n) into 21-bit fields of one uint64. With uv/normal lists beyond
+    // 2^21 (2.097.152) entries — legal now that the hard ceiling is 4M —
+    // the packed fields bled into the neighbours and two DIFFERENT corners
+    // deduped into one (silent geometry corruption). This file puts the two
+    // colliding corners in separate triangles:
+    //   face A: "f 1//1 2//1 3//1"      -> corners (p, absent, 0)
+    //   face B: "f 1/2^21/1 2/2^21/1 3/2^21/1" -> corners (p, 2^21-1, 0)
+    // Under the OLD packing the absent sentinel (all-ones 21-bit field)
+    // equals the real uv index 2^21-1 shifted the same way: every corner of
+    // B deduped into its A twin (uvs lost, 3 corners instead of 6). The
+    // struct key keeps all six distinct.
+    constexpr int kVtCount = (1 << 21); // exactly 2^21 vt entries
+    std::ostringstream obj;
+    obj << "# gerado: chave de tuplo para alem de 21 bits\n";
+    obj << "v 0 0 0\nv 1 0 0\nv 2 0 0\n";
+    obj << "vn 0 0 1\n";
+    // uv.x encodes the entry index exactly (floats hold ints up to 2^24).
+    for (int i = 0; i < kVtCount; ++i) {
+        obj << "vt " << i << " 0\n";
+    }
+    obj << "f 1//1 2//1 3//1\n";
+    obj << "f 1/" << kVtCount << "/1 2/" << kVtCount << "/1 3/" << kVtCount
+        << "/1\n";
+    std::istringstream in(obj.str());
+    const auto raw = blone::io::ObjLoader::parseFile(in);
+    REQUIRE(raw.has_value());
+    CHECK(raw->positions.size() == 6); // 3 corners per face; old packing: 3
+    CHECK(raw->uvs.size() == 6);       // old packing deduped to 3
+    CHECK(raw->normals.size() == 6);
+    REQUIRE(raw->faceIndices.size() == 2);
+    REQUIRE(raw->faceIndices[0].size() == 3);
+    REQUIRE(raw->faceIndices[1].size() == 3);
+    for (const int c : raw->faceIndices[0]) {
+        CHECK(raw->uvs[static_cast<size_t>(c)].x == 0.0f); // placeholder
+    }
+    for (const int c : raw->faceIndices[1]) {
+        // uv = vt[2^21-1] — NOT the placeholder the old packing produced.
+        CHECK(raw->uvs[static_cast<size_t>(c)].x ==
+              static_cast<float>(kVtCount - 1));
+        CHECK(raw->normals[static_cast<size_t>(c)].z == 1.0f);
+    }
+    // Builds through the full pipeline.
+    const auto mesh = MeshBuilder::build(*raw);
+    REQUIRE(mesh.has_value());
+    CHECK(mesh->aliveVertexCount() == 6);
+    CHECK(mesh->aliveFaceCount() == 2);
+}
+
 } // namespace
 
 namespace blone::test {
@@ -409,6 +554,10 @@ void runIoTests() {
     testGltfEmbeddedDataUriFixture();       // hotfix D1
     testImportHistoryUndoRedo();
     testRawAboveLimitsRejected();
+    testFormatCountAndClassify();           // F4-LIMITS P1
+    testLimitReasonsCarryNumbers();         // F4-LIMITS P1
+    testHardCeilingMessageCarriesNumbers(); // F4-LIMITS P1
+    testObjTupleKeyBeyond21Bits();          // F4-LIMITS P1
 }
 
 } // namespace blone::test

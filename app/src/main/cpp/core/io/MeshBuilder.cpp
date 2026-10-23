@@ -1,4 +1,5 @@
 #include "MeshBuilder.h"
+#include "GeometryLimits.h" // formatCount (numbered rejection messages, P1)
 
 #include <algorithm>
 #include <cmath>
@@ -26,13 +27,25 @@ std::optional<HalfEdgeMesh> MeshBuilder::build(const RawMeshData& data,
         return std::nullopt;
     }
 
-    // 2) Global geometry limits — rejected BEFORE any work happens.
+    // 2) HARD geometry ceiling — rejected BEFORE any work happens.
+    //    P1 (F4-LIMITS): the message carries the numbers (R8) — file counts
+    //    vs the ceiling — so the device dialog can quote them verbatim.
+    //    The RUNTIME per-profile gate lives in the I/O worker
+    //    (GeometryLimits::classifyImport) and rejects long before this.
     if (data.positions.size() > MeshLimits::maxVertices) {
-        if (err) *err = "excede o limite de vértices";
+        if (err) {
+            *err = "excede o teto de vértices do motor (" +
+                   formatCount(MeshLimits::maxVertices) + "; ficheiro tem " +
+                   formatCount(data.positions.size()) + ")";
+        }
         return std::nullopt;
     }
     if (data.faceIndices.size() > MeshLimits::maxFaces) {
-        if (err) *err = "excede o limite de faces";
+        if (err) {
+            *err = "excede o teto de faces do motor (" +
+                   formatCount(MeshLimits::maxFaces) + "; ficheiro tem " +
+                   formatCount(data.faceIndices.size()) + ")";
+        }
         return std::nullopt;
     }
 
@@ -134,6 +147,14 @@ std::optional<HalfEdgeMesh> MeshBuilder::build(const RawMeshData& data,
     }
 
     return mesh;
+}
+
+size_t rawTriangleCount(const RawMeshData& data) {
+    size_t tris = 0;
+    for (const std::vector<int>& loop : data.faceIndices) {
+        tris += loop.size() >= 3 ? loop.size() - 2 : 0;
+    }
+    return tris;
 }
 
 } // namespace blone::io

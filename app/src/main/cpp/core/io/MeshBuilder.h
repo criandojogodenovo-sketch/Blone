@@ -77,4 +77,10 @@ public:
                                              std::string* err = nullptr);
 };
 
+// Exact triangle count of a RawMeshData: sum of (sides - 2) over the faces
+// (the fan triangulation MeshBuilder's topology implies). Pure and cheap —
+// the I/O worker calls it for the runtime limit gate (F4-LIMITS, P1) and
+// the host tests pin it.
+size_t rawTriangleCount(const RawMeshData& data);
+
 } // namespace blone::io

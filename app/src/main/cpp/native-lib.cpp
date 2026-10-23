@@ -20,6 +20,7 @@
 
 #include "core/Log.h"
 #include "core/history/History.h"
+#include "core/io/GeometryLimits.h"
 #include "core/io/GltfLoader.h"
 #include "core/io/MeshBuilder.h"
 #include "core/io/ObjExporter.h"
@@ -58,6 +59,10 @@ struct PendingImport {
     std::string name;      // sanitized display name
     std::string sourcePath; // for IMPORT_FAIL reporting at drain time
     blone::HalfEdgeMesh mesh;
+    // File counts captured at the raw stage (F4-LIMITS, P1): the drain
+    // failure path reports them without re-walking the mesh.
+    long long fileVerts = -1;
+    long long fileTris = -1;
 };
 std::mutex gIoMutex;                      // guards the queue AND the futures
 std::deque<PendingImport> gPendingImports;
@@ -83,6 +88,24 @@ std::string takeIoStatus() {
 std::string peekIoStatus() {
     std::lock_guard<std::mutex> lock(gIoStatusMutex);
     return gIoStatus;
+}
+
+// IMPORT_FAIL composer (missão F4-LIMITS, P1): full reason + the machine-
+// readable counts/limits the Kotlin dialog needs. Protocol (9 fields):
+//   IMPORT_FAIL|<path>|<motivo PT>|<fileVerts>|<fileTris>
+//              |<perfil>|<editVerts>|<editTris>|<viewTris>
+// Counts are -1 when the failing stage ran before the file was parsed.
+std::string importFailStatus(const std::string& path,
+                             const std::string& motivo, long long fileVerts,
+                             long long fileTris,
+                             blone::io::LimitsProfile profile) {
+    const blone::io::RuntimeLimits lim = blone::io::limitsFor(profile);
+    return "IMPORT_FAIL|" + path + "|" + motivo + "|" +
+           std::to_string(fileVerts) + "|" + std::to_string(fileTris) + "|" +
+           blone::io::profileName(profile) + "|" +
+           std::to_string(lim.editVerts) + "|" +
+           std::to_string(lim.editTris) + "|" +
+           std::to_string(lim.viewTris);
 }
 
 // std::async trap: destroying a future whose shared state never finished
@@ -155,7 +178,9 @@ void drainPendingImportsLocked() {
             }
             BLONE_IOE("(e) drenagem: ObjAdd falhou para '%s': %s",
                       name.c_str(), motivo);
-            setIoStatus("IMPORT_FAIL|" + item.sourcePath + "|" + motivo);
+            setIoStatus(importFailStatus(item.sourcePath, motivo,
+                                         item.fileVerts, item.fileTris,
+                                         blone::io::currentProfile()));
         }
     }
 }
@@ -698,10 +723,12 @@ Java_com_blone_app_gl_NativeLib_importMesh(JNIEnv* env, jobject /*thiz*/,
                                             BLONE_IOE("import '%s': (b) worker "
                                                       "não abriu o path",
                                                       filePath.c_str());
-                                            setIoStatus("IMPORT_FAIL|" +
-                                                        filePath +
-                                                        "|ficheiro não encontrado "
-                                                        "no armazenamento");
+                                            setIoStatus(importFailStatus(
+                                                    filePath,
+                                                    "ficheiro não encontrado "
+                                                    "no armazenamento",
+                                                    -1, -1,
+                                                    blone::io::currentProfile()));
                                             return;
                                         }
                                         const long long bytes =
@@ -732,8 +759,9 @@ Java_com_blone_app_gl_NativeLib_importMesh(JNIEnv* env, jobject /*thiz*/,
                                                       "falhou: %s",
                                                       filePath.c_str(),
                                                       err.c_str());
-                                            setIoStatus("IMPORT_FAIL|" +
-                                                        filePath + "|" + err);
+                                            setIoStatus(importFailStatus(
+                                                    filePath, err, -1, -1,
+                                                    blone::io::currentProfile()));
                                             return;
                                         }
                                         BLONE_IOI("import '%s': (c) parser OK "
@@ -741,6 +769,70 @@ Java_com_blone_app_gl_NativeLib_importMesh(JNIEnv* env, jobject /*thiz*/,
                                                   filePath.c_str(),
                                                   raw->positions.size(),
                                                   raw->faceIndices.size());
+
+                                        // ---- RUNTIME LIMIT GATE (P1) ---
+                                        // Classified against the CURRENT
+                                        // profile BEFORE any heavy
+                                        // allocation: the hard ceiling only
+                                        // exists to catch bugs; the profile
+                                        // decides edit vs reject. P3 will
+                                        // route the (<= viewTris) slice to
+                                        // read-only mode instead of failing.
+                                        const blone::io::LimitsProfile
+                                                profile =
+                                                blone::io::currentProfile();
+                                        const size_t fileVerts =
+                                                raw->positions.size();
+                                        const size_t fileTris =
+                                                blone::io::rawTriangleCount(
+                                                        *raw);
+                                        const blone::io::ImportClass cls =
+                                                blone::io::classifyImport(
+                                                        fileVerts, fileTris,
+                                                        blone::io::limitsFor(
+                                                                profile));
+                                        if (cls !=
+                                            blone::io::ImportClass::Editable) {
+                                            const bool aboveCeiling =
+                                                    fileVerts > blone::MeshLimits::
+                                                                    maxVertices ||
+                                                    fileTris > blone::MeshLimits::
+                                                                   maxFaces;
+                                            const std::string motivo =
+                                                    aboveCeiling
+                                                            ? blone::io::
+                                                                      reasonAboveHardCeiling(
+                                                                      fileVerts,
+                                                                      fileTris)
+                                                            : blone::io::
+                                                                      reasonAboveEditLimit(
+                                                                      profile,
+                                                                      fileVerts,
+                                                                      fileTris);
+                                            BLONE_IOE("import '%s': limite "
+                                                      "excedido (V=%zu tris=%zu "
+                                                      "perfil=%s): %s",
+                                                      filePath.c_str(),
+                                                      fileVerts, fileTris,
+                                                      blone::io::profileName(
+                                                              profile),
+                                                      motivo.c_str());
+                                            setIoStatus(importFailStatus(
+                                                    filePath, motivo,
+                                                    static_cast<long long>(
+                                                            fileVerts),
+                                                    static_cast<long long>(
+                                                            fileTris),
+                                                    profile));
+                                            return;
+                                        }
+                                        BLONE_IOI("import '%s': dentro dos "
+                                                  "limites do perfil %s "
+                                                  "(V=%zu tris=%zu)",
+                                                  filePath.c_str(),
+                                                  blone::io::profileName(
+                                                          profile),
+                                                  fileVerts, fileTris);
 
                                         // Stage (d): MeshBuilder (all-or-nothing).
                                         std::optional<blone::HalfEdgeMesh>
@@ -756,8 +848,13 @@ Java_com_blone_app_gl_NativeLib_importMesh(JNIEnv* env, jobject /*thiz*/,
                                                       "MeshBuilder falhou: %s",
                                                       filePath.c_str(),
                                                       err.c_str());
-                                            setIoStatus("IMPORT_FAIL|" +
-                                                        filePath + "|" + err);
+                                            setIoStatus(importFailStatus(
+                                                    filePath, err,
+                                                    static_cast<long long>(
+                                                            fileVerts),
+                                                    static_cast<long long>(
+                                                            fileTris),
+                                                    blone::io::currentProfile()));
                                             return;
                                         }
                                         BLONE_IOI("import '%s': (d) malha "
@@ -768,10 +865,16 @@ Java_com_blone_app_gl_NativeLib_importMesh(JNIEnv* env, jobject /*thiz*/,
                                             std::lock_guard<std::mutex> q(
                                                     gIoMutex);
                                             gPendingImports.push_back(
-                                                    PendingImport{displayName,
-                                                                  filePath,
-                                                                  std::move(
-                                                                          *mesh)});
+                                                    PendingImport{
+                                                            displayName,
+                                                            filePath,
+                                                            std::move(*mesh),
+                                                            static_cast<long
+                                                                    long>(
+                                                                    fileVerts),
+                                                            static_cast<long
+                                                                    long>(
+                                                                    fileTris)});
                                         }
                                         // NOTE: no IMPORT_OK here — the
                                         // drain reports the final state once

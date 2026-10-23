@@ -1,4 +1,5 @@
 #include "GltfLoader.h"
+#include "GeometryLimits.h" // formatCount (numbered rejection messages, P1)
 
 #include <cmath>
 #include <cstring>
@@ -140,10 +141,22 @@ std::optional<RawMeshData> GltfLoader::extractRaw(const cgltf_data* data,
                 if (err) *err = "geometria excede o limite de vértices";
                 return std::nullopt;
             }
+            const size_t count = posAcc->count;
+            // Hard ceiling guard (missão F4-LIMITS, P1): reject BEFORE the
+            // big allocations below, with the numbers in the message (R8).
+            // The runtime per-profile gate lives in the I/O worker.
+            if (out.positions.size() + count > MeshLimits::maxVertices) {
+                if (err) {
+                    *err = "excede o teto de vértices do motor (" +
+                           formatCount(MeshLimits::maxVertices) +
+                           "; ficheiro tem " +
+                           formatCount(out.positions.size() + count) + ")";
+                }
+                return std::nullopt;
+            }
 
             // ---- vertices (concatenated with an offset) ----------------
             const size_t base = out.positions.size();
-            const size_t count = posAcc->count;
             out.positions.resize(base + count);
             if (nrmAcc || !out.normals.empty()) {
                 out.normals.resize(base + count, Vec3{0.0f, 0.0f, 0.0f});
