@@ -413,15 +413,17 @@ void testFormatCountAndClassify() {
     CHECK(formatCount(4000001) == "4.000.001");
 
     // Approved table (values pinned so a silent change is caught).
+    // historyBytes sizing rule: must hold the ObjAdd entry of the biggest
+    // editable import of the profile (~270 B per editable triangle).
     const auto baixo = limitsFor(LimitsProfile::Baixo);
     const auto medio = limitsFor(LimitsProfile::Medio);
     const auto alto = limitsFor(LimitsProfile::Alto);
     CHECK(baixo.editVerts == 40000 && baixo.editTris == 80000 &&
-          baixo.viewTris == 500000 && baixo.historyBytes == 8ull * 1024 * 1024);
+          baixo.viewTris == 500000 && baixo.historyBytes == 32ull * 1024 * 1024);
     CHECK(medio.editVerts == 75000 && medio.editTris == 150000 &&
-          medio.viewTris == 1000000 && medio.historyBytes == 16ull * 1024 * 1024);
+          medio.viewTris == 1000000 && medio.historyBytes == 48ull * 1024 * 1024);
     CHECK(alto.editVerts == 150000 && alto.editTris == 300000 &&
-          alto.viewTris == 2000000 && alto.historyBytes == 24ull * 1024 * 1024);
+          alto.viewTris == 2000000 && alto.historyBytes == 96ull * 1024 * 1024);
 
     // P8 acceptance criteria encoded in the classification:
     // 50k tri -> EDITABLE on every profile.

@@ -148,6 +148,10 @@ class BloneViewModel : ViewModel() {
     var activeObject by mutableStateOf(-1)
         private set
 
+    /** F4-LIMITS (P3): 0 = the active object is READ-ONLY (snapshot idx 9). */
+    var activeObjectEditable by mutableStateOf(true)
+        private set
+
     // ---- selection state (MIRROR of the C++ engine, never a second truth) --
     // Filled exclusively from NativeLib.selectionSnapshot() by refresh().
     // The Kotlin layer does not keep its own selection set — it displays what
@@ -301,6 +305,7 @@ class BloneViewModel : ViewModel() {
         selFaces = snap[6]
         hasValidSelection = snap[7] == 1
         if (snap.size >= 9) activeObject = snap[8]
+        if (snap.size >= 10) activeObjectEditable = snap[9] == 1
     }
 
     /** Called (UI thread) with the result of [NativeLib.pickAndSelect]:
@@ -585,6 +590,35 @@ class BloneViewModel : ViewModel() {
                 ioBusy = false
                 cleanupTemp()
             }
+            "PROMOTE_OK" -> {
+                statusText = "Objeto editável: ${parts.getOrElse(1) { "" }}"
+                ioBusy = false
+                refresh()
+            }
+            "PROMOTE_FAIL" -> {
+                val motivo = parts.getOrElse(2) { "" }
+                statusText = if (motivo.isEmpty()) "Falha ao tornar editável"
+                             else "Falha ao tornar editável: $motivo"
+                ioBusy = false
+                refresh()
+            }
+        }
+    }
+
+    /**
+     * F4-LIMITS (P3): "Tornar editável" for the ACTIVE read-only object.
+     * Shares the I/O polling loop (ioBusy) with import/export.
+     */
+    fun requestPromoteActive() {
+        if (ioBusy) {
+            statusText = "Já existe uma operação de E/S em curso"
+            return
+        }
+        statusText = "A tornar editável…"
+        if (NativeLib.promoteActiveObject()) {
+            beginIoWatch()
+        } else {
+            statusText = "Nada para tornar editável"
         }
     }
 

@@ -56,6 +56,12 @@ struct ToolSession {
     Vec3 accumMove{};
     float accumFactor = 1.0f;
     float accumDeg = 0.0f;
+    // F4-LIMITS (P3): READ-OBJECT sessions transform obj.position ONLY
+    // (no half-edge to move, nothing to commit): Move works, Rotate/Scale
+    // are rejected with ErrUnsupported at begin, and no history entry is
+    // written (read-only transforms are not undoable — documented).
+    bool readMode = false;
+    Vec3 startPosObj{}; // object.position at session begin (read mode)
 };
 
 // ---- scene / object management -------------------------------------------
@@ -70,6 +76,17 @@ Status deleteActiveObject(Scene& s, History& h);
 // the scene — the worker never touches the live scene); its position is
 // (0,0,0) because imported files already carry world-space coordinates.
 Status addImportedObject(Scene& s, History& h, SceneObject&& obj);
+// F4-LIMITS (P3): same contract for a READ-ONLY import (geometry in the
+// shared immutable RenderMesh; the HalfEdgeMesh stays empty). Requires
+// obj.editable == false && obj.readMesh non-empty.
+Status addImportedReadObject(Scene& s, History& h, SceneObject&& obj);
+// F4-LIMITS (P3): promotion — replaces the read-only object at `index`
+// with its EDITABLE version (same name/position). Exactly ONE history
+// entry (ObjectSwap): undo restores the read-only object, redo restores
+// the editable one. The caller built the editable mesh OFF the scene
+// (worker) and already classified it against the profile edit limits.
+Status replaceWithEditable(Scene& s, History& h, int index,
+                           SceneObject&& replacement);
 // Duplicates the ACTIVE object (whole mesh clone, selection NOT copied,
 // offset +1.5 X so the copy is visible), activates the copy and pushes an
 // ObjectAdded history entry (undo removes the copy). Returns the new index

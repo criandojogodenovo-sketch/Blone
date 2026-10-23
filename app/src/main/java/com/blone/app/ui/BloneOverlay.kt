@@ -662,9 +662,37 @@ private fun PropertiesPanel(viewModel: BloneViewModel, modifier: Modifier = Modi
             fontSize = 11.sp,
             fontFamily = FontFamily.Monospace,
         )
+        // F4-LIMITS (P3): read-only object — honest badge, Move-only
+        // affordances and the "Tornar editável" promotion (worker + progress).
+        if (!viewModel.activeObjectEditable && viewModel.activeObject >= 0) {
+            Spacer(modifier = Modifier.height(6.dp))
+            Text(
+                text = "MODO LEITURA",
+                color = Amber,
+                fontSize = 11.sp,
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier
+                    .background(DisabledBg, RoundedCornerShape(8.dp))
+                    .padding(horizontal = 8.dp, vertical = 4.dp),
+            )
+            Text(
+                text = "Objeto grande em modo de visualização — Mover funciona; esculpir/pintar/editar exigem torná-lo editável.",
+                color = ChromeDim,
+                fontSize = 10.sp,
+            )
+            ToolButton(
+                "Tornar editável",
+                false,
+                enabled = !viewModel.ioBusy && !viewModel.busy,
+            ) { viewModel.requestPromoteActive() }
+            Spacer(modifier = Modifier.height(6.dp))
+        }
         Spacer(modifier = Modifier.height(8.dp))
 
         val canTransform = viewModel.activeObject >= 0 && !viewModel.busy
+        // Rotate/Scale need mesh mutation: unavailable on read-only objects
+        // (the native layer would reject with "topologia não suportada").
+        val canRotateScale = canTransform && viewModel.activeObjectEditable
         Text("Mover (passo 0,25)", color = ChromeDim, fontSize = 11.sp)
         StepRow("X", canTransform, { viewModel.nudgeMove(0, -0.25f) },
                 { viewModel.nudgeMove(0, 0.25f) })
@@ -674,18 +702,18 @@ private fun PropertiesPanel(viewModel: BloneViewModel, modifier: Modifier = Modi
                 { viewModel.nudgeMove(2, 0.25f) })
         Spacer(modifier = Modifier.height(6.dp))
         Text("Rodar (passo 15°)", color = ChromeDim, fontSize = 11.sp)
-        StepRow("X", canTransform, { viewModel.nudgeRotate(0, -15f) },
+        StepRow("X", canRotateScale, { viewModel.nudgeRotate(0, -15f) },
                 { viewModel.nudgeRotate(0, 15f) })
-        StepRow("Y", canTransform, { viewModel.nudgeRotate(1, -15f) },
+        StepRow("Y", canRotateScale, { viewModel.nudgeRotate(1, -15f) },
                 { viewModel.nudgeRotate(1, 15f) })
-        StepRow("Z", canTransform, { viewModel.nudgeRotate(2, -15f) },
+        StepRow("Z", canRotateScale, { viewModel.nudgeRotate(2, -15f) },
                 { viewModel.nudgeRotate(2, 15f) })
         Spacer(modifier = Modifier.height(6.dp))
         Text("Escalar", color = ChromeDim, fontSize = 11.sp)
         Row {
-            StepButton("×1,25", canTransform) { viewModel.nudgeScale(3, 1.25f) }
+            StepButton("×1,25", canRotateScale) { viewModel.nudgeScale(3, 1.25f) }
             Spacer(modifier = Modifier.width(4.dp))
-            StepButton("÷1,25", canTransform) { viewModel.nudgeScale(3, 0.8f) }
+            StepButton("÷1,25", canRotateScale) { viewModel.nudgeScale(3, 0.8f) }
         }
         Spacer(modifier = Modifier.height(8.dp))
         Text(

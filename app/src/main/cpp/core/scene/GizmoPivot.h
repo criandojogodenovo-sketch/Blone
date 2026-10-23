@@ -11,6 +11,13 @@
 //                gates gizmo drawing on hasValidSelection in edit mode).
 // Returns false when there is no usable pivot (no active object or empty
 // mesh) — callers must draw NO gizmo and accept NO hit in that case.
+//
+// F4-LIMITS (P3): READ-ONLY active objects (geometry in the shared
+// RenderMesh, the HalfEdgeMesh intentionally empty) use the SAME whole-
+// object rule with the RenderMesh's cached centroid as the source — the
+// gate itself (which object gets a gizmo, and when) is UNCHANGED. Without
+// this, the object gizmo could not exist in read mode (missão: "gizmo de
+// objeto funciona em leitura").
 
 #include "Scene.h"
 
@@ -19,7 +26,21 @@ namespace blone::gizmopivot {
 inline bool pivotFor(const Scene& s, bool editMode, Vec3& out, int& objIndexOut) {
     objIndexOut = s.active;
     const SceneObject* obj = s.activeObject();
-    if (!obj || obj->mesh.empty()) return false;
+    if (!obj) return false;
+
+    // F4-LIMITS (P3): read-only object — the same whole-object rule, the
+    // centroid comes from the cached RenderMesh centroid (O(1); the pivot
+    // must never walk half a million vertices per frame). Only meaningful
+    // in OBJECT mode: edit mode has no alive elements on a read object, so
+    // hasValidSelection is false and the callers never reach here.
+    if (!obj->editable) {
+        if (editMode) return false; // no selection can exist on a read object
+        if (!obj->readMesh || obj->readMesh->empty()) return false;
+        out = obj->readMesh->centroid + obj->position;
+        return true;
+    }
+
+    if (obj->mesh.empty()) return false;
 
     Vec3 acc{};
     size_t count = 0;

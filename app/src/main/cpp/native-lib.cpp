@@ -30,6 +30,7 @@
 #include "core/operations/TransformMath.h"
 #include "core/project/Project.h"
 #include "core/render/RenderData.h"
+#include "core/render/RenderMesh.h"
 #include "core/scene/GizmoPivot.h"
 #include "core/scene/Scene.h"
 #include "core/scene/SceneOps.h"
@@ -58,14 +59,28 @@ std::mutex gMutex;
 struct PendingImport {
     std::string name;      // sanitized display name
     std::string sourcePath; // for IMPORT_FAIL reporting at drain time
+    // F4-LIMITS (P3): the worker picks the representation — editable
+    // HalfEdgeMesh (within the profile edit budget) or READ-ONLY RenderMesh
+    // (within the view budget, above the edit one).
     blone::HalfEdgeMesh mesh;
+    std::shared_ptr<const blone::render::RenderMesh> readMesh;
+    bool readOnly = false;
     // File counts captured at the raw stage (F4-LIMITS, P1): the drain
     // failure path reports them without re-walking the mesh.
     long long fileVerts = -1;
     long long fileTris = -1;
 };
+
+// Pending promotion (F4-LIMITS, P3): "Tornar editável" — the worker built
+// the editable mesh OFF the scene; the drain swaps it in place.
+struct PendingPromotion {
+    int index = -1;
+    std::string name;
+    blone::HalfEdgeMesh mesh;
+};
 std::mutex gIoMutex;                      // guards the queue AND the futures
 std::deque<PendingImport> gPendingImports;
+std::deque<PendingPromotion> gPendingPromotions;
 std::vector<std::future<void>> gIoFutures;
 std::mutex gIoStatusMutex;                // guards the atomic status slot
 std::string gIoStatus;
@@ -144,16 +159,26 @@ void drainPendingImportsLocked() {
         blone::SceneObject obj;
         obj.name = std::move(item.name);
         obj.mesh = std::move(item.mesh);
+        if (item.readOnly) {
+            obj.editable = false;
+            obj.readMesh = std::move(item.readMesh);
+        }
         const blone::ops::Status st =
-                blone::sceneops::addImportedObject(gScene, gHistory,
-                                                   std::move(obj));
+                item.readOnly
+                        ? blone::sceneops::addImportedReadObject(gScene,
+                                                                 gHistory,
+                                                                 std::move(obj))
+                        : blone::sceneops::addImportedObject(gScene, gHistory,
+                                                             std::move(obj));
         if (st == blone::ops::Status::OK) {
             pruneSelectionsLocked();
             // Stage (e): the object REALLY entered the scene (undo removes
             // it, kMaxObjects respected by the SceneOps facade).
             BLONE_IOI("(e) drenagem: '%s' entrou na cena via SceneOps "
-                      "(ObjAdd, objeto ativo = %d)",
-                      name.c_str(), gScene.active);
+                      "(%s, objeto ativo = %d)",
+                      name.c_str(),
+                      item.readOnly ? "modo leitura" : "ObjAdd",
+                      gScene.active);
             setIoStatus("IMPORT_OK|" + name);
         } else {
             // kMaxObjects / budget / internal: the scene stays intact and
@@ -185,6 +210,61 @@ void drainPendingImportsLocked() {
     }
 }
 
+// DRAIN — promotions (F4-LIMITS, P3): "Tornar editável". Runs right after
+// the import drain inside drawFrame, caller holds gMutex. The editable mesh
+// was built by the worker OFF the scene; the swap itself is ONE ObjectSwap
+// history entry (SceneOps::replaceWithEditable).
+void drainPendingPromotionsLocked() {
+    std::deque<PendingPromotion> pending;
+    {
+        std::lock_guard<std::mutex> lock(gIoMutex);
+        pending.swap(gPendingPromotions);
+    }
+    while (!pending.empty()) {
+        PendingPromotion item = std::move(pending.front());
+        pending.pop_front();
+        blone::SceneObject replacement;
+        replacement.name = item.name;
+        replacement.editable = true;
+        replacement.mesh = std::move(item.mesh);
+        // Keep the read object's world placement.
+        if (item.index >= 0 &&
+            item.index < static_cast<int>(gScene.objects.size())) {
+            replacement.position =
+                    gScene.objects[static_cast<size_t>(item.index)].position;
+        }
+        const blone::ops::Status st = blone::sceneops::replaceWithEditable(
+                gScene, gHistory, item.index, std::move(replacement));
+        if (st == blone::ops::Status::OK) {
+            pruneSelectionsLocked();
+            BLONE_IOI("promoção: '%s' tornou-se editável (1 entrada "
+                      "ObjectSwap)",
+                      item.name.c_str());
+            setIoStatus("PROMOTE_OK|" + item.name);
+        } else {
+            const char* motivo = "falha ao tornar editável";
+            switch (st) {
+                case blone::ops::Status::ErrLimit:
+                    motivo = "cena cheia: máximo de objetos atingido";
+                    break;
+                case blone::ops::Status::ErrBudget:
+                    motivo = "limite de histórico esgotado para esta promoção";
+                    break;
+                case blone::ops::Status::ErrInvalidArg:
+                    motivo = "o objeto já não está disponível";
+                    break;
+                case blone::ops::Status::ErrInternal:
+                    motivo = "erro interno ao promover";
+                    break;
+                default:
+                    break;
+            }
+            BLONE_IOE("promoção: '%s' falhou: %s", item.name.c_str(), motivo);
+            setIoStatus("PROMOTE_FAIL|" + item.name + "|" + motivo);
+        }
+    }
+}
+
 blone::OrbitCamera cameraFrom(jfloat azimuthDeg, jfloat elevationDeg,
                               jfloat distance, jfloat tx, jfloat ty, jfloat tz) {
     blone::OrbitCamera c;
@@ -206,7 +286,10 @@ std::vector<jint> selectionCounts() {
 // ATOMIC selection snapshot for the UI (single source of truth): the Kotlin
 // layer reads this instead of keeping a diverging copy of the selection.
 // Layout: [editMode, selectionMode, multiSelect, hasActiveObject,
-//          nVerts, nEdges, nFaces, hasValidSelection, activeIndex].
+//          nVerts, nEdges, nFaces, hasValidSelection, activeIndex,
+//          activeEditable]  (F4-LIMITS P3: index 9 = 0 only when the active
+//          object is READ-ONLY — the properties panel gates its affordances
+//          on it and offers "Tornar editável").
 // Dead ids are NOT counted; hasValidSelection distinguishes an EMPTY
 // selection (all zero) from an INVALID one (ids kept but dead).
 // activeIndex (hotfix D3) is the ENGINE's active object — the Kotlin mirror
@@ -216,13 +299,15 @@ std::vector<jint> selectionSnapshotLocked() {
     int counts[3] = {0, 0, 0};
     blone::sceneops::selectionCounts(gScene, counts);
     const blone::SceneObject* obj = gScene.activeObject();
+    const jint activeEditable = (obj && !obj->editable) ? 0 : 1;
     return {gScene.editMode ? 1 : 0,
             static_cast<jint>(gScene.selectionMode),
             gScene.multiSelect ? 1 : 0,
             obj ? 1 : 0,
             counts[0], counts[1], counts[2],
             blone::sceneops::hasValidSelection(gScene) ? 1 : 0,
-            obj ? gScene.active : -1};
+            obj ? gScene.active : -1,
+            activeEditable};
 }
 
 jintArray toJIntArray(JNIEnv* env, const std::vector<jint>& v) {
@@ -441,6 +526,7 @@ Java_com_blone_app_gl_NativeLib_drawFrame(JNIEnv* /*env*/, jobject /*thiz*/,
     // Fase 4: drain finished imports BEFORE rendering — the new object is
     // visible the same frame (SceneOps facade bumps the scene version).
     drainPendingImportsLocked();
+    drainPendingPromotionsLocked();
     const blone::OrbitCamera cam =
             cameraFrom(azimuthDeg, elevationDeg, distance, tx, ty, tz);
     gRenderer.render(cam, gScene, pointRadiusPx, gGizmoTool);
@@ -798,32 +884,101 @@ Java_com_blone_app_gl_NativeLib_importMesh(JNIEnv* env, jobject /*thiz*/,
                                                                     maxVertices ||
                                                     fileTris > blone::MeshLimits::
                                                                    maxFaces;
-                                            const std::string motivo =
-                                                    aboveCeiling
-                                                            ? blone::io::
-                                                                      reasonAboveHardCeiling(
-                                                                      fileVerts,
-                                                                      fileTris)
-                                                            : blone::io::
-                                                                      reasonAboveEditLimit(
-                                                                      profile,
-                                                                      fileVerts,
-                                                                      fileTris);
-                                            BLONE_IOE("import '%s': limite "
-                                                      "excedido (V=%zu tris=%zu "
-                                                      "perfil=%s): %s",
+                                            if (aboveCeiling) {
+                                                const std::string motivo =
+                                                        blone::io::
+                                                                reasonAboveHardCeiling(
+                                                                        fileVerts,
+                                                                        fileTris);
+                                                BLONE_IOE("import '%s': acima "
+                                                          "do teto (V=%zu "
+                                                          "tris=%zu): %s",
+                                                          filePath.c_str(),
+                                                          fileVerts, fileTris,
+                                                          motivo.c_str());
+                                                setIoStatus(importFailStatus(
+                                                        filePath, motivo,
+                                                        static_cast<long long>(
+                                                                fileVerts),
+                                                        static_cast<long long>(
+                                                                fileTris),
+                                                        profile));
+                                                return;
+                                            }
+                                            // P3: ReadOnly => view-only import
+                                            // (the RenderMesh below); Rejected
+                                            // above the view budget => full PT
+                                            // reason with the numbers.
+                                            if (cls ==
+                                                blone::io::ImportClass::
+                                                        Rejected) {
+                                                const std::string motivo =
+                                                        blone::io::
+                                                                reasonAboveViewLimit(
+                                                                        profile,
+                                                                        fileVerts,
+                                                                        fileTris);
+                                                BLONE_IOE("import '%s': acima do "
+                                                          "limite de leitura "
+                                                          "(V=%zu tris=%zu "
+                                                          "perfil=%s): %s",
+                                                          filePath.c_str(),
+                                                          fileVerts, fileTris,
+                                                          blone::io::profileName(
+                                                                  profile),
+                                                          motivo.c_str());
+                                                setIoStatus(importFailStatus(
+                                                        filePath, motivo,
+                                                        static_cast<long long>(
+                                                                fileVerts),
+                                                        static_cast<long long>(
+                                                                fileTris),
+                                                        profile));
+                                                return;
+                                            }
+                                            // ---- READ-ONLY ROUTE (P3) ----
+                                            // Above the edit budget, within
+                                            // the view budget: build the
+                                            // indexed RenderMesh (~30 B/tri)
+                                            // and skip the HalfEdgeMesh
+                                            // entirely (this is the memory
+                                            // that used to crash).
+                                            blone::render::RenderMesh rm =
+                                                    blone::render::
+                                                            buildRenderMesh(
+                                                                    *raw);
+                                            BLONE_IOI("import '%s': MODO "
+                                                      "LEITURA (V=%zu tris=%zu, "
+                                                      "%llu bytes) — em fila",
                                                       filePath.c_str(),
-                                                      fileVerts, fileTris,
-                                                      blone::io::profileName(
-                                                              profile),
-                                                      motivo.c_str());
-                                            setIoStatus(importFailStatus(
-                                                    filePath, motivo,
-                                                    static_cast<long long>(
-                                                            fileVerts),
-                                                    static_cast<long long>(
-                                                            fileTris),
-                                                    profile));
+                                                      rm.positions.size(),
+                                                      rm.triangleCount,
+                                                      static_cast<long long>(
+                                                              rm.memoryBytes()));
+                                            auto shared =
+                                                    std::make_shared<const
+                                                            blone::render::
+                                                                    RenderMesh>(
+                                                            std::move(rm));
+                                            {
+                                                std::lock_guard<std::mutex> q(
+                                                        gIoMutex);
+                                                gPendingImports.push_back(
+                                                        PendingImport{
+                                                                displayName,
+                                                                filePath,
+                                                                blone::
+                                                                        HalfEdgeMesh{},
+                                                                std::move(
+                                                                        shared),
+                                                                true,
+                                                                static_cast<long
+                                                                        long>(
+                                                                        fileVerts),
+                                                                static_cast<long
+                                                                        long>(
+                                                                        fileTris)});
+                                            }
                                             return;
                                         }
                                         BLONE_IOI("import '%s': dentro dos "
@@ -869,6 +1024,8 @@ Java_com_blone_app_gl_NativeLib_importMesh(JNIEnv* env, jobject /*thiz*/,
                                                             displayName,
                                                             filePath,
                                                             std::move(*mesh),
+                                                            nullptr,
+                                                            false,
                                                             static_cast<long
                                                                     long>(
                                                                     fileVerts),
@@ -920,6 +1077,91 @@ Java_com_blone_app_gl_NativeLib_exportObj(JNIEnv* env, jobject /*thiz*/,
         setIoStatus(std::string(ok ? "EXPORT_OK|" : "EXPORT_FAIL|") + filePath +
                     (ok ? "" : "|não foi possível escrever o ficheiro OBJ"));
     }));
+    return JNI_TRUE;
+}
+
+// F4-LIMITS (P3): "Tornar editável" — promotes the ACTIVE read-only object.
+// Enqueues a worker (build OFF the scene) whose result the drain swaps in
+// with ONE ObjectSwap history entry. Returns true when the job was ACCEPTED
+// (watch ioStatusConsume for PROMOTE_OK / PROMOTE_FAIL).
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_blone_app_gl_NativeLib_promoteActiveObject(JNIEnv* /*env*/,
+                                                    jobject /*thiz*/) {
+    // Snapshot under gMutex: index + shared geometry + name. The read-only
+    // RenderMesh is immutable — the worker can read it without the scene.
+    int index = -1;
+    std::string name;
+    std::shared_ptr<const blone::render::RenderMesh> geometry;
+    {
+        std::lock_guard<std::mutex> lock(gMutex);
+        const blone::SceneObject* obj = gScene.activeObject();
+        if (!obj || obj->editable || !obj->readMesh) return JNI_FALSE;
+        index = gScene.active;
+        name = obj->name;
+        geometry = obj->readMesh;
+    }
+
+    pruneFinishedFutures();
+    std::lock_guard<std::mutex> lock(gIoMutex);
+    gIoFutures.push_back(std::async(std::launch::async,
+                                    [index, name, geometry]() {
+                                        // Profile gate FIRST (fail before any
+                                        // heavy build): promotion must fit
+                                        // the EDIT budget of the profile.
+                                        const blone::io::LimitsProfile
+                                                profile =
+                                                blone::io::currentProfile();
+                                        const blone::io::RuntimeLimits lim =
+                                                blone::io::limitsFor(profile);
+                                        const size_t verts =
+                                                geometry->positions.size();
+                                        const size_t tris =
+                                                geometry->triangleCount;
+                                        if (verts > lim.editVerts ||
+                                            tris > lim.editTris) {
+                                            const std::string motivo =
+                                                    blone::io::
+                                                            reasonAboveEditLimit(
+                                                                    profile,
+                                                                    verts,
+                                                                    tris);
+                                            BLONE_IOE("promoção '%s': %s",
+                                                      name.c_str(),
+                                                      motivo.c_str());
+                                            setIoStatus("PROMOTE_FAIL|" + name
+                                                        + "|" + motivo);
+                                            return;
+                                        }
+                                        const blone::io::RawMeshData raw =
+                                                blone::render::renderMeshToRaw(
+                                                        *geometry);
+                                        std::string err;
+                                        auto mesh = blone::io::MeshBuilder::
+                                                build(raw, &err);
+                                        if (!mesh) {
+                                            if (err.empty()) {
+                                                err = "geometria inválida";
+                                            }
+                                            BLONE_IOE("promoção '%s': "
+                                                      "MeshBuilder falhou: %s",
+                                                      name.c_str(),
+                                                      err.c_str());
+                                            setIoStatus("PROMOTE_FAIL|" + name
+                                                        + "|" + err);
+                                            return;
+                                        }
+                                        BLONE_IOI("promoção '%s': malha "
+                                                  "editável construída "
+                                                  "(V=%zu faces=%zu) — em fila",
+                                                  name.c_str(),
+                                                  mesh->aliveVertexCount(),
+                                                  mesh->aliveFaceCount());
+                                        std::lock_guard<std::mutex> q(gIoMutex);
+                                        gPendingPromotions.push_back(
+                                                PendingPromotion{index, name,
+                                                                 std::move(
+                                                                         *mesh)});
+                                    }));
     return JNI_TRUE;
 }
 

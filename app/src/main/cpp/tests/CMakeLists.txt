@@ -33,8 +33,10 @@ add_executable(blone_tests
         ${CPP_DIR}/core/operations/Operations.cpp
         ${CPP_DIR}/core/history/History.cpp
         ${CPP_DIR}/core/render/RenderData.cpp
+        ${CPP_DIR}/core/render/RenderMesh.cpp
         ${CPP_DIR}/core/scene/SceneOps.cpp
-        ${CPP_DIR}/core/project/Project.cpp)
+        ${CPP_DIR}/core/project/Project.cpp
+        test_readmode.cpp)
 
 target_include_directories(blone_tests PRIVATE ${CPP_DIR})
 # Fixture dir for the I/O tests (cube.glb lives in tests/data).

@@ -122,6 +122,9 @@ private:
         // GL_UNSIGNED_INT otherwise (70k+ vertex meshes keep the uint32
         // path — native in ES 3.0, verified against the old behaviour).
         GLenum indexType = GL_UNSIGNED_INT;
+        // READ-MODE (P3): identity of the uploaded RenderMesh (re-upload
+        // skip when the shared geometry is unchanged).
+        const void* readUploaded = nullptr;
         GLuint wireVao = 0, wireVbo = 0;
         GLsizei wireCount = 0;
         GLuint ptVao = 0, ptVbo = 0;
@@ -145,6 +148,10 @@ private:
     void destroyObjectGpu(ObjectGpu& g);
     void buildObjectGeometry(ObjectGpu& g, const SceneObject& obj);
     void buildSelectionOverlays(ObjectGpu& g, const SceneObject& obj);
+    // READ-MODE upload (F4-LIMITS P3): indexed unique-vertex buffers from
+    // the shared RenderMesh (flat shading via uFlatDeriv; no overlays).
+    // Skips the re-upload while the same RenderMesh pointer is resident.
+    void buildReadGeometry(ObjectGpu& g, const SceneObject& obj);
 
     // Shared ray builder for picking AND the brush surface hit (single
     // projection source — they can never diverge).
@@ -163,7 +170,7 @@ private:
     GLuint fillProgram_ = 0, lineProgram_ = 0, pointProgram_ = 0;
     GLint fillMvpLoc_ = -1, fillModelLoc_ = -1, fillLightLoc_ = -1;
     GLint fillEyeLoc_ = -1, fillTintLoc_ = -1, fillTintMixLoc_ = -1;
-    GLint fillUseVColLoc_ = -1;
+    GLint fillUseVColLoc_ = -1, fillFlatDerivLoc_ = -1;
     GLint lineMvpLoc_ = -1, lineOverrideLoc_ = -1, lineUseOverrideLoc_ = -1;
     GLint pointMvpLoc_ = -1, pointColorLoc_ = -1, pointSizeLoc_ = -1;
 

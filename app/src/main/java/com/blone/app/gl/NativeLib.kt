@@ -59,12 +59,16 @@ object NativeLib {
     /**
      * ATOMIC selection snapshot from the C++ engine (single source of truth):
      * [editMode, selectionMode, multiSelect, hasActiveObject,
-     *  nVerts, nEdges, nFaces, hasValidSelection, activeIndex].
+     *  nVerts, nEdges, nFaces, hasValidSelection, activeIndex,
+     *  activeEditable].
      * Dead ids are never counted; hasValidSelection distinguishes an EMPTY
      * selection (all counts zero) from an INVALID one (stale ids dropped).
      * activeIndex (hotfix D3) is the ENGINE's active object (-1 when none):
      * the UI mirror MUST re-sync from it every refresh — keeping its own
      * stale copy made the properties panel read the wrong object.
+     * activeEditable (F4-LIMITS P3) is 0 only when the active object is
+     * READ-ONLY: the panel then shows the "Modo leitura" badge, gates
+     * Rodar/Escalar and offers "Tornar editável".
      */
     external fun selectionSnapshot(): IntArray?
 
@@ -242,6 +246,14 @@ object NativeLib {
 
     /** Enqueues an OBJ export of the whole scene. True = job accepted. */
     external fun exportObj(path: String): Boolean
+
+    /**
+     * F4-LIMITS (P3): "Tornar editável" — promotes the ACTIVE read-only
+     * object (worker builds the editable mesh off the scene; the drain
+     * swaps it in place with ONE history entry). True = job accepted;
+     * watch [ioStatusConsume] for PROMOTE_OK / PROMOTE_FAIL.
+     */
+    external fun promoteActiveObject(): Boolean
 
     /** Atomic I/O status: "" idle | "IMPORT_OK|<nome>" | "IMPORT_FAIL|<path>"
      *  | "EXPORT_OK|<cachepath>" | "EXPORT_FAIL|<path>". */

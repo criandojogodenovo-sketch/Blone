@@ -6,9 +6,14 @@
 //
 //   Perfil | editVerts | editTris | viewTris  | historyBytes
 //   -------+-----------+----------+-----------+-------------
-//   Baixo  |   40.000  |   80.000 |   500.000 |      8 MB
-//   Médio  |   75.000  |  150.000 | 1.000.000 |     16 MB
-//   Alto   |  150.000  |  300.000 | 2.000.000 |     24 MB
+//   Baixo  |   40.000  |   80.000 |   500.000 |      32 MB
+//   Médio  |   75.000  |  150.000 | 1.000.000 |      48 MB
+//   Alto   |  150.000  |  300.000 | 2.000.000 |      96 MB
+//
+// historyBytes sizing rule: the budget must hold the ObjAdd entry of the
+// BIGGEST editable import of the profile (~270 B per editable triangle —
+// one object copy in the history entry) plus margin, so a legal import is
+// never rejected by the budget. Undo eviction keeps usage <= the budget.
 //
 // Semantics (enforced by the I/O worker BEFORE any heavy allocation):
 //   V <= editVerts AND tris <= editTris  -> EDITABLE mesh (HalfEdgeMesh);
@@ -51,12 +56,12 @@ struct RuntimeLimits {
 inline RuntimeLimits limitsFor(LimitsProfile p) {
     switch (p) {
         case LimitsProfile::Baixo:
-            return {40000, 80000, 500000, 8ull * 1024 * 1024};
+            return {40000, 80000, 500000, 32ull * 1024 * 1024};
         case LimitsProfile::Alto:
-            return {150000, 300000, 2000000, 24ull * 1024 * 1024};
+            return {150000, 300000, 2000000, 96ull * 1024 * 1024};
         case LimitsProfile::Medio:
         default:
-            return {75000, 150000, 1000000, 16ull * 1024 * 1024};
+            return {75000, 150000, 1000000, 48ull * 1024 * 1024};
     }
 }
 
