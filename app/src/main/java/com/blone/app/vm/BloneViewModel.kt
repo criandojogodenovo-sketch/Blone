@@ -8,6 +8,8 @@ import androidx.lifecycle.viewModelScope
 import com.blone.app.gl.CameraState
 import com.blone.app.gl.NativeLib
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -55,6 +57,18 @@ object StatusMessages {
         else -> "$action: erro $code"
     }
 
+    /** PT thousands separator (1.000.000) — mirrors the native formatCount. */
+    fun formatCount(n: Long): String {
+        val digits = n.toString()
+        val sb = StringBuilder(digits)
+        var i = if (digits.length > 3) digits.length - 3 else 0
+        while (i > 0) {
+            sb.insert(i, ".")
+            i = if (i > 3) i - 3 else 0
+        }
+        return sb.toString()
+    }
+
     fun projectError(code: Int): String = when (code) {
         0 -> "Projeto aberto"
         -1 -> "Ficheiro inválido (cabeçalho)"
@@ -75,6 +89,29 @@ object StatusMessages {
  * GL thread) and post results back to the main thread.
  */
 class BloneViewModel : ViewModel() {
+
+    /**
+     * Import-failure details for the multi-line dialog (F4-LIMITS, P1).
+     * The old truncated toast hid the numbers; the dialog shows the file
+     * counts, the ACTIVE profile limits and the 3 suggestions. Counts are
+     * -1 when the failure happened before the file was parsed.
+     */
+    data class ImportIssue(
+        val motivo: String,
+        val fileVerts: Long,
+        val fileTris: Long,
+        val profileName: String,
+        val editVerts: Long,
+        val editTris: Long,
+        val viewTris: Long,
+    )
+
+    var importIssue by mutableStateOf<ImportIssue?>(null)
+        private set
+
+    fun dismissImportIssue() {
+        importIssue = null
+    }
 
     val camera = CameraState()
 
@@ -109,6 +146,10 @@ class BloneViewModel : ViewModel() {
         private set
 
     var activeObject by mutableStateOf(-1)
+        private set
+
+    /** F4-LIMITS (P3): 0 = the active object is READ-ONLY (snapshot idx 9). */
+    var activeObjectEditable by mutableStateOf(true)
         private set
 
     // ---- selection state (MIRROR of the C++ engine, never a second truth) --
@@ -246,7 +287,14 @@ class BloneViewModel : ViewModel() {
         refresh()
     }
 
-    /** Applies one atomic engine snapshot to the mirrored UI state. */
+    /** Applies one atomic engine snapshot to the mirrored UI state.
+     *
+     *  Hotfix D3: index 8 is the ENGINE's active object. The Kotlin mirror
+     *  used to keep its own stale copy (set only by explicit activation), so
+     *  the properties panel showed "Nenhum objeto"/V0·A0·F0 with an active
+     *  object and the fixed steps had nothing to act on. From now on the
+     *  engine is the single source of truth — after a pick, a primitive,
+     *  an import drain, undo/redo, the mirror re-syncs every refresh(). */
     private fun applySnapshot(snap: IntArray?) {
         if (snap == null || snap.size < 8) return
         engineSelectionMode = SelectionMode.entries.firstOrNull { it.native == snap[1] }
@@ -256,6 +304,8 @@ class BloneViewModel : ViewModel() {
         selEdges = snap[5]
         selFaces = snap[6]
         hasValidSelection = snap[7] == 1
+        if (snap.size >= 9) activeObject = snap[8]
+        if (snap.size >= 10) activeObjectEditable = snap[9] == 1
     }
 
     /** Called (UI thread) with the result of [NativeLib.pickAndSelect]:
@@ -397,6 +447,236 @@ class BloneViewModel : ViewModel() {
         refresh()
     }
 
+    // ---- I/O 3D (Fase 4: OBJ/glTF) -----------------------------------------
+    //
+    // The ViewModel owns ONLY the polling and the messages; SAF file I/O
+    // stays in MainActivity through the two hooks below (the VM never
+    // touches android.net.Uri). The native side is asynchronous: parse/build
+    // happen on a worker, the object enters the scene at the GL-thread drain
+    // via the SceneOps facade (one undo entry per import).
+
+    /** True while an import/export job is pending (drives the polling). */
+    var ioBusy by mutableStateOf(false)
+        private set
+
+    /** F4-LIMITS (P4): the kind of the running job (dialog title/labels). */
+    enum class IoJobKind { IMPORT, EXPORT, PROMOTE }
+
+    var ioJobKind by mutableStateOf(IoJobKind.IMPORT)
+        private set
+
+    /** Import progress 0..1000 from the engine (P4; polled with the status). */
+    var ioProgress by mutableStateOf(0)
+        private set
+
+    // ---- limits profile (F4-LIMITS, P6) ---------------------------------
+    // 0 Baixo, 1 Médio (default until the Activity applies the saved choice
+    // or the RAM-appropriate one), 2 Alto. The native side is the single
+    // source of truth for the numbers (core/io/GeometryLimits.h).
+    var limitsProfile by mutableStateOf(1)
+        private set
+
+    /** MainActivity hook: persists the profile choice (SharedPreferences). */
+    var onProfilePersist: ((profile: Int) -> Unit)? = null
+
+    /** Called ONCE at startup (MainActivity): saved choice or RAM default. */
+    fun initLimitsProfile(profile: Int) {
+        val p = profile.coerceIn(0, 2)
+        limitsProfile = p
+        NativeLib.setLimitsProfile(p)
+    }
+
+    fun selectLimitsProfile(profile: Int) {
+        if (profile !in 0..2 || profile == limitsProfile) return
+        limitsProfile = profile
+        NativeLib.setLimitsProfile(profile)
+        statusText = when (profile) {
+            0 -> "Perfil Baixo — objetos até 80.000 triângulos editáveis · histórico 32 MB"
+            2 -> "Perfil Alto — objetos até 300.000 triângulos editáveis · usa mais memória"
+            else -> "Perfil Médio — objetos até 150.000 triângulos editáveis"
+        }
+        onProfilePersist?.invoke(profile)
+    }
+
+    /** MainActivity hook: copies the exported cache file to the SAF uri
+     *  (Dispatchers.IO) and deletes the temporary. */
+    var onExportFileReady: ((cachePath: String) -> Unit)? = null
+
+    /** MainActivity hook: deletes a temporary cache file. */
+    var onIoFileCleanup: ((cachePath: String) -> Unit)? = null
+
+    private var ioWatchJob: Job? = null
+    private var ioTempPath: String? = null
+
+    /** Enqueues an import job over an already-copied cache file. */
+    fun requestImport(cachePath: String, isGltf: Boolean, displayName: String) {
+        if (ioBusy) {
+            statusText = "Já existe uma operação de E/S em curso"
+            return
+        }
+        ioTempPath = cachePath
+        ioJobKind = IoJobKind.IMPORT
+        ioProgress = 0
+        statusText = "A importar…"
+        if (NativeLib.importMesh(cachePath, isGltf, displayName)) {
+            beginIoWatch()
+        } else {
+            finishIo("Falha na importação")
+        }
+    }
+
+    /** Enqueues an OBJ export job over a fresh cache file. */
+    fun requestExport(cachePath: String) {
+        if (ioBusy) {
+            statusText = "Já existe uma operação de E/S em curso"
+            return
+        }
+        ioTempPath = cachePath
+        ioJobKind = IoJobKind.EXPORT
+        statusText = "A exportar…"
+        if (NativeLib.exportObj(cachePath)) {
+            beginIoWatch()
+        } else {
+            finishIo("Falha na exportação")
+        }
+    }
+
+    /** The SAF copy URI -> cache failed before any job was enqueued
+     *  (hotfix D1/R8: a falha diz o motivo — nunca silenciosa). */
+    fun importCopyFailed() {
+        statusText = "Falha na importação: não foi possível ler o ficheiro"
+        cleanupTemp()
+    }
+
+    /** The SAF copy cache -> uri failed after a successful export. */
+    fun exportCopyFailed() {
+        statusText = "Falha na exportação"
+    }
+
+    private fun finishIo(message: String) {
+        statusText = message
+        cleanupTemp()
+    }
+
+    private fun cleanupTemp() {
+        val path = ioTempPath
+        ioTempPath = null
+        if (path != null) onIoFileCleanup?.invoke(path)
+    }
+
+    /** 400 ms polling — runs ONLY while a job is pending (ioBusy). */
+    private fun beginIoWatch() {
+        ioBusy = true
+        ioWatchJob?.cancel()
+        ioWatchJob = viewModelScope.launch {
+            while (ioBusy) {
+                delay(400)
+                // P4: keep the progress dialog alive while the job runs.
+                if (ioJobKind == IoJobKind.IMPORT) {
+                    ioProgress = NativeLib.importProgress()
+                }
+                val status = NativeLib.ioStatusConsume()
+                if (status.isNotEmpty()) handleIoStatus(status)
+            }
+        }
+    }
+
+    /** P4: user pressed Cancelar — the loaders unwind cleanly. */
+    fun cancelIoJob() {
+        if (ioJobKind == IoJobKind.IMPORT) {
+            NativeLib.cancelImport()
+            statusText = "A cancelar…"
+        }
+    }
+
+    private fun handleIoStatus(status: String) {
+        // Protocol (hotfix D1 + F4-LIMITS P1):
+        //   "<KIND>|<payload>[|<motivo PT>[|<fileVerts>|<fileTris>
+        //                |<perfil>|<editVerts>|<editTris>|<viewTris>]]"
+        // The third field is the human-readable reason produced by the
+        // native stage that failed; fields 4..9 carry the machine-readable
+        // counts/limits for the failure dialog (-1 = unknown). Missing
+        // fields = legacy message (statusText only).
+        val parts = status.split("|", limit = 9)
+        when (parts.getOrElse(0) { "" }) {
+            "IMPORT_OK" -> {
+                statusText = "Importado: ${parts.getOrElse(1) { "" }}"
+                ioBusy = false
+                cleanupTemp() // the cache copy has served its purpose
+                refresh()
+            }
+            "IMPORT_FAIL" -> {
+                val motivo = parts.getOrElse(2) { "" }
+                statusText = if (motivo.isEmpty()) "Falha na importação"
+                             else "Falha na importação: $motivo"
+                // Dialog whenever the file counts were reportable (parsed
+                // or drained). Open/parser failures keep the full reason in
+                // the status line (never a bare message, R8).
+                val fileVerts = parts.getOrNull(3)?.toLongOrNull()
+                if (fileVerts != null && fileVerts >= 0) {
+                    importIssue = ImportIssue(
+                        motivo = motivo.ifEmpty { "falha na importação" },
+                        fileVerts = fileVerts,
+                        fileTris = parts.getOrNull(4)?.toLongOrNull() ?: -1,
+                        profileName = parts.getOrElse(5) { "Médio" },
+                        editVerts = parts.getOrNull(6)?.toLongOrNull() ?: 0,
+                        editTris = parts.getOrNull(7)?.toLongOrNull() ?: 0,
+                        viewTris = parts.getOrNull(8)?.toLongOrNull() ?: 0,
+                    )
+                }
+                ioBusy = false
+                cleanupTemp()
+                refresh()
+            }
+            "EXPORT_OK" -> {
+                statusText = "Exportado"
+                ioBusy = false
+                val path = ioTempPath
+                ioTempPath = null
+                // Cache -> SAF uri copy (and temp deletion) is the
+                // MainActivity hook — the VM does no Android I/O.
+                onExportFileReady?.invoke(path ?: parts.getOrElse(1) { "" })
+            }
+            "EXPORT_FAIL" -> {
+                val motivo = parts.getOrElse(2) { "" }
+                statusText = if (motivo.isEmpty()) "Falha na exportação"
+                             else "Falha na exportação: $motivo"
+                ioBusy = false
+                cleanupTemp()
+            }
+            "PROMOTE_OK" -> {
+                statusText = "Objeto editável: ${parts.getOrElse(1) { "" }}"
+                ioBusy = false
+                refresh()
+            }
+            "PROMOTE_FAIL" -> {
+                val motivo = parts.getOrElse(2) { "" }
+                statusText = if (motivo.isEmpty()) "Falha ao tornar editável"
+                             else "Falha ao tornar editável: $motivo"
+                ioBusy = false
+                refresh()
+            }
+        }
+    }
+
+    /**
+     * F4-LIMITS (P3): "Tornar editável" for the ACTIVE read-only object.
+     * Shares the I/O polling loop (ioBusy) with import/export.
+     */
+    fun requestPromoteActive() {
+        if (ioBusy) {
+            statusText = "Já existe uma operação de E/S em curso"
+            return
+        }
+        ioJobKind = IoJobKind.PROMOTE
+        statusText = "A tornar editável…"
+        if (NativeLib.promoteActiveObject()) {
+            beginIoWatch()
+        } else {
+            statusText = "Nada para tornar editável"
+        }
+    }
+
     // ---- modeling operations ------------------------------------------------
 
     private fun runOp(action: String, onOk: (() -> Unit)? = null, op: () -> Int) {
@@ -500,22 +780,19 @@ class BloneViewModel : ViewModel() {
         // ONE atomic native read for every selection-derived UI state — the
         // Kotlin layer never derives selection state on its own.
         applySnapshot(NativeLib.selectionSnapshot())
-        // Properties readout: engine-reported name/counts/center only.
-        val idx = activeObject
-        if (idx < 0 || idx >= objectCount) {
-            propLabel = ""
-            propVerts = 0
-            propEdges = 0
-            propFaces = 0
-            propCenter = null
-        } else {
-            val base = NativeLib.objectName(idx)
-            propLabel = if (base.isNullOrEmpty()) "Objeto ${idx + 1}" else "$base ${idx + 1}"
-            val info = NativeLib.objectInfo(idx)
-            propVerts = info?.getOrNull(0) ?: 0
-            propEdges = info?.getOrNull(1) ?: 0
-            propFaces = info?.getOrNull(2) ?: 0
-            propCenter = NativeLib.objectCenter(idx)
-        }
+        // Properties readout: engine-reported name/counts/center only, keyed
+        // by the ENGINE active index synced above (hotfix D3).
+        val inRange = activeObject in 0 until objectCount
+        val readout = PropertiesReadout.compute(
+            activeObject, objectCount,
+            if (inRange) NativeLib.objectName(activeObject) else null,
+            if (inRange) NativeLib.objectInfo(activeObject) else null,
+            if (inRange) NativeLib.objectCenter(activeObject) else null,
+        )
+        propLabel = readout.label
+        propVerts = readout.verts
+        propEdges = readout.edges
+        propFaces = readout.faces
+        propCenter = readout.center
     }
 }

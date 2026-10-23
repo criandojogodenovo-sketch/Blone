@@ -50,10 +50,18 @@ uniform float uTintMix;
 // 1.0 = use the per-vertex albedo (mesh objects); 0.0 = historical base
 // color (selection overlays, whose VAOs carry no color attribute).
 uniform float uUseVertexColor;
+// 1.0 = READ-MODE flat shading (missão F4-LIMITS, P3): the face normal is
+// derived from screen-space derivatives of the world position — no normal
+// attribute and no duplicated fill buffers are needed for view-only
+// objects. dFdx/dFdy are core in ES 3.0.
+uniform float uFlatDeriv;
 out vec4 fragColor;
 void main() {
     vec3 base = mix(vec3(0.58, 0.66, 0.78), clamp(vColor, 0.0, 1.0), uUseVertexColor);
     vec3 n = normalize(vNormal);
+    if (uFlatDeriv > 0.5) {
+        n = normalize(cross(dFdx(vWorldPos), dFdy(vWorldPos)));
+    }
     vec3 l = normalize(uLightDir);
     float diff = max(dot(n, l), 0.0);
     float fill = max(dot(n, -l), 0.0);       // luz de preenchimento oposta
@@ -232,6 +240,8 @@ void Renderer::init() {
     if (gizmoPtVbo_ != 0) glDeleteBuffers(1, &gizmoPtVbo_);
     for (ObjectGpu& g : gpu_) destroyObjectGpu(g);
     gpu_.clear();
+    for (ObjectGpu& g : gpuPool_) destroyObjectGpu(g); // P7 pool teardown
+    gpuPool_.clear();
     sceneVersion_ = 0;
 
     fillProgram_ = linkProgram(kFillVertexShader, kFillFragmentShader);
@@ -246,6 +256,7 @@ void Renderer::init() {
         fillTintLoc_ = glGetUniformLocation(fillProgram_, "uTint");
         fillTintMixLoc_ = glGetUniformLocation(fillProgram_, "uTintMix");
         fillUseVColLoc_ = glGetUniformLocation(fillProgram_, "uUseVertexColor");
+        fillFlatDerivLoc_ = glGetUniformLocation(fillProgram_, "uFlatDeriv");
     }
     if (lineProgram_ != 0) {
         lineMvpLoc_ = glGetUniformLocation(lineProgram_, "uMVP");
@@ -337,8 +348,40 @@ void Renderer::destroyObjectGpu(ObjectGpu& g) {
     g = ObjectGpu{};
 }
 
+// F4-LIMITS (P7): the retired entry keeps its live GL names; the next
+// build* reuses them via glBufferData (no allocation churn on resync).
+void Renderer::retireObjectGpu(ObjectGpu& g) {
+    const bool empty = g.vao == 0 && g.wireVao == 0 && g.ptVao == 0 &&
+                       g.boxVao == 0 && g.selFaceVao == 0;
+    if (empty) {
+        g = ObjectGpu{};
+        return;
+    }
+    if (gpuPool_.size() < kGpuPoolMax) {
+        gpuPool_.push_back(g);
+        g = ObjectGpu{};
+    } else {
+        destroyObjectGpu(g); // pool full: real teardown (zeroes g)
+    }
+}
+
+void Renderer::acquireObjectGpu(ObjectGpu& g) {
+    if (!gpuPool_.empty()) {
+        g = gpuPool_.back();
+        gpuPool_.pop_back();
+    }
+}
+
 void Renderer::buildObjectGeometry(ObjectGpu& g, const SceneObject& obj) {
-    destroyObjectGpu(g);
+    retireObjectGpu(g);
+    acquireObjectGpu(g);
+    // P7: acquired entries carry live names — generate only what is missing.
+    auto genVAO = [](GLuint& id) {
+        if (id == 0) glGenVertexArrays(1, &id);
+    };
+    auto genBuf = [](GLuint& id) {
+        if (id == 0) glGenBuffers(1, &id);
+    };
 
     // Single geometric source (render == edit mesh == picking).
     renderdata::RenderData rd;
@@ -356,19 +399,38 @@ void Renderer::buildObjectGeometry(ObjectGpu& g, const SceneObject& obj) {
                          rd.fillCol[i * 3 + 2]});
     }
 
-    // Fill buffers.
-    glGenVertexArrays(1, &g.vao);
-    glGenBuffers(1, &g.vbo);
-    glGenBuffers(1, &g.ebo);
+    // Fill buffers. Index type per object (P2): 16-bit IBO when the
+    // duplicated fill vertex count allows it, uint32 otherwise (verified —
+    // a mismatched downcast falls back to uint32, never a truncated IBO).
+    genVAO(g.vao);
+    genBuf(g.vbo);
+    genBuf(g.ebo);
     glBindVertexArray(g.vao);
     glBindBuffer(GL_ARRAY_BUFFER, g.vbo);
     glBufferData(GL_ARRAY_BUFFER,
                  static_cast<GLsizeiptr>(verts.size() * sizeof(FillVertex)),
                  verts.data(), GL_STATIC_DRAW);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g.ebo);
-    glBufferData(GL_ELEMENT_ARRAY_BUFFER,
-                 static_cast<GLsizeiptr>(rd.fillIdx.size() * sizeof(uint32_t)),
-                 rd.fillIdx.data(), GL_STATIC_DRAW);
+    if (renderdata::fitsUint16Index(rd.fillVertexCount)) {
+        std::vector<uint16_t> idx16;
+        renderdata::downcastIndices16(rd.fillIdx, idx16);
+        if (idx16.size() == rd.fillIdx.size()) {
+            glBufferData(GL_ELEMENT_ARRAY_BUFFER,
+                         static_cast<GLsizeiptr>(idx16.size() * sizeof(uint16_t)),
+                         idx16.data(), GL_STATIC_DRAW);
+            g.indexType = GL_UNSIGNED_SHORT;
+        } else {
+            glBufferData(GL_ELEMENT_ARRAY_BUFFER,
+                         static_cast<GLsizeiptr>(rd.fillIdx.size() * sizeof(uint32_t)),
+                         rd.fillIdx.data(), GL_STATIC_DRAW);
+            g.indexType = GL_UNSIGNED_INT;
+        }
+    } else {
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER,
+                     static_cast<GLsizeiptr>(rd.fillIdx.size() * sizeof(uint32_t)),
+                     rd.fillIdx.data(), GL_STATIC_DRAW);
+        g.indexType = GL_UNSIGNED_INT;
+    }
     const GLsizei stride = sizeof(FillVertex);
     glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, stride, reinterpret_cast<void*>(0));
     glEnableVertexAttribArray(0);
@@ -388,8 +450,8 @@ void Renderer::buildObjectGeometry(ObjectGpu& g, const SceneObject& obj) {
         wire.push_back({rd.wirePos[i], rd.wirePos[i + 1], rd.wirePos[i + 2],
                         0.08f, 0.09f, 0.11f, 0.9f});
     }
-    glGenVertexArrays(1, &g.wireVao);
-    glGenBuffers(1, &g.wireVbo);
+    genVAO(g.wireVao);
+    genBuf(g.wireVbo);
     glBindVertexArray(g.wireVao);
     glBindBuffer(GL_ARRAY_BUFFER, g.wireVbo);
     glBufferData(GL_ARRAY_BUFFER,
@@ -405,8 +467,8 @@ void Renderer::buildObjectGeometry(ObjectGpu& g, const SceneObject& obj) {
     g.wireCount = static_cast<GLsizei>(wire.size());
 
     // Vertex points (true editable vertices).
-    glGenVertexArrays(1, &g.ptVao);
-    glGenBuffers(1, &g.ptVbo);
+    genVAO(g.ptVao);
+    genBuf(g.ptVbo);
     glBindVertexArray(g.ptVao);
     glBindBuffer(GL_ARRAY_BUFFER, g.ptVbo);
     glBufferData(GL_ARRAY_BUFFER,
@@ -420,8 +482,8 @@ void Renderer::buildObjectGeometry(ObjectGpu& g, const SceneObject& obj) {
 
     // Object-mode outline, cached in local space.
     std::vector<LineVertex> box = boxEdgesLines(rd.bounds);
-    glGenVertexArrays(1, &g.boxVao);
-    glGenBuffers(1, &g.boxVbo);
+    genVAO(g.boxVao);
+    genBuf(g.boxVbo);
     glBindVertexArray(g.boxVao);
     glBindBuffer(GL_ARRAY_BUFFER, g.boxVbo);
     glBufferData(GL_ARRAY_BUFFER,
@@ -524,14 +586,136 @@ void Renderer::buildSelectionOverlays(ObjectGpu& g, const SceneObject& obj) {
     }
 }
 
+void Renderer::buildReadGeometry(ObjectGpu& g, const SceneObject& obj) {
+    const auto* rm = obj.readMesh.get();
+    if (!rm || rm->empty()) return;
+    // Re-upload skip: the RenderMesh is immutable and shared — the buffers
+    // only change when the object's geometry identity changes (import,
+    // promotion, undo/redo swap).
+    if (g.readUploaded == static_cast<const void*>(rm) && g.indexCount > 0) {
+        return;
+    }
+    retireObjectGpu(g);
+    acquireObjectGpu(g);
+    auto genVAO = [](GLuint& id) {
+        if (id == 0) glGenVertexArrays(1, &id);
+    };
+    auto genBuf = [](GLuint& id) {
+        if (id == 0) glGenBuffers(1, &id);
+    };
+    // Read objects carry NO overlays: pooled overlay buffers are RELEASED
+    // (GPU memory stays proportional to what is actually drawn).
+    glDeleteVertexArrays(1, &g.wireVao);
+    glDeleteBuffers(1, &g.wireVbo);
+    glDeleteVertexArrays(1, &g.ptVao);
+    glDeleteBuffers(1, &g.ptVbo);
+    glDeleteVertexArrays(1, &g.selFaceVao);
+    glDeleteBuffers(1, &g.selFaceVbo);
+    glDeleteBuffers(1, &g.selFaceEbo);
+    glDeleteVertexArrays(1, &g.selEdgeVao);
+    glDeleteBuffers(1, &g.selEdgeVbo);
+    glDeleteVertexArrays(1, &g.selPtVao);
+    glDeleteBuffers(1, &g.selPtVbo);
+    g.wireVao = g.wireVbo = g.ptVao = g.ptVbo = 0;
+    g.selFaceVao = g.selFaceVbo = g.selFaceEbo = 0;
+    g.selEdgeVao = g.selEdgeVbo = g.selPtVao = g.selPtVbo = 0;
+    g.wireCount = g.ptCount = g.selFaceIndexCount = g.selEdgeCount =
+            g.selPtCount = 0;
+
+    // Same FillVertex layout as editable objects (shared upload path, P7
+    // pool compatible); the normal attribute is unused in read mode (the
+    // fragment shader derives the face normal — uFlatDeriv=1).
+    const size_t n = rm->positions.size();
+    const bool hasColors = rm->colors.size() == n;
+    std::vector<FillVertex> verts;
+    verts.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        const Vec3& p = rm->positions[i];
+        const Vec3 c = hasColors ? rm->colors[i] : Vec3{1.0f, 1.0f, 1.0f};
+        verts.push_back({p.x, p.y, p.z, 0.0f, 0.0f, 0.0f, c.x, c.y, c.z});
+    }
+
+    genVAO(g.vao);
+    genBuf(g.vbo);
+    genBuf(g.ebo);
+    glBindVertexArray(g.vao);
+    glBindBuffer(GL_ARRAY_BUFFER, g.vbo);
+    glBufferData(GL_ARRAY_BUFFER,
+                 static_cast<GLsizeiptr>(verts.size() * sizeof(FillVertex)),
+                 verts.data(), GL_STATIC_DRAW);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g.ebo);
+    // Same per-object index rule as P2 (uint16 up to 65535, uint32 above —
+    // a 1M-triangle view mesh has millions of indices).
+    if (renderdata::fitsUint16Index(n)) {
+        std::vector<uint16_t> idx16;
+        renderdata::downcastIndices16(rm->indices, idx16);
+        if (idx16.size() == rm->indices.size()) {
+            glBufferData(GL_ELEMENT_ARRAY_BUFFER,
+                         static_cast<GLsizeiptr>(idx16.size() * sizeof(uint16_t)),
+                         idx16.data(), GL_STATIC_DRAW);
+            g.indexType = GL_UNSIGNED_SHORT;
+        }
+    }
+    if (g.indexType != GL_UNSIGNED_SHORT) {
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER,
+                     static_cast<GLsizeiptr>(rm->indices.size() * sizeof(uint32_t)),
+                     rm->indices.data(), GL_STATIC_DRAW);
+        g.indexType = GL_UNSIGNED_INT;
+    }
+    const GLsizei stride = sizeof(FillVertex);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, stride, reinterpret_cast<void*>(0));
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, stride,
+                          reinterpret_cast<void*>(3 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, stride,
+                          reinterpret_cast<void*>(6 * sizeof(float)));
+    glEnableVertexAttribArray(2);
+    glBindVertexArray(0);
+    g.indexCount = static_cast<GLsizei>(rm->indices.size());
+    g.bounds = rm->bounds;
+    g.readUploaded = static_cast<const void*>(rm);
+
+    // Object-mode outline from the read bounds (same cached-local-space
+    // scheme as editable objects).
+    std::vector<LineVertex> box = boxEdgesLines(rm->bounds);
+    genVAO(g.boxVao);
+    genBuf(g.boxVbo);
+    glBindVertexArray(g.boxVao);
+    glBindBuffer(GL_ARRAY_BUFFER, g.boxVbo);
+    glBufferData(GL_ARRAY_BUFFER,
+                 static_cast<GLsizeiptr>(box.size() * sizeof(LineVertex)),
+                 box.data(), GL_STATIC_DRAW);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(LineVertex),
+                          reinterpret_cast<void*>(0));
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, sizeof(LineVertex),
+                          reinterpret_cast<void*>(3 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+    glBindVertexArray(0);
+    g.boxCount = static_cast<GLsizei>(box.size());
+}
+
 void Renderer::syncObjects(const Scene& scene) {
     if (scene.version == sceneVersion_ && gpu_.size() == scene.objects.size()) {
         return;
     }
+    // P7: shrinking the object list must RETIRE the dropped entries first —
+    // a plain resize would leak their GL names (pre-existing behaviour).
+    if (gpu_.size() > scene.objects.size()) {
+        for (size_t i = scene.objects.size(); i < gpu_.size(); ++i) {
+            retireObjectGpu(gpu_[i]);
+        }
+    }
     gpu_.resize(scene.objects.size());
     for (size_t i = 0; i < scene.objects.size(); ++i) {
-        buildObjectGeometry(gpu_[i], scene.objects[i]);
-        buildSelectionOverlays(gpu_[i], scene.objects[i]);
+        const SceneObject& obj = scene.objects[i];
+        if (!obj.editable) {
+            buildReadGeometry(gpu_[i], obj); // re-upload skip inside
+        } else {
+            buildObjectGeometry(gpu_[i], obj);
+            buildSelectionOverlays(gpu_[i], obj);
+        }
     }
     sceneVersion_ = scene.version;
 }
@@ -616,10 +800,28 @@ void Renderer::render(const OrbitCamera& camera, const Scene& scene,
     // Objects.
     for (size_t i = 0; i < scene.objects.size(); ++i) {
         const SceneObject& obj = scene.objects[i];
-        if (obj.mesh.empty()) continue;
+        // F4-LIMITS (P3): read-only objects draw from the shared RenderMesh
+        // (uFlatDeriv=1); the edit-mode overlays never exist for them.
+        const bool isRead = !obj.editable;
+        if (isRead) {
+            if (!obj.readMesh || obj.readMesh->empty()) continue;
+        } else if (obj.mesh.empty()) {
+            continue;
+        }
         const ObjectGpu& g = gpu_[i];
         const Mat4 model = Mat4::translate(obj.position.x, obj.position.y, obj.position.z);
         const Mat4 mvp = vp * model;
+
+        // F4-LIMITS (P7): frustum culling per object AABB — world bounds =
+        // local bounds translated by obj.position (SceneObject has no
+        // rotation/scale). Objects fully outside the frustum skip ALL their
+        // passes (fill, overlays, outline). The gizmo is independent (it
+        // follows the pivot, not the drawn geometry).
+        const Aabb worldBounds{
+                g.bounds.minX + obj.position.x, g.bounds.minY + obj.position.y,
+                g.bounds.minZ + obj.position.z, g.bounds.maxX + obj.position.x,
+                g.bounds.maxY + obj.position.y, g.bounds.maxZ + obj.position.z};
+        if (!aabbInFrustum(worldBounds, vp)) continue;
 
         glUseProgram(fillProgram_);
         glUniformMatrix4fv(fillMvpLoc_, 1, GL_FALSE, mvp.m);
@@ -629,6 +831,7 @@ void Renderer::render(const OrbitCamera& camera, const Scene& scene,
         glUniform3f(fillTintLoc_, 0.0f, 0.0f, 0.0f);
         glUniform1f(fillTintMixLoc_, 0.0f);
         glUniform1f(fillUseVColLoc_, 1.0f); // Fase 3: mesh albedo from vertex colors
+        glUniform1f(fillFlatDerivLoc_, isRead ? 1.0f : 0.0f);
         glBindVertexArray(g.vao);
         // Z-fighting fix: the SOLID pass is pushed slightly back in depth
         // (GL_POLYGON_OFFSET_FILL, GLES3-compatible) so the wireframe and the
@@ -637,11 +840,11 @@ void Renderer::render(const OrbitCamera& camera, const Scene& scene,
         // after the pass so nothing leaks into the overlay passes.
         glEnable(GL_POLYGON_OFFSET_FILL);
         glPolygonOffset(1.0f, 1.0f);
-        glDrawElements(GL_TRIANGLES, g.indexCount, GL_UNSIGNED_INT, nullptr);
+        glDrawElements(GL_TRIANGLES, g.indexCount, g.indexType, nullptr);
         glDisable(GL_POLYGON_OFFSET_FILL);
 
         const bool active = (static_cast<int>(i) == scene.active);
-        if (scene.editMode && active) {
+        if (scene.editMode && active && !isRead) {
             // Wireframe of the active object (depth ON, native depth — clean
             // against the offset solid pass above).
             glUseProgram(lineProgram_);
@@ -709,14 +912,19 @@ void Renderer::render(const OrbitCamera& camera, const Scene& scene,
 
     // Gizmo overlay — active object, in BOTH modes (interface reorganization:
     // DECISÃO C — whole-object gizmo in object mode):
-    //   - OBJECT mode: shown when an active object with geometry exists;
+    //   - OBJECT mode: shown when an active object with geometry exists
+    //     (editable mesh OR read-only RenderMesh — F4-LIMITS P3);
     //   - EDIT mode: ONLY when the selection is VALID (at least one alive
     //     selected element). An empty or invalidated selection draws NO
     //     gizmo, NO markers, NO highlights — the UI state matches what the
     //     renderer actually shows (stability correction).
     //   - GizmoTool::None ("Seleção") draws no gizmo and accepts no hit.
-    const bool objectModeGizmo = !scene.editMode && scene.activeObject() != nullptr &&
-                                 !scene.activeObject()->mesh.empty();
+    const bool objectModeGizmo = [&] {
+        const SceneObject* obj = scene.activeObject();
+        if (!obj || scene.editMode) return false;
+        return obj->editable ? !obj->mesh.empty()
+                             : (obj->readMesh && !obj->readMesh->empty());
+    }();
     const bool editModeGizmo = scene.editMode && sceneops::hasValidSelection(scene);
     if (gizmoTool != GizmoTool::None && (objectModeGizmo || editModeGizmo)) {
         drawGizmo(scene, vp, gizmoTool);
@@ -870,10 +1078,15 @@ Renderer::GizmoHit Renderer::gizmoHitAt(float xPx, float yPx, const Scene& scene
                                         GizmoTool tool) const {
     GizmoHit out;
     // EXACTLY the same gate as the drawing (render()): object mode gizmo for
-    // the active object, edit-mode gizmo only with a VALID selection, and
-    // GizmoTool::None never hits — no invisible/ghost handles.
-    const bool objectModeGizmo = !scene.editMode && scene.activeObject() != nullptr &&
-                                 !scene.activeObject()->mesh.empty();
+    // the active object (editable OR read-only — F4-LIMITS P3), edit-mode
+    // gizmo only with a VALID selection, and GizmoTool::None never hits —
+    // no invisible/ghost handles.
+    const bool objectModeGizmo = [&] {
+        const SceneObject* obj = scene.activeObject();
+        if (!obj || scene.editMode) return false;
+        return obj->editable ? !obj->mesh.empty()
+                             : (obj->readMesh && !obj->readMesh->empty());
+    }();
     const bool editModeGizmo = scene.editMode && sceneops::hasValidSelection(scene);
     if (tool == GizmoTool::None || !(objectModeGizmo || editModeGizmo)) return out;
 
@@ -1012,6 +1225,29 @@ Renderer::PickHit Renderer::pickAtPixel(float xPx, float yPx, const Scene& scene
     ElemId bestFace = kNull;
     for (size_t i = 0; i < scene.objects.size(); ++i) {
         const SceneObject& obj = scene.objects[i];
+        // F4-LIMITS (P3): read-only objects participate in OBJECT-mode
+        // picking (activation + move gizmo need them) via their index
+        // triples; edit mode ignores them (no editable elements).
+        if (!obj.editable) {
+            if (scene.editMode) continue;
+            if (!obj.readMesh || obj.readMesh->empty()) continue;
+            const Vec3 local = Vec3{eye_.x - obj.position.x, eye_.y - obj.position.y,
+                                    eye_.z - obj.position.z};
+            const auto& idx = obj.readMesh->indices;
+            for (size_t t = 0; t + 2 < idx.size(); t += 3) {
+                const float tt = rayTriangle(
+                        local, dir,
+                        obj.readMesh->positions[idx[t + 0]],
+                        obj.readMesh->positions[idx[t + 1]],
+                        obj.readMesh->positions[idx[t + 2]]);
+                if (tt > 0.0f && tt < bestT) {
+                    bestT = tt;
+                    bestObj = static_cast<int>(i);
+                    bestFace = kNull; // no face id space on read meshes
+                }
+            }
+            continue;
+        }
         if (obj.mesh.empty()) continue;
         const Vec3 local = Vec3{eye_.x - obj.position.x, eye_.y - obj.position.y,
                                 eye_.z - obj.position.z};
@@ -1139,6 +1375,9 @@ bool Renderer::surfaceHitAt(float xPx, float yPx, const Scene& scene,
     std::vector<ElemId> tris;
     for (size_t i = 0; i < scene.objects.size(); ++i) {
         const SceneObject& obj = scene.objects[i];
+        // F4-LIMITS (P3): the brush NEVER targets read-only objects (they
+        // accept no sculpt/paint) — skipped entirely here.
+        if (!obj.editable) continue;
         if (obj.mesh.empty()) continue;
         const Vec3 local = Vec3{eye_.x - obj.position.x, eye_.y - obj.position.y,
                                 eye_.z - obj.position.z};

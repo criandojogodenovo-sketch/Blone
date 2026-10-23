@@ -276,6 +276,107 @@ void testTransformDirectSteps() {
     CHECK(mesh.validate());
 }
 
+// ---- hotfix D4: gizmo HIT in OBJECT mode with an EMPTY component selection
+//
+// Contract (Fase 2, core/scene/GizmoPivot.h): the gizmo gate is "OBJECT mode
+// with an active object OR EDIT mode with a valid selection". In object mode
+// the component selection is empty BY DESIGN and the gizmo must draw, hit
+// and transform the WHOLE object; the message "seleção inválida" only exists
+// in EDIT mode without a valid selection.
+//
+// Device regression fixed here at the mapping level: beginGizmoDrag
+// hard-coded axis tips (handles 1..3) to the Move tool, so with Escalar
+// active every axial grab returned ErrInvalidArg ("Gizmo: seleção
+// inválida") in object mode. The JNI now maps tips to the ACTIVE tool; this
+// test pins the SceneOps sessions for EVERY (tool, kind, axis) triple the
+// JNI can produce in object mode with an empty selection.
+void testObjectModeEmptySelectionGizmoHit() {
+    History h;
+    Scene s = oneCubeScene(h);
+    s.editMode = false;                      // OBJECT mode
+    CHECK(s.objects[0].sel.empty());         // empty component selection ...
+    CHECK(!sceneops::hasValidSelection(s));  // ... and that is NOT an error
+
+    auto& mesh = s.objects[0].mesh;
+    const size_t nVerts = mesh.aliveVertexCount();
+    const auto pre = mesh.captureRaw();
+
+    sceneops::GizmoMapping map;
+    map.axisDirX = 1.0f;
+    map.axisDirY = 0.0f;
+    map.pxPerWorld = 100.0f;
+
+    // 1) Mover + axial tip (Move, kind 1, axis 0): whole object moves.
+    {
+        sceneops::ToolSession t;
+        REQUIRE(sceneops::beginTool(s, h, t, sceneops::Tool::Move, 1, 0,
+                                    500.0f, 500.0f) == ops::Status::OK);
+        CHECK(t.verts.size() == nVerts); // the WHOLE object is the target
+        REQUIRE(sceneops::updateTool(s, t, map, 550.0f, 500.0f) ==
+                ops::Status::OK);
+        CHECK_NEAR(t.accumMove.x, 0.5f, 1e-5f);
+        REQUIRE(sceneops::endTool(s, h, t) == ops::Status::OK);
+    }
+    CHECK(mesh.validate());
+    for (const auto& v : mesh.vertices()) {
+        if (!v.alive) continue;
+        CHECK_NEAR(v.pos.x, test::rawPos(pre, v.id).x + 0.5f, 1e-5f);
+    }
+
+    // 2) Escalar + axial tip (Scale, kind 1, axis 0) — the D4 regression:
+    //    this session MUST be accepted (it used to reach the JNI as a Move
+    //    request and bounce back "seleção inválida").
+    {
+        sceneops::ToolSession t;
+        REQUIRE(sceneops::beginTool(s, h, t, sceneops::Tool::Scale, 1, 0,
+                                    500.0f, 500.0f) == ops::Status::OK);
+        CHECK(t.verts.size() == nVerts);
+        REQUIRE(sceneops::updateTool(s, t, map, 600.0f, 500.0f) ==
+                ops::Status::OK);
+        CHECK_NEAR(t.accumFactor, 1.0f + 100.0f / 150.0f, 1e-5f);
+        REQUIRE(sceneops::endTool(s, h, t) == ops::Status::OK);
+        CHECK(mesh.validate());
+        CHECK(mesh.aliveVertexCount() == nVerts); // topology untouched
+    }
+    test::assertInvariants(mesh, "escalar axial modo objeto");
+
+    // 3) Escalar + center handle (Scale, kind 3, axis 3): uniform.
+    {
+        sceneops::ToolSession t;
+        REQUIRE(sceneops::beginTool(s, h, t, sceneops::Tool::Scale, 3, 3,
+                                    500.0f, 500.0f) == ops::Status::OK);
+        CHECK(t.verts.size() == nVerts);
+        REQUIRE(sceneops::updateTool(s, t, map, 500.0f, 400.0f) ==
+                ops::Status::OK); // 100 px up: factor 1.5
+        CHECK_NEAR(t.accumFactor, 1.5f, 1e-5f);
+        REQUIRE(sceneops::endTool(s, h, t) == ops::Status::OK);
+        CHECK(mesh.validate());
+    }
+
+    // 4) Rodar + ring (Rotate, kind 2, axis 2): whole object rotates.
+    {
+        sceneops::ToolSession t;
+        map.pivotScreenX = 500.0f;
+        map.pivotScreenY = 500.0f;
+        map.ringSign = 1.0f;
+        REQUIRE(sceneops::beginTool(s, h, t, sceneops::Tool::Rotate, 2, 2,
+                                    600.0f, 500.0f) == ops::Status::OK);
+        CHECK(t.verts.size() == nVerts);
+        // 90° screen sweep (same pattern as testObjectModeGizmoTransforms;
+        // a sweep segment THROUGH the pivot would be degenerate by design).
+        REQUIRE(sceneops::updateTool(s, t, map, 500.0f, 400.0f) ==
+                ops::Status::OK);
+        CHECK_NEAR(std::fabs(t.accumDeg), 90.0f, 0.5f);
+        REQUIRE(sceneops::endTool(s, h, t) == ops::Status::OK);
+        CHECK(mesh.validate());
+        CHECK(mesh.aliveVertexCount() == nVerts);
+        CHECK(mesh.aliveFaceCount() == 6);
+    }
+
+    // One committed history entry per ended drag (already true above); a
+    // second finger cancel path stays camera-only (TouchTracker contract).
+}
+
 // ---- shared pivot rule (renderer + JNI can never diverge) ------------------
 
 void testGizmoPivotRule() {
@@ -318,6 +419,7 @@ void testGizmoPivotRule() {
 namespace test {
 void runUiModeTests() {
     testObjectModeGizmoTransforms();
+    testObjectModeEmptySelectionGizmoHit(); // hotfix D4
     testModeIdentityAcrossTransitions();
     testDuplicateActiveObject();
     testTransformDirectSteps();

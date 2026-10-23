@@ -6,7 +6,9 @@
 //  - Topology operations record full mesh snapshots (before + after).
 //  - Adding/removing objects records the whole object.
 //  - Every byte is counted: usedBytes() is the exact heap held by entries.
-//  - A hard budget (default 24 MB) is enforced with a two-phase reservation:
+//  - A hard budget (per device profile, F4-LIMITS: the Kotlin UI sets it
+//    from core/io/GeometryLimits.h alongside the geometry limits) is
+//    enforced with a two-phase reservation:
 //      1. reserve(costUpperBound) — BEFORE mutating anything — evicts the
 //         oldest undo entries (and the whole redo branch) until the bound
 //         fits; if even the bound does not fit, the operation is REJECTED
@@ -16,6 +18,12 @@
 //  - Any new operation discards the redo branch (standard behaviour).
 //  - Entries are capped at kMaxEntries; memory is capped by the budget —
 //    whichever limit hits first.
+//
+// F4-LIMITS (P3): ObjectSwap — promotion of a read-only object to editable
+// replaces the WHOLE SceneObject at an index (empty half-edge + shared
+// RenderMesh  ->  built half-edge). One entry per promotion (mission
+// requirement); undo/redo swap the states, so entry bytes stay constant.
+// This is the ONLY structural addition; budget semantics are unchanged.
 
 #include "../mesh/HalfEdgeMesh.h"
 #include "../scene/Scene.h"
@@ -66,6 +74,12 @@ public:
                                    const Selection& selAfter);
     bool pushObjectAdded(uint32_t index, const SceneObject& data);
     bool pushObjectRemoved(uint32_t index, const SceneObject& data);
+    // F4-LIMITS (P3): replaces the object at `index` wholesale (promotion
+    // read-only -> editable). Stores BOTH states; undo/redo swap them, so
+    // the entry cost is constant. Reservations come from the caller as
+    // objectBytes(before) + objectBytes(after) + slack.
+    bool pushObjectSwap(uint32_t index, const SceneObject& before,
+                        const SceneObject& after);
 
     bool undo(Scene& scene);
     bool redo(Scene& scene);
@@ -73,7 +87,8 @@ public:
 
 private:
     struct Entry {
-        enum class Kind { VertDelta, ColorDelta, MeshSwap, ObjAdd, ObjRemove }
+        enum class Kind { VertDelta, ColorDelta, MeshSwap, ObjAdd, ObjRemove,
+                          ObjectSwap }
                 kind = Kind::VertDelta;
         uint32_t objIndex = 0;
         uint64_t bytes = 0;
@@ -90,6 +105,10 @@ private:
         Selection selAfter;
         // ObjAdd / ObjRemove
         SceneObject object;
+        // ObjectSwap (promotion): beforeObj and afterObj trade places on
+        // undo/redo (both states always live exactly once).
+        SceneObject beforeObj;
+        SceneObject afterObj;
     };
 
     static uint64_t meshRawBytes(const HalfEdgeMesh::Raw& r);

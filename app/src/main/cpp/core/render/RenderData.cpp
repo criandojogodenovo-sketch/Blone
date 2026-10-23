@@ -268,4 +268,20 @@ void buildSelection(const SceneObject& obj, SelectionData& out) {
     }
 }
 
+void downcastIndices16(const std::vector<uint32_t>& src,
+                       std::vector<uint16_t>& out) {
+    out.clear();
+    out.reserve(src.size());
+    for (const uint32_t idx : src) {
+        if (idx > 65535u) {
+            // Precondition violated (caller skipped fitsUint16Index): leave
+            // `out` EMPTY so the renderer's size check falls back to the
+            // uint32 path — never a silently truncated index buffer.
+            out.clear();
+            return;
+        }
+        out.push_back(static_cast<uint16_t>(idx));
+    }
+}
+
 } // namespace blone::renderdata
