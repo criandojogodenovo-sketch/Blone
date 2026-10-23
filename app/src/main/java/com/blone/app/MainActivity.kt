@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -77,6 +78,35 @@ private fun BloneRoot() {
     val resolver = LocalContext.current.contentResolver
     val context = LocalContext.current
     val pendingExportUri = remember { mutableStateOf<android.net.Uri?>(null) }
+
+    // ---- F4-LIMITS (P6): limits profile ---------------------------------
+    // Saved choice (SharedPreferences) or a RAM-appropriate default:
+    // low-RAM devices (<3 GB or isLowRamDevice) get Baixo, <6 GB Médio,
+    // the rest Alto. Applied to the engine ONCE at startup; user changes
+    // persist through the onProfilePersist hook (the VM has no context).
+    val prefs = remember { context.getSharedPreferences("blone_limits", android.content.Context.MODE_PRIVATE) }
+    val ramProfile = remember {
+        val am = context.getSystemService(android.content.Context.ACTIVITY_SERVICE)
+                as android.app.ActivityManager
+        val mem = android.app.ActivityManager.MemoryInfo()
+        am.getMemoryInfo(mem)
+        val gb = mem.totalMem / (1024.0 * 1024.0 * 1024.0)
+        when {
+            am.isLowRamDevice || gb < 3.0 -> 0
+            gb < 6.0 -> 1
+            else -> 2
+        }
+    }
+    val savedProfile = remember { prefs.getInt("limits_profile", -1) }
+    LaunchedEffect(Unit) {
+        viewModel.initLimitsProfile(if (savedProfile in 0..2) savedProfile else ramProfile)
+    }
+    DisposableEffect(viewModel) {
+        viewModel.onProfilePersist = { profile ->
+            prefs.edit().putInt("limits_profile", profile).apply()
+        }
+        onDispose { viewModel.onProfilePersist = null }
+    }
 
     // SAF: create a .bloneproj file (save) / open an existing one (open).
     val saveLauncher = rememberLauncherForActivityResult(

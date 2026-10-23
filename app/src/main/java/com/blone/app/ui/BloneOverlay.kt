@@ -758,6 +758,30 @@ private fun PropertiesPanel(viewModel: BloneViewModel, modifier: Modifier = Modi
             StepButton("÷1,25", canRotateScale) { viewModel.nudgeScale(3, 0.8f) }
         }
         Spacer(modifier = Modifier.height(8.dp))
+        // F4-LIMITS (P6): device limits profile — Baixo/Médio/Alto. The
+        // numbers live in the engine (GeometryLimits.h); this is the only
+        // control, inside the existing properties panel (zones and the
+        // 44 dp targets untouched).
+        Text("Limites de geometria", color = ChromeDim, fontSize = 11.sp)
+        Row {
+            ToolButton("Baixo", viewModel.limitsProfile == 0) {
+                viewModel.selectLimitsProfile(0)
+            }
+            ToolButton("Médio", viewModel.limitsProfile == 1) {
+                viewModel.selectLimitsProfile(1)
+            }
+            ToolButton("Alto", viewModel.limitsProfile == 2) {
+                viewModel.selectLimitsProfile(2)
+            }
+        }
+        if (viewModel.limitsProfile == 2) {
+            Text(
+                text = "Aviso: o perfil Alto usa mais memória — use num dispositivo com RAM suficiente.",
+                color = Amber,
+                fontSize = 10.sp,
+            )
+        }
+        Spacer(modifier = Modifier.height(8.dp))
         Text(
             text = "Gizmo: arraste um eixo/anel · fora dele a câmara orbita · 2 dedos = câmara",
             color = ChromeDim,

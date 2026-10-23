@@ -1265,6 +1265,31 @@ Java_com_blone_app_gl_NativeLib_cancelImport(JNIEnv* /*env*/,
     gIoProgress.requestCancel();
 }
 
+// P6: device limits profile (Baixo/Médio/Alto) — sets the runtime geometry
+// limits AND the history budget for the whole engine (one source of truth:
+// core/io/GeometryLimits.h). Mutex-guarded like every mutating entry.
+extern "C" JNIEXPORT void JNICALL
+Java_com_blone_app_gl_NativeLib_setLimitsProfile(JNIEnv* /*env*/,
+                                                 jobject /*thiz*/,
+                                                 jint profile) {
+    std::lock_guard<std::mutex> lock(gMutex);
+    if (profile < 0 || profile > 2) return;
+    const blone::io::LimitsProfile p = static_cast<blone::io::LimitsProfile>(profile);
+    blone::io::setCurrentProfile(p);
+    const blone::io::RuntimeLimits lim = blone::io::limitsFor(p);
+    gHistory.setBudget(lim.historyBytes);
+    BLONE_LOGI("perfil de limites: %s (edição %zu tris, leitura %zu tris, "
+               "histórico %llu bytes)",
+               blone::io::profileName(p), lim.editTris, lim.viewTris,
+               static_cast<unsigned long long>(lim.historyBytes));
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_blone_app_gl_NativeLib_limitsProfile(JNIEnv* /*env*/,
+                                              jobject /*thiz*/) {
+    return static_cast<jint>(blone::io::currentProfile());
+}
+
 extern "C" JNIEXPORT jint JNICALL
 Java_com_blone_app_gl_NativeLib_createPrimitive(JNIEnv* /*env*/, jobject /*thiz*/,
                                                 jint type, jint segsU, jint segsV) {

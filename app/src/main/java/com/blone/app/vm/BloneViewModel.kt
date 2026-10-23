@@ -469,6 +469,35 @@ class BloneViewModel : ViewModel() {
     var ioProgress by mutableStateOf(0)
         private set
 
+    // ---- limits profile (F4-LIMITS, P6) ---------------------------------
+    // 0 Baixo, 1 Médio (default until the Activity applies the saved choice
+    // or the RAM-appropriate one), 2 Alto. The native side is the single
+    // source of truth for the numbers (core/io/GeometryLimits.h).
+    var limitsProfile by mutableStateOf(1)
+        private set
+
+    /** MainActivity hook: persists the profile choice (SharedPreferences). */
+    var onProfilePersist: ((profile: Int) -> Unit)? = null
+
+    /** Called ONCE at startup (MainActivity): saved choice or RAM default. */
+    fun initLimitsProfile(profile: Int) {
+        val p = profile.coerceIn(0, 2)
+        limitsProfile = p
+        NativeLib.setLimitsProfile(p)
+    }
+
+    fun selectLimitsProfile(profile: Int) {
+        if (profile !in 0..2 || profile == limitsProfile) return
+        limitsProfile = profile
+        NativeLib.setLimitsProfile(profile)
+        statusText = when (profile) {
+            0 -> "Perfil Baixo — objetos até 80.000 triângulos editáveis · histórico 32 MB"
+            2 -> "Perfil Alto — objetos até 300.000 triângulos editáveis · usa mais memória"
+            else -> "Perfil Médio — objetos até 150.000 triângulos editáveis"
+        }
+        onProfilePersist?.invoke(profile)
+    }
+
     /** MainActivity hook: copies the exported cache file to the SAF uri
      *  (Dispatchers.IO) and deletes the temporary. */
     var onExportFileReady: ((cachePath: String) -> Unit)? = null

@@ -274,6 +274,17 @@ object NativeLib {
      */
     external fun cancelImport()
 
+    /**
+     * F4-LIMITS (P6): selects the device limits profile (0 Baixo, 1 Médio,
+     * 2 Alto). Sets the RUNTIME geometry limits AND the history budget.
+     * Call once at startup (saved choice or RAM-appropriate default) and on
+     * every user change.
+     */
+    external fun setLimitsProfile(profile: Int)
+
+    /** Current limits profile (0 Baixo, 1 Médio, 2 Alto; default Médio). */
+    external fun limitsProfile(): Int
+
     // History.
     external fun canUndo(): Boolean
     external fun canRedo(): Boolean
