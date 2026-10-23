@@ -62,4 +62,22 @@ struct SelectionData {
 };
 void buildSelection(const SceneObject& obj, SelectionData& out);
 
+// ---- index type choice (missão F4-LIMITS, P2) -------------------------------
+//
+// The renderer ALWAYS had a 32-bit index path (GL_UNSIGNED_INT — native in
+// ES 3.0), so meshes beyond 65.535 duplicated vertices draw correctly. P2
+// adds the per-object choice: objects whose fill buffer stays within 16-bit
+// indices upload a HALF-SIZE IBO (memory/bandwidth), everything else keeps
+// uint32. Pure helpers so the host tests pin the decision and the
+// conversion without a GL context.
+
+inline bool fitsUint16Index(size_t vertexCount) {
+    return vertexCount <= 65535u;
+}
+
+// Downcasts the fill indices (values already verified < 65536). Debug-
+// checked so a misuse above the threshold cannot pass silently.
+void downcastIndices16(const std::vector<uint32_t>& src,
+                       std::vector<uint16_t>& out);
+
 } // namespace blone::renderdata

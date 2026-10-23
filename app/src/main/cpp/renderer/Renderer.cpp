@@ -356,7 +356,9 @@ void Renderer::buildObjectGeometry(ObjectGpu& g, const SceneObject& obj) {
                          rd.fillCol[i * 3 + 2]});
     }
 
-    // Fill buffers.
+    // Fill buffers. Index type per object (P2): 16-bit IBO when the
+    // duplicated fill vertex count allows it, uint32 otherwise (verified —
+    // a mismatched downcast falls back to uint32, never a truncated IBO).
     glGenVertexArrays(1, &g.vao);
     glGenBuffers(1, &g.vbo);
     glGenBuffers(1, &g.ebo);
@@ -366,9 +368,26 @@ void Renderer::buildObjectGeometry(ObjectGpu& g, const SceneObject& obj) {
                  static_cast<GLsizeiptr>(verts.size() * sizeof(FillVertex)),
                  verts.data(), GL_STATIC_DRAW);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g.ebo);
-    glBufferData(GL_ELEMENT_ARRAY_BUFFER,
-                 static_cast<GLsizeiptr>(rd.fillIdx.size() * sizeof(uint32_t)),
-                 rd.fillIdx.data(), GL_STATIC_DRAW);
+    if (renderdata::fitsUint16Index(rd.fillVertexCount)) {
+        std::vector<uint16_t> idx16;
+        renderdata::downcastIndices16(rd.fillIdx, idx16);
+        if (idx16.size() == rd.fillIdx.size()) {
+            glBufferData(GL_ELEMENT_ARRAY_BUFFER,
+                         static_cast<GLsizeiptr>(idx16.size() * sizeof(uint16_t)),
+                         idx16.data(), GL_STATIC_DRAW);
+            g.indexType = GL_UNSIGNED_SHORT;
+        } else {
+            glBufferData(GL_ELEMENT_ARRAY_BUFFER,
+                         static_cast<GLsizeiptr>(rd.fillIdx.size() * sizeof(uint32_t)),
+                         rd.fillIdx.data(), GL_STATIC_DRAW);
+            g.indexType = GL_UNSIGNED_INT;
+        }
+    } else {
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER,
+                     static_cast<GLsizeiptr>(rd.fillIdx.size() * sizeof(uint32_t)),
+                     rd.fillIdx.data(), GL_STATIC_DRAW);
+        g.indexType = GL_UNSIGNED_INT;
+    }
     const GLsizei stride = sizeof(FillVertex);
     glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, stride, reinterpret_cast<void*>(0));
     glEnableVertexAttribArray(0);
@@ -637,7 +656,7 @@ void Renderer::render(const OrbitCamera& camera, const Scene& scene,
         // after the pass so nothing leaks into the overlay passes.
         glEnable(GL_POLYGON_OFFSET_FILL);
         glPolygonOffset(1.0f, 1.0f);
-        glDrawElements(GL_TRIANGLES, g.indexCount, GL_UNSIGNED_INT, nullptr);
+        glDrawElements(GL_TRIANGLES, g.indexCount, g.indexType, nullptr);
         glDisable(GL_POLYGON_OFFSET_FILL);
 
         const bool active = (static_cast<int>(i) == scene.active);

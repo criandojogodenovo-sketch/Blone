@@ -117,6 +117,11 @@ private:
     struct ObjectGpu {
         GLuint vao = 0, vbo = 0, ebo = 0;
         GLsizei indexCount = 0;
+        // Per-object index type (missão F4-LIMITS, P2): GL_UNSIGNED_SHORT
+        // when the fill buffer fits 16-bit indices (half-size IBO),
+        // GL_UNSIGNED_INT otherwise (70k+ vertex meshes keep the uint32
+        // path — native in ES 3.0, verified against the old behaviour).
+        GLenum indexType = GL_UNSIGNED_INT;
         GLuint wireVao = 0, wireVbo = 0;
         GLsizei wireCount = 0;
         GLuint ptVao = 0, ptVbo = 0;
