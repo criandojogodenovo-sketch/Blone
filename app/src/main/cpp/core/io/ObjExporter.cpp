@@ -70,6 +70,9 @@ bool ObjExporter::exportScene(const Scene& scene, const std::string& path) {
     // ---- pass A: unique world-space positions (scene-wide dedup) --------
     // MARK (Fase 5 extension point): when SceneObject gains rotation/scale,
     // the full transform is applied HERE — world = T * R * S * local.
+    // F4-LIMITS (P5): READ-ONLY objects export from their RenderMesh (each
+    // index triple is one triangle face); editable objects keep the exact
+    // polygonal export. Both share the same scene-wide dedup space.
     std::vector<Vec3> worldPos;
     std::vector<Vec3> colorOfPos;   // paint color of the first source vertex
     std::vector<uint32_t> ownerOfPos; // first object that used the position
@@ -80,7 +83,11 @@ bool ObjExporter::exportScene(const Scene& scene, const std::string& path) {
 
     size_t totalFaces = 0;
     for (const SceneObject& obj : scene.objects) {
-        totalFaces += obj.mesh.aliveFaceCount();
+        if (!obj.editable && obj.readMesh) {
+            totalFaces += obj.readMesh->triangleCount;
+        } else {
+            totalFaces += obj.mesh.aliveFaceCount();
+        }
     }
     if (totalFaces == 0 || totalFaces > MeshLimits::maxFaces) return false;
     worldPos.reserve(totalFaces * 4);
@@ -89,6 +96,49 @@ bool ObjExporter::exportScene(const Scene& scene, const std::string& path) {
 
     for (size_t oi = 0; oi < scene.objects.size(); ++oi) {
         const SceneObject& obj = scene.objects[oi];
+        if (!obj.editable && obj.readMesh) {
+            // ---- READ-ONLY path: triangles straight from the RenderMesh.
+            const auto& rm = *obj.readMesh;
+            if (rm.empty()) continue;
+            std::vector<std::vector<uint32_t>>& objFaces = facesOfObject[oi];
+            objFaces.reserve(rm.triangleCount);
+            auto emitPos = [&](const Vec3& local, const Vec3& color) -> uint32_t {
+                const Vec3 world{local.x + obj.position.x,
+                                 local.y + obj.position.y,
+                                 local.z + obj.position.z};
+                auto it = posIndex.find(PosKey{world.x, world.y, world.z});
+                if (it == posIndex.end()) {
+                    const uint32_t id = static_cast<uint32_t>(worldPos.size());
+                    worldPos.push_back(world);
+                    colorOfPos.push_back(color);
+                    ownerOfPos.push_back(static_cast<uint32_t>(oi));
+                    it = posIndex.emplace(PosKey{world.x, world.y, world.z}, id)
+                                 .first;
+                }
+                return it->second;
+            };
+            const bool hasColors = rm.colors.size() == rm.positions.size();
+            for (size_t t = 0; t + 2 < rm.indices.size(); t += 3) {
+                const uint32_t ia = rm.indices[t];
+                const uint32_t ib = rm.indices[t + 1];
+                const uint32_t ic = rm.indices[t + 2];
+                if (ia >= rm.positions.size() || ib >= rm.positions.size() ||
+                    ic >= rm.positions.size()) {
+                    continue; // defensive (buildRenderMesh guarantees)
+                }
+                const uint32_t pa = emitPos(rm.positions[ia],
+                                            hasColors ? rm.colors[ia]
+                                                      : Vec3{1.0f, 1.0f, 1.0f});
+                const uint32_t pb = emitPos(rm.positions[ib],
+                                            hasColors ? rm.colors[ib]
+                                                      : Vec3{1.0f, 1.0f, 1.0f});
+                const uint32_t pc = emitPos(rm.positions[ic],
+                                            hasColors ? rm.colors[ic]
+                                                      : Vec3{1.0f, 1.0f, 1.0f});
+                objFaces.push_back({pa, pb, pc});
+            }
+            continue;
+        }
         if (obj.mesh.empty()) continue;
         std::vector<std::vector<uint32_t>>& objFaces = facesOfObject[oi];
         objFaces.reserve(obj.mesh.aliveFaceCount());

@@ -571,11 +571,12 @@ void testPersistenceV2RoundTrip() {
     const std::vector<uint8_t> bytes = project::save(sc);
     CHECK(!bytes.empty());
     CHECK(bytes.size() > 24);
-    // The saved header must advertise formatVersion 2.
+    // The saved header must advertise the CURRENT format version
+    // (F4-LIMITS P5: v3 — per-object editable flag).
     uint32_t savedVersion = 0;
     std::memcpy(&savedVersion, bytes.data() + 8, 4);
     CHECK(savedVersion == project::kFormatVersion);
-    CHECK(savedVersion == 2u);
+    CHECK(savedVersion == 3u);
 
     Scene loaded;
     REQUIRE(project::load(bytes, loaded) == project::Ok);
@@ -713,11 +714,12 @@ void testV1FileCompatibility() {
                                      m.vrt(1).pos, Vec3{0, 1, 0}, s) ==
           ops::Status::OK);
     CHECK(sceneops::endBrushStroke(loaded, h, b) == ops::Status::OK);
-    const std::vector<uint8_t> v2 = project::save(loaded);
-    CHECK(!v2.empty());
+    const std::vector<uint8_t> v3 = project::save(loaded);
+    CHECK(!v3.empty());
     uint32_t version = 0;
-    std::memcpy(&version, v2.data() + 8, 4);
-    CHECK(version == 2u);
+    std::memcpy(&version, v3.data() + 8, 4);
+    // F4-LIMITS P5: the writer emits the CURRENT version (3).
+    CHECK(version == 3u);
 }
 
 // -------------------------------------------------------- budget + misc --
