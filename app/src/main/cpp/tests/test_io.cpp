@@ -2,7 +2,11 @@
 // Contracts pinned here are documented in core/io/*.h.
 #include "test_util.h"
 
+#include <sys/stat.h> // mkdir (D5 subpath fixture; host-only suite)
+#include <unistd.h>   // rmdir
+
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -318,6 +322,136 @@ void testGltfEmbeddedDataUriFixture() {
     std::remove(badObj.c_str());
 }
 
+// ---------------------------------------------------------------- 4d ------
+// Hotfix D5: .gltf with EXTERNAL .bin buffers — the two-step import flow.
+// The device failure: SAF copies only the .gltf to the cache; the .bin
+// sibling stays in Downloads and cgltf_load_buffers fails with a generic
+// "buffers não carregados". Now the loader reports the missing BASE names
+// (percent-decoded) so the Kotlin layer can ask for the folder that
+// contains them (IMPORT_NEEDS_FILES + retryLastImport).
+void writeD5Gltf(const char* path, const char* bufferUri) {
+    std::ofstream out(path, std::ios::binary);
+    REQUIRE(out.good());
+    out << "{\n"
+           "  \"asset\": {\"version\": \"2.0\"},\n"
+           "  \"scene\": 0,\n"
+           "  \"scenes\": [{\"nodes\": [0]}],\n"
+           "  \"nodes\": [{\"mesh\": 0}],\n"
+           "  \"meshes\": [{\"primitives\": [{\"attributes\": {\"POSITION\": 1},"
+           " \"indices\": 0, \"mode\": 4}]}],\n"
+           "  \"buffers\": [{\"uri\": \"" << bufferUri
+        << "\", \"byteLength\": 168}],\n"
+           "  \"bufferViews\": [\n"
+           "    {\"buffer\": 0, \"byteOffset\": 0, \"byteLength\": 72,"
+           " \"target\": 34963},\n"
+           "    {\"buffer\": 0, \"byteOffset\": 72, \"byteLength\": 96,"
+           " \"target\": 34962}],\n"
+           "  \"accessors\": [\n"
+           "    {\"bufferView\": 0, \"componentType\": 5123, \"count\": 36,"
+           " \"type\": \"SCALAR\"},\n"
+           "    {\"bufferView\": 1, \"componentType\": 5126, \"count\": 8,"
+           " \"type\": \"VEC3\", \"min\": [-1, -1, -1], \"max\": [1, 1, 1]}]\n"
+           "}\n";
+}
+
+void writeD5Bin(const char* path) {
+    static const uint16_t idx[36] = {
+            0, 1, 2, 0, 2, 3,   1, 5, 6, 1, 6, 2,   5, 4, 7, 5, 7, 6,
+            4, 0, 3, 4, 3, 7,   3, 2, 6, 3, 6, 7,   4, 5, 1, 4, 1, 0};
+    static const float pos[24] = {-1, -1, 1, 1, -1, 1, 1, 1, 1, -1, 1, 1,
+                                  -1, -1, -1, 1, -1, -1, 1, 1, -1, -1, 1, -1};
+    std::ofstream out(path, std::ios::binary);
+    REQUIRE(out.good());
+    out.write(reinterpret_cast<const char*>(idx), sizeof(idx));
+    out.write(reinterpret_cast<const char*>(pos), sizeof(pos));
+}
+
+void testGltfExternalBuffersTwoStep() {
+    const std::string doc = "blone_test_d5_model.gltf";
+    const std::string bin = "cube_ext.bin";
+
+    // (b) WITHOUT the .bin: nullopt + the EXACT base name in the list + a
+    // PT reason (R8). This is the payload the IMPORT_NEEDS_FILES protocol
+    // carries to Kotlin.
+    writeD5Gltf(doc.c_str(), "cube_ext.bin");
+    {
+        std::string err;
+        std::vector<std::string> missing;
+        const auto raw = blone::io::GltfLoader::load(doc, &err, nullptr, &missing);
+        CHECK(!raw.has_value());
+        REQUIRE(missing.size() == 1);
+        CHECK(missing[0] == "cube_ext.bin"); // nome exato (missão D5)
+        CHECK(!err.empty());                 // motivo PT presente
+    }
+
+    // (a)+(c) the Kotlin flow copied the .bin next to the cached document
+    // ("a MESMA dir de cache do .gltf") and re-fired the import: OK, the
+    // missing list stays EMPTY on success and the geometry is complete.
+    writeD5Bin(bin.c_str());
+    {
+        std::string err;
+        std::vector<std::string> missing;
+        const auto raw = blone::io::GltfLoader::load(doc, &err, nullptr, &missing);
+        REQUIRE(raw.has_value());
+        CHECK(missing.empty());
+        CHECK(err.empty()); // success => NO error text (D1 err contract)
+        CHECK(raw->positions.size() == 8);
+        CHECK(raw->faceIndices.size() == 12);
+        auto mesh = MeshBuilder::build(*raw, &err);
+        REQUIRE(mesh.has_value());
+        CHECK(mesh->validate());
+        CHECK(mesh->aliveFaceCount() == 12);
+    }
+
+    // (d) percent-decode + subpath: uri "sub%20dir/my%20buffer.bin" — the
+    // MISSING report carries the DECODED BASE name (what the user's folder
+    // contains and what Kotlin must copy); cgltf decodes the uri on the
+    // file path, so once the decoded file exists the import succeeds.
+    const std::string doc2 = "blone_test_d5_model2.gltf";
+    writeD5Gltf(doc2.c_str(), "sub%20dir/my%20buffer.bin");
+    {
+        std::string err;
+        std::vector<std::string> missing;
+        CHECK(!blone::io::GltfLoader::load(doc2, &err, nullptr, &missing)
+                   .has_value());
+        REQUIRE(missing.size() == 1);
+        CHECK(missing[0] == "my buffer.bin"); // decodificado, só o nome-base
+    }
+    mkdir("sub dir", 0777);
+    writeD5Bin("sub dir/my buffer.bin");
+    {
+        std::string err;
+        std::vector<std::string> missing;
+        const auto raw = blone::io::GltfLoader::load(doc2, &err, nullptr, &missing);
+        REQUIRE(raw.has_value());
+        CHECK(missing.empty());
+        CHECK(raw->positions.size() == 8);
+    }
+
+    // GLB / data-URI documents NEVER take the missing-files path (the
+    // mission: they keep working without any dialog).
+    {
+        std::string err;
+        std::vector<std::string> missing;
+        const auto raw = blone::io::GltfLoader::load(
+                std::string(BLONE_TEST_DATA_DIR) + "/cube_embedded.gltf", &err,
+                nullptr, &missing);
+        REQUIRE(raw.has_value());
+        CHECK(missing.empty());
+        const auto glb = blone::io::GltfLoader::load(
+                std::string(BLONE_TEST_DATA_DIR) + "/cube.glb", &err, nullptr,
+                &missing);
+        REQUIRE(glb.has_value());
+        CHECK(missing.empty());
+    }
+
+    std::remove(doc.c_str());
+    std::remove(bin.c_str());
+    std::remove(doc2.c_str());
+    std::remove("sub dir/my buffer.bin");
+    rmdir("sub dir");
+}
+
 // ---------------------------------------------------------------- 5 -------
 void testImportHistoryUndoRedo() {
     History h;
@@ -624,6 +758,7 @@ void runIoTests() {
     testGlbFixtureImport();
     testObjRealFileCrlfGroupsNegatives();   // hotfix D1
     testGltfEmbeddedDataUriFixture();       // hotfix D1
+    testGltfExternalBuffersTwoStep();       // hotfix D5
     testImportHistoryUndoRedo();
     testRawAboveLimitsRejected();
     testFormatCountAndClassify();           // F4-LIMITS P1

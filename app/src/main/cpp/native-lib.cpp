@@ -791,21 +791,25 @@ static std::string sanitizeImportName(const char* raw) {
     return out;
 }
 
-extern "C" JNIEXPORT jboolean JNICALL
-Java_com_blone_app_gl_NativeLib_importMesh(JNIEnv* env, jobject /*thiz*/,
-                                           jstring path, jboolean isGltf,
-                                           jstring name) {
-    const char* pathChars = env->GetStringUTFChars(path, nullptr);
-    if (!pathChars) return JNI_FALSE;
-    const std::string filePath(pathChars);
-    env->ReleaseStringUTFChars(path, pathChars);
-    const char* nameChars = env->GetStringUTFChars(name, nullptr);
-    if (!nameChars) return JNI_FALSE;
-    const std::string displayName = sanitizeImportName(nameChars);
-    env->ReleaseStringUTFChars(name, nameChars);
+// D5 (hotfix 2): the LAST import specification for retryLastImport — the
+// two-step flow for .gltf files with external .bin buffers. The Kotlin layer
+// copies the missing files next to the cached document and re-fires the SAME
+// import (path/name/route) without a new SAF round-trip. Guarded by
+// gIoMutex (written by the JNI entry points, read by the retry).
+struct LastImportSpec {
+    std::string path;
+    std::string name;
+    bool isGltf = false;
+    bool valid = false;
+};
+LastImportSpec gLastImport;
 
-    if (filePath.empty()) return JNI_FALSE;
-
+// Enqueues the import worker (shared by importMesh and retryLastImport —
+// D5). Kotlin resolves SAF to real file paths BEFORE calling; the entry
+// points only VALIDATE arguments and enqueue a worker — they never parse,
+// build or write inline (no disk I/O on the GL/UI threads, Regra 3).
+bool enqueueImportWorker(const std::string& filePath, bool isGltf,
+                         const std::string& displayName) {
     pruneFinishedFutures();
     std::lock_guard<std::mutex> lock(gIoMutex);
     auto importWorker = [filePath, isGltf, displayName]() {
@@ -846,18 +850,47 @@ Java_com_blone_app_gl_NativeLib_importMesh(JNIEnv* env, jobject /*thiz*/,
 
                                         // Stage (c): parser with the PT error
                                         // code (reason flows to the toast).
+                                        // D5 (hotfix 2): the glTF route also
+                                        // collects the MISSING EXTERNAL
+                                        // buffer names (buffers não
+                                        // copiados pelo SAF).
                                         std::string err;
+                                        std::vector<std::string> missingFiles;
                                         std::optional<blone::io::RawMeshData>
                                                 raw = isGltf == JNI_TRUE
                                                           ? blone::io::GltfLoader::load(
                                                                   filePath, &err,
-                                                                  &gIoProgress)
+                                                                  &gIoProgress,
+                                                                  &missingFiles)
                                                           : blone::io::ObjLoader::load(
                                                                   filePath, &err,
                                                                   &gIoProgress);
                                         if (!raw) {
                                             if (err.empty()) {
                                                 err = "formato não reconhecido";
+                                            }
+                                            if (!missingFiles.empty()) {
+                                                // IMPORT_NEEDS_FILES|nome1;nome2|motivo
+                                                // (D5): the two-step import —
+                                                // the Kotlin layer asks for the
+                                                // folder that contains them and
+                                                // re-fires retryLastImport.
+                                                std::string list;
+                                                for (size_t i = 0;
+                                                     i < missingFiles.size();
+                                                     ++i) {
+                                                    if (i > 0) list += ";";
+                                                    list += missingFiles[i];
+                                                }
+                                                BLONE_IOE("import '%s': (c) "
+                                                          "buffers externos "
+                                                          "em falta: %s",
+                                                          filePath.c_str(),
+                                                          list.c_str());
+                                                setIoStatus(
+                                                        "IMPORT_NEEDS_FILES|" +
+                                                        list + "|" + err);
+                                                return;
                                             }
                                             BLONE_IOE("import '%s': (c) parser "
                                                       "falhou: %s",
@@ -1092,7 +1125,55 @@ Java_com_blone_app_gl_NativeLib_importMesh(JNIEnv* env, jobject /*thiz*/,
                                                             currentProfile()));
                                         }
                                     }));
-    return JNI_TRUE;
+    return true;
+}
+
+// Fase 4 import entry point (D5: stores the retry spec, then enqueues the
+// SAME shared worker as retryLastImport).
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_blone_app_gl_NativeLib_importMesh(JNIEnv* env, jobject /*thiz*/,
+                                           jstring path, jboolean isGltf,
+                                           jstring name) {
+    const char* pathChars = env->GetStringUTFChars(path, nullptr);
+    if (!pathChars) return JNI_FALSE;
+    const std::string filePath(pathChars);
+    env->ReleaseStringUTFChars(path, pathChars);
+    const char* nameChars = env->GetStringUTFChars(name, nullptr);
+    if (!nameChars) return JNI_FALSE;
+    const std::string displayName = sanitizeImportName(nameChars);
+    env->ReleaseStringUTFChars(name, nameChars);
+
+    if (filePath.empty()) return JNI_FALSE;
+
+    {
+        std::lock_guard<std::mutex> lock(gIoMutex);
+        gLastImport = LastImportSpec{filePath, displayName,
+                                     isGltf == JNI_TRUE, true};
+    }
+    return enqueueImportWorker(filePath, isGltf == JNI_TRUE, displayName)
+                   ? JNI_TRUE
+                   : JNI_FALSE;
+}
+
+// D5 (hotfix 2): re-fires the LAST import (same path/name/route) after the
+// Kotlin layer copied the missing external buffers next to the cached
+// document. True = a worker was enqueued (watch ioStatusConsume again).
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_blone_app_gl_NativeLib_retryLastImport(JNIEnv* /*env*/,
+                                                jobject /*thiz*/) {
+    std::string path;
+    std::string name;
+    bool isGltf = false;
+    {
+        std::lock_guard<std::mutex> lock(gIoMutex);
+        if (!gLastImport.valid) return JNI_FALSE;
+        path = gLastImport.path;
+        name = gLastImport.name;
+        isGltf = gLastImport.isGltf;
+    }
+    BLONE_IOI("retry: re-dispara a importação de '%s' (%s)", path.c_str(),
+              isGltf ? "glTF/GLB" : "OBJ");
+    return enqueueImportWorker(path, isGltf, name) ? JNI_TRUE : JNI_FALSE;
 }
 
 extern "C" JNIEXPORT jboolean JNICALL

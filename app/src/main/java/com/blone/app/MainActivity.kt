@@ -225,6 +225,60 @@ private fun BloneRoot() {
             }
         }
     }
+
+    // ---- Hotfix D5: buffers externos de um .gltf ---------------------------
+    // O SAF copia só o .gltf para a cache; o .bin irmão fica em Downloads e
+    // o cgltf_load_buffers falha. O motor devolve IMPORT_NEEDS_FILES com os
+    // nomes-base; este launcher pede a PASTA que os contém, copia cada um
+    // (DocumentFile.findFile) para a MESMA pasta de cache do .gltf e re-
+    // dispara a importação com NativeLib.retryLastImport().
+    val folderLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocumentTree()
+    ) { uri ->
+        val needed = viewModel.needsFiles?.files.orEmpty()
+        if (uri == null) {
+            // Picker cancelado — o fluxo termina com motivo claro (R8).
+            if (viewModel.needsFiles != null) viewModel.cancelNeedsFiles()
+            return@rememberLauncherForActivityResult
+        }
+        scope.launch(Dispatchers.IO) {
+            val copied = mutableListOf<String>()
+            var all = needed.isNotEmpty()
+            val tree = try {
+                androidx.documentfile.provider.DocumentFile.fromTreeUri(context, uri)
+            } catch (_: Exception) {
+                null
+            }
+            for (name in needed) {
+                val doc = try {
+                    tree?.findFile(name)
+                } catch (_: Exception) {
+                    null
+                }
+                if (doc == null || !doc.canRead()) {
+                    all = false
+                    break
+                }
+                val out = java.io.File(context.cacheDir, name)
+                val ok = try {
+                    resolver.openInputStream(doc.uri)?.use { input ->
+                        out.outputStream().use { output -> input.copyTo(output) }
+                        true
+                    } ?: false
+                } catch (e: Exception) {
+                    android.util.Log.w("BloneIO", "(D5) cópia de '$name' falhou: ${e.message}")
+                    false
+                }
+                if (!ok) {
+                    all = false
+                    break
+                }
+                copied.add(out.absolutePath)
+                android.util.Log.i("BloneIO", "(D5) buffer externo copiado: '$name' (${out.length()} bytes)")
+            }
+            withContext(Dispatchers.Main) { viewModel.onExternalFilesCopied(all, copied) }
+        }
+    }
     // I/O hooks: the VM owns polling + messages; MainActivity owns SAF I/O.
     DisposableEffect(viewModel) {
         viewModel.onExportFileReady = { cachePath ->
@@ -248,9 +302,19 @@ private fun BloneRoot() {
         viewModel.onIoFileCleanup = { cachePath ->
             scope.launch(Dispatchers.IO) { java.io.File(cachePath).delete() }
         }
+        // Hotfix D5: the NEEDS_FILES dialog asks the VM; the VM asks us to
+        // open the system folder picker (the Activity owns the launcher).
+        viewModel.onPickExternalFolder = {
+            try {
+                folderLauncher.launch(null)
+            } catch (_: Exception) {
+                viewModel.cancelNeedsFiles()
+            }
+        }
         onDispose {
             viewModel.onExportFileReady = null
             viewModel.onIoFileCleanup = null
+            viewModel.onPickExternalFolder = null
         }
     }
 

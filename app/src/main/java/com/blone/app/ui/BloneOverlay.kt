@@ -240,6 +240,58 @@ private fun ImportIssueDialog(viewModel: BloneViewModel) {
 }
 
 /**
+ * Hotfix D5: the two-step import for .gltf files with EXTERNAL buffers.
+ * The engine reports IMPORT_NEEDS_FILES with the missing base names; this
+ * dialog asks for the folder that contains them (mission wording), shows
+ * the complete PT reason (D6 — multi-line, scrollable, never truncated)
+ * and hands over to the system folder picker. Cancel ends the flow with a
+ * clear reason (nothing was imported).
+ */
+@Composable
+private fun NeedsFilesDialog(viewModel: BloneViewModel) {
+    val needs = viewModel.needsFiles ?: return
+    AlertDialog(
+        onDismissRequest = { viewModel.cancelNeedsFiles() },
+        containerColor = ChromeSolid,
+        titleContentColor = ChromeFg,
+        textContentColor = ChromeFg,
+        title = { Text("Ficheiros externos em falta", fontSize = 16.sp, fontWeight = FontWeight.Bold) },
+        text = {
+            Column(
+                modifier = Modifier
+                    .verticalScroll(rememberScrollState())
+            ) {
+                Text(
+                    text = "Este modelo referencia ficheiros externos: " +
+                        needs.files.joinToString(", ") +
+                        ". Escolhe a pasta que os contém.",
+                    color = ChromeFg,
+                    fontSize = 12.sp,
+                )
+                if (needs.motivo.isNotEmpty()) {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text = needs.motivo,
+                        color = ChromeDim,
+                        fontSize = 11.sp,
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { viewModel.requestNeedsFilesFolder() }) {
+                Text("Escolher pasta", color = Accent)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = { viewModel.cancelNeedsFiles() }) {
+                Text("Cancelar", color = Danger)
+            }
+        },
+    )
+}
+
+/**
  * Import progress dialog (missão F4-LIMITS, P4): atomic 0..1000 from the
  * engine shown as a percentage + bar, with a REAL Cancel button — the
  * loaders unwind cleanly (all-or-nothing) and report "cancelada".
@@ -485,6 +537,7 @@ fun BloneOverlay(
 
         // Multi-line import-failure dialog (F4-LIMITS, P1) — above everything.
         ImportIssueDialog(viewModel)
+        NeedsFilesDialog(viewModel) // hotfix D5: buffers externos do .gltf
         // Import progress + real cancel (F4-LIMITS, P4).
         ImportProgressDialog(viewModel)
     }

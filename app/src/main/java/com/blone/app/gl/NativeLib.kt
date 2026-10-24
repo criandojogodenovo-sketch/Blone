@@ -244,6 +244,15 @@ object NativeLib {
      */
     external fun importMesh(path: String, isGltf: Boolean, name: String): Boolean
 
+    /**
+     * Hotfix D5: re-fires the LAST import (same path/name/route — the
+     * native side keeps the spec). Used by the two-step flow for .gltf
+     * files with external .bin buffers: after Kotlin copies the missing
+     * files next to the cached document, this re-runs the import without a
+     * new SAF round-trip. True = job accepted; watch [ioStatusConsume].
+     */
+    external fun retryLastImport(): Boolean
+
     /** Enqueues an OBJ export of the whole scene. True = job accepted. */
     external fun exportObj(path: String): Boolean
 

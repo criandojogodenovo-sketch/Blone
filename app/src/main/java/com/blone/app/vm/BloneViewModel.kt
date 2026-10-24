@@ -113,6 +113,25 @@ class BloneViewModel : ViewModel() {
         importIssue = null
     }
 
+    /**
+     * Hotfix D5: a .gltf importada refere buffers externos (.bin) que não
+     * vieram com ela — o motor devolveu IMPORT_NEEDS_FILES. O diálogo pede a
+     * pasta que os contém; a MainActivity copia-os para a MESMA pasta de
+     * cache do .gltf e o import é re-disparado (NativeLib.retryLastImport).
+     * O ficheiro .gltf em cache TEM de sobreviver: em NEEDS_FILES não há
+     * cleanupTemp — ele é limpo no desfecho final (OK, falha ou cancelamento).
+     */
+    data class NeedsExternalFiles(
+        val files: List<String>,
+        val motivo: String,
+    )
+
+    var needsFiles by mutableStateOf<NeedsExternalFiles?>(null)
+        private set
+
+    /** MainActivity hook: opens the system folder picker (OpenDocumentTree). */
+    var onPickExternalFolder: (() -> Unit)? = null
+
     val camera = CameraState()
 
     /** Real measured FPS text, updated from the render thread. */
@@ -515,6 +534,9 @@ class BloneViewModel : ViewModel() {
     private var ioWatchJob: Job? = null
     private var ioTempPath: String? = null
 
+    /** D5: cache copies of the external buffers — cleaned with the temp. */
+    private var externalTempPaths: List<String> = emptyList()
+
     /** Enqueues an import job over an already-copied cache file. */
     fun requestImport(cachePath: String, isGltf: Boolean, displayName: String) {
         if (ioBusy) {
@@ -568,7 +590,10 @@ class BloneViewModel : ViewModel() {
     private fun cleanupTemp() {
         val path = ioTempPath
         ioTempPath = null
+        val extras = externalTempPaths
+        externalTempPaths = emptyList()
         if (path != null) onIoFileCleanup?.invoke(path)
+        for (extra in extras) onIoFileCleanup?.invoke(extra)
     }
 
     /** 400 ms polling — runs ONLY while a job is pending (ioBusy). */
@@ -597,72 +622,132 @@ class BloneViewModel : ViewModel() {
     }
 
     private fun handleIoStatus(status: String) {
-        // Protocol (hotfix D1 + F4-LIMITS P1):
-        //   "<KIND>|<payload>[|<motivo PT>[|<fileVerts>|<fileTris>
-        //                |<perfil>|<editVerts>|<editTris>|<viewTris>]]"
-        // The third field is the human-readable reason produced by the
-        // native stage that failed; fields 4..9 carry the machine-readable
-        // counts/limits for the failure dialog (-1 = unknown). Missing
-        // fields = legacy message (statusText only).
-        val parts = status.split("|", limit = 9)
-        when (parts.getOrElse(0) { "" }) {
-            "IMPORT_OK" -> {
-                statusText = "Importado: ${parts.getOrElse(1) { "" }}"
+        // Protocol decoded by the PURE parser (hotfix D5/D6, JVM-tested):
+        // the kind + payload + the human-readable reason produced by the
+        // native stage that failed; IMPORT_FAIL fields 4..9 carry the
+        // machine-readable counts/limits for the failure dialog (-1 =
+        // unknown). Missing fields = legacy message (statusText only).
+        when (val ev = IoStatusParser.parse(status)) {
+            is IoStatusParser.Event.ImportOk -> {
+                statusText = "Importado: ${ev.name}"
                 ioBusy = false
                 cleanupTemp() // the cache copy has served its purpose
                 refresh()
             }
-            "IMPORT_FAIL" -> {
-                val motivo = parts.getOrElse(2) { "" }
+            is IoStatusParser.Event.ImportFail -> {
+                val motivo = ev.motivo
                 statusText = if (motivo.isEmpty()) "Falha na importação"
                              else "Falha na importação: $motivo"
                 // Dialog whenever the file counts were reportable (parsed
                 // or drained). Open/parser failures keep the full reason in
                 // the status line (never a bare message, R8).
-                val fileVerts = parts.getOrNull(3)?.toLongOrNull()
-                if (fileVerts != null && fileVerts >= 0) {
+                if (ev.fileVerts >= 0) {
                     importIssue = ImportIssue(
                         motivo = motivo.ifEmpty { "falha na importação" },
-                        fileVerts = fileVerts,
-                        fileTris = parts.getOrNull(4)?.toLongOrNull() ?: -1,
-                        profileName = parts.getOrElse(5) { "Médio" },
-                        editVerts = parts.getOrNull(6)?.toLongOrNull() ?: 0,
-                        editTris = parts.getOrNull(7)?.toLongOrNull() ?: 0,
-                        viewTris = parts.getOrNull(8)?.toLongOrNull() ?: 0,
+                        fileVerts = ev.fileVerts,
+                        fileTris = ev.fileTris,
+                        profileName = ev.profileName.ifEmpty { "Médio" },
+                        editVerts = ev.editVerts,
+                        editTris = ev.editTris,
+                        viewTris = ev.viewTris,
                     )
                 }
                 ioBusy = false
                 cleanupTemp()
                 refresh()
             }
-            "EXPORT_OK" -> {
+            is IoStatusParser.Event.ImportNeedsFiles -> {
+                // D5: dois tempos — pedir a pasta que contém os .bin. O
+                // .gltf em cache TEM de sobreviver para o retry (sem
+                // cleanupTemp aqui); o motivo completo fica no diálogo.
+                needsFiles = NeedsExternalFiles(ev.files, ev.motivo)
+                statusText = "Ficheiros externos em falta: " +
+                    ev.files.joinToString(", ")
+                ioBusy = false
+            }
+            is IoStatusParser.Event.ExportOk -> {
                 statusText = "Exportado"
                 ioBusy = false
                 val path = ioTempPath
                 ioTempPath = null
                 // Cache -> SAF uri copy (and temp deletion) is the
                 // MainActivity hook — the VM does no Android I/O.
-                onExportFileReady?.invoke(path ?: parts.getOrElse(1) { "" })
+                onExportFileReady?.invoke(path ?: ev.cachePath)
             }
-            "EXPORT_FAIL" -> {
-                val motivo = parts.getOrElse(2) { "" }
+            is IoStatusParser.Event.ExportFail -> {
+                val motivo = ev.motivo
                 statusText = if (motivo.isEmpty()) "Falha na exportação"
                              else "Falha na exportação: $motivo"
                 ioBusy = false
                 cleanupTemp()
             }
-            "PROMOTE_OK" -> {
-                statusText = "Objeto editável: ${parts.getOrElse(1) { "" }}"
+            is IoStatusParser.Event.PromoteOk -> {
+                statusText = "Objeto editável: ${ev.name}"
                 ioBusy = false
                 refresh()
             }
-            "PROMOTE_FAIL" -> {
-                val motivo = parts.getOrElse(2) { "" }
+            is IoStatusParser.Event.PromoteFail -> {
+                val motivo = ev.motivo
                 statusText = if (motivo.isEmpty()) "Falha ao tornar editável"
                              else "Falha ao tornar editável: $motivo"
                 ioBusy = false
                 refresh()
             }
+            is IoStatusParser.Event.Unknown -> Unit
+        }
+    }
+
+    // ---- D5: two-step import for .gltf with external buffers ---------------
+
+    /** User tapped "Escolher pasta" on the NEEDS_FILES dialog. */
+    fun requestNeedsFilesFolder() {
+        if (needsFiles == null) return
+        onPickExternalFolder?.invoke()
+    }
+
+    /**
+     * MainActivity hook result: the picked folder was scanned. `ok` = every
+     * missing file was found and copied next to the cached .gltf; the
+     * import is then re-fired natively (same spec — retryLastImport).
+     * `copiedPaths` are cache temporaries cleaned with the flow's outcome.
+     */
+    fun onExternalFilesCopied(ok: Boolean, copiedPaths: List<String>) {
+        if (needsFiles == null) return
+        if (!ok) {
+            // Honest retry loop: the folder did not contain them — the
+            // dialog stays open with a clear PT reason (R8).
+            statusText = "A pasta escolhida não contém: " +
+                (needsFiles?.files?.joinToString(", ") ?: "") +
+                " — escolha outra pasta ou cancele."
+            return
+        }
+        externalTempPaths = copiedPaths
+        needsFiles = null
+        retryAfterExternalFiles()
+    }
+
+    /** User cancelled the NEEDS_FILES dialog: clear failure reason (R8). */
+    fun cancelNeedsFiles() {
+        val files = needsFiles?.files.orEmpty()
+        needsFiles = null
+        statusText = if (files.isEmpty()) {
+            "Importação cancelada — nada foi importado."
+        } else {
+            "Importação cancelada: o modelo precisa dos ficheiros externos (" +
+                files.joinToString(", ") + ") — nada foi importado."
+        }
+        cleanupTemp()
+    }
+
+    private fun retryAfterExternalFiles() {
+        if (ioBusy) return
+        ioJobKind = IoJobKind.IMPORT
+        ioProgress = 0
+        statusText = "A importar…"
+        if (NativeLib.retryLastImport()) {
+            beginIoWatch()
+        } else {
+            finishIo("Falha ao reiniciar a importação")
         }
     }
 

@@ -53,11 +53,68 @@ bool samePos(const Vec3& a, const Vec3& b) {
     return std::memcmp(&a, &b, sizeof(Vec3)) == 0;
 }
 
+// ---- D5 (hotfix 2): missing external buffer names --------------------------
+
+// Minimal percent-decode of a URI path component: %XX hex pairs become the
+// raw byte; everything else (including '+' and stray '%') is kept as-is —
+// we only need the FILE NAME to ask the user for, never a canonical URL.
+void percentDecodeInPlace(std::string& s) {
+    auto hexVal = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    std::string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '%' && i + 2 < s.size()) {
+            const int hi = hexVal(s[i + 1]);
+            const int lo = hexVal(s[i + 2]);
+            if (hi >= 0 && lo >= 0) {
+                out.push_back(static_cast<char>((hi << 4) | lo));
+                i += 2;
+                continue;
+            }
+        }
+        out.push_back(s[i]);
+    }
+    s = std::move(out);
+}
+
+// Base name of a buffer URI: percent-decoded, path prefixes stripped (both
+// separators — the file may come from any platform). Empty stays empty; the
+// caller then falls back to the raw uri so the list is never misleading.
+std::string bufferBaseName(const char* uri) {
+    std::string s = uri ? uri : "";
+    percentDecodeInPlace(s);
+    const size_t slash = s.find_last_of("/\\");
+    if (slash != std::string::npos) s = s.substr(slash + 1);
+    return s;
+}
+
+// The buffers whose data never arrived AND that are file references (not
+// GLB-embedded — uri==NULL — and not data-URIs). Only these can be fixed by
+// the user picking the right folder; anything else is a real parse error.
+std::vector<std::string> missingExternalBufferNames(const cgltf_data& data) {
+    std::vector<std::string> out;
+    for (size_t i = 0; i < data.buffers_count; ++i) {
+        const cgltf_buffer& b = data.buffers[i];
+        if (b.data != nullptr || b.uri == nullptr) continue;
+        if (std::strncmp(b.uri, "data:", 5) == 0) continue; // inline, not a file
+        std::string name = bufferBaseName(b.uri);
+        if (name.empty()) name = b.uri; // never report an empty entry
+        out.push_back(std::move(name));
+    }
+    return out;
+}
+
 } // namespace
 
 std::optional<RawMeshData> GltfLoader::load(const std::string& path,
                                             std::string* err,
-                                            IoProgress* progress) {
+                                            IoProgress* progress,
+                                            std::vector<std::string>* missingFiles) {
     if (path.empty()) {
         if (err) *err = "caminho vazio";
         return std::nullopt;
@@ -111,6 +168,20 @@ std::optional<RawMeshData> GltfLoader::load(const std::string& path,
     // resolve next to it. GLB buffers are embedded and need no root.
     r = cgltf_load_buffers(&options, data, path.c_str());
     if (r != cgltf_result_success) {
+        // D5 (hotfix 2): a .gltf whose EXTERNAL .bin files are absent fails
+        // here (SAF copied only the document; the .bin stayed in Downloads).
+        // Those buffers are identifiable: data never arrived + file URI.
+        // Report their decoded BASE names so the Kotlin layer can ask for
+        // the folder that contains them (IMPORT_NEEDS_FILES + retry).
+        std::vector<std::string> missing = missingExternalBufferNames(*data);
+        if (!missing.empty()) {
+            if (missingFiles) *missingFiles = std::move(missing);
+            if (err) {
+                *err = "o modelo referencia ficheiros externos que não "
+                       "foram encontrados junto do documento";
+            }
+            return std::nullopt;
+        }
         if (err) {
             *err = std::string("buffers não carregados: ") + resultReason(r);
         }
