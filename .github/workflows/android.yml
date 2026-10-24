@@ -55,7 +55,7 @@ jobs:
         run: |
           SHORT_SHA=$(git rev-parse --short=8 HEAD)
           echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
-          echo "Building Blone Fase 3 @ ${SHORT_SHA}"
+          echo "Building Blone F4-HOTFIX2 @ ${SHORT_SHA}"
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -78,7 +78,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Blone-fase3-test-results-${{ steps.meta.outputs.short_sha }}
+          name: Blone-fase4-hotfix2-test-results-${{ steps.meta.outputs.short_sha }}
           path: app/build/reports/tests/**
           retention-days: 30
           if-no-files-found: warn
@@ -86,7 +86,7 @@ jobs:
       - name: Upload debug APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Blone-fase3-debug-${{ steps.meta.outputs.short_sha }}
+          name: Blone-fase4-hotfix2-debug-${{ steps.meta.outputs.short_sha }}
           path: app/build/outputs/apk/debug/*.apk
           retention-days: 30
           if-no-files-found: error
@@ -138,7 +138,7 @@ jobs:
         if: steps.release.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
-          name: Blone-fase3-release-assinado-${{ steps.meta.outputs.short_sha }}
+          name: Blone-fase4-hotfix2-release-assinado-${{ steps.meta.outputs.short_sha }}
           path: app/build/outputs/apk/release/*.apk
           retention-days: 30
           if-no-files-found: error
@@ -153,7 +153,7 @@ jobs:
         if: always()
         run: |
           {
-            echo "## Blone Android CI — Fase 3"
+            echo "## Blone Android CI — Fase 4"
             echo ""
             echo "| Item | Resultado |"
             echo "|------|-----------|"

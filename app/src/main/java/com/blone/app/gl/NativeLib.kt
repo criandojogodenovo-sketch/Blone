@@ -59,9 +59,16 @@ object NativeLib {
     /**
      * ATOMIC selection snapshot from the C++ engine (single source of truth):
      * [editMode, selectionMode, multiSelect, hasActiveObject,
-     *  nVerts, nEdges, nFaces, hasValidSelection].
+     *  nVerts, nEdges, nFaces, hasValidSelection, activeIndex,
+     *  activeEditable].
      * Dead ids are never counted; hasValidSelection distinguishes an EMPTY
      * selection (all counts zero) from an INVALID one (stale ids dropped).
+     * activeIndex (hotfix D3) is the ENGINE's active object (-1 when none):
+     * the UI mirror MUST re-sync from it every refresh — keeping its own
+     * stale copy made the properties panel read the wrong object.
+     * activeEditable (F4-LIMITS P3) is 0 only when the active object is
+     * READ-ONLY: the panel then shows the "Modo leitura" badge, gates
+     * Rodar/Escalar and offers "Tornar editável".
      */
     external fun selectionSnapshot(): IntArray?
 
@@ -219,6 +226,73 @@ object NativeLib {
 
     /** Cancels the stroke and restores the captured start state. */
     external fun cancelBrushStroke()
+
+    // ---- I/O 3D (Fase 4: OBJ / glTF-GLB) ------------------------------------
+    //
+    // Threading contract: importMesh/exportObj only ENQUEUE a native worker
+    // (std::async) and return immediately — parse/build/write never run on
+    // the GL or UI threads. The result surfaces through the atomic status
+    // slot (ioStatusConsume), which the ViewModel polls every 400 ms while
+    // an operation is pending. Kotlin resolves SAF to real file paths
+    // BEFORE calling; the mesh itself never crosses the JNI boundary.
+
+    /**
+     * Enqueues an import job. [path] is a real file path (SAF resolved);
+     * [isGltf] selects the glTF (cgltf) or the OBJ loader; [name] is the
+     * display name of the new object. Returns true when the job was
+     * ACCEPTED (not when it finished — watch [ioStatusConsume]).
+     */
+    external fun importMesh(path: String, isGltf: Boolean, name: String): Boolean
+
+    /**
+     * Hotfix D5: re-fires the LAST import (same path/name/route — the
+     * native side keeps the spec). Used by the two-step flow for .gltf
+     * files with external .bin buffers: after Kotlin copies the missing
+     * files next to the cached document, this re-runs the import without a
+     * new SAF round-trip. True = job accepted; watch [ioStatusConsume].
+     */
+    external fun retryLastImport(): Boolean
+
+    /** Enqueues an OBJ export of the whole scene. True = job accepted. */
+    external fun exportObj(path: String): Boolean
+
+    /**
+     * F4-LIMITS (P3): "Tornar editável" — promotes the ACTIVE read-only
+     * object (worker builds the editable mesh off the scene; the drain
+     * swaps it in place with ONE history entry). True = job accepted;
+     * watch [ioStatusConsume] for PROMOTE_OK / PROMOTE_FAIL.
+     */
+    external fun promoteActiveObject(): Boolean
+
+    /** Atomic I/O status: "" idle | "IMPORT_OK|<nome>" | "IMPORT_FAIL|<path>"
+     *  | "EXPORT_OK|<cachepath>" | "EXPORT_FAIL|<path>". */
+    external fun ioStatus(): String
+
+    /** Reads and CLEARS the atomic I/O status (single consumer). */
+    external fun ioStatusConsume(): String
+
+    /**
+     * F4-LIMITS (P4): import progress 0..1000 (map to % by /10). Polled by
+     * the ViewModel together with the status slot; 0 before the first stage.
+     */
+    external fun importProgress(): Int
+
+    /**
+     * F4-LIMITS (P4): raises the cancel flag — the loaders unwind cleanly
+     * (all-or-nothing: nothing reaches the scene) and report "cancelada".
+     */
+    external fun cancelImport()
+
+    /**
+     * F4-LIMITS (P6): selects the device limits profile (0 Baixo, 1 Médio,
+     * 2 Alto). Sets the RUNTIME geometry limits AND the history budget.
+     * Call once at startup (saved choice or RAM-appropriate default) and on
+     * every user change.
+     */
+    external fun setLimitsProfile(profile: Int)
+
+    /** Current limits profile (0 Baixo, 1 Médio, 2 Alto; default Médio). */
+    external fun limitsProfile(): Int
 
     // History.
     external fun canUndo(): Boolean

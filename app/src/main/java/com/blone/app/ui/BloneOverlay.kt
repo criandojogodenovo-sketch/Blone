@@ -21,12 +21,15 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -182,6 +185,162 @@ private fun StepButton(label: String, enabled: Boolean, onClick: () -> Unit) {
 }
 
 /**
+ * Multi-line FAILURE dialog (missão F4-LIMITS, P1; hotfix D6: fires for
+ * EVERY IMPORT_FAIL / EXPORT_FAIL / PROMOTE_FAIL — the old truncated toast
+ * is gone). The motivo is the COMPLETE engine reason, multi-line with
+ * vertical scroll — nothing can be cut. When the engine could report the
+ * file counts (fields 4..9 of the IMPORT_FAIL protocol), the numbers, the
+ * ACTIVE profile limits and the 3 suggestions are shown as well.
+ */
+@Composable
+private fun ImportIssueDialog(viewModel: BloneViewModel) {
+    val issue = viewModel.importIssue ?: return
+    val hasCounts = issue.fileVerts >= 0
+    AlertDialog(
+        onDismissRequest = { viewModel.dismissImportIssue() },
+        containerColor = ChromeSolid,
+        titleContentColor = ChromeFg,
+        textContentColor = ChromeFg,
+        title = { Text(issue.title, fontSize = 16.sp, fontWeight = FontWeight.Bold) },
+        text = {
+            // D6: the reason itself scrolls — a long PT reason is NEVER
+            // truncated, whatever the screen size.
+            Column(
+                modifier = Modifier
+                    .heightIn(max = 420.dp)
+                    .verticalScroll(rememberScrollState())
+            ) {
+                Text(
+                    text = issue.motivo,
+                    color = ChromeFg,
+                    fontSize = 12.sp,
+                )
+                if (hasCounts) {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text = "Ficheiro: ${com.blone.app.vm.StatusMessages.formatCount(issue.fileVerts)} vértices · " +
+                            "${com.blone.app.vm.StatusMessages.formatCount(issue.fileTris)} triângulos",
+                        color = ChromeDim,
+                        fontSize = 11.sp,
+                        fontFamily = FontFamily.Monospace,
+                    )
+                    Text(
+                        text = "Perfil ativo: ${issue.profileName.ifEmpty { "Médio" }} — edição: " +
+                            "${com.blone.app.vm.StatusMessages.formatCount(issue.editVerts)} vértices / " +
+                            "${com.blone.app.vm.StatusMessages.formatCount(issue.editTris)} triângulos · " +
+                            "leitura: ${com.blone.app.vm.StatusMessages.formatCount(issue.viewTris)} triângulos",
+                        color = ChromeDim,
+                        fontSize = 11.sp,
+                        fontFamily = FontFamily.Monospace,
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text("Sugestões:", color = Accent, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+                    Text("1. Escolha um ficheiro mais leve (menos triângulos).", color = ChromeDim, fontSize = 11.sp)
+                    Text("2. Mude o perfil de limites para Alto em Propriedades (dispositivos com RAM suficiente).", color = ChromeDim, fontSize = 11.sp)
+                    Text("3. Simplifique o modelo noutro programa (decimação) antes de importar.", color = ChromeDim, fontSize = 11.sp)
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { viewModel.dismissImportIssue() }) {
+                Text("Fechar", color = Accent)
+            }
+        },
+    )
+}
+
+/**
+ * Hotfix D5: the two-step import for .gltf files with EXTERNAL buffers.
+ * The engine reports IMPORT_NEEDS_FILES with the missing base names; this
+ * dialog asks for the folder that contains them (mission wording), shows
+ * the complete PT reason (D6 — multi-line, scrollable, never truncated)
+ * and hands over to the system folder picker. Cancel ends the flow with a
+ * clear reason (nothing was imported).
+ */
+@Composable
+private fun NeedsFilesDialog(viewModel: BloneViewModel) {
+    val needs = viewModel.needsFiles ?: return
+    AlertDialog(
+        onDismissRequest = { viewModel.cancelNeedsFiles() },
+        containerColor = ChromeSolid,
+        titleContentColor = ChromeFg,
+        textContentColor = ChromeFg,
+        title = { Text("Ficheiros externos em falta", fontSize = 16.sp, fontWeight = FontWeight.Bold) },
+        text = {
+            Column(
+                modifier = Modifier
+                    .verticalScroll(rememberScrollState())
+            ) {
+                Text(
+                    text = "Este modelo referencia ficheiros externos: " +
+                        needs.files.joinToString(", ") +
+                        ". Escolhe a pasta que os contém.",
+                    color = ChromeFg,
+                    fontSize = 12.sp,
+                )
+                if (needs.motivo.isNotEmpty()) {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text = needs.motivo,
+                        color = ChromeDim,
+                        fontSize = 11.sp,
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { viewModel.requestNeedsFilesFolder() }) {
+                Text("Escolher pasta", color = Accent)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = { viewModel.cancelNeedsFiles() }) {
+                Text("Cancelar", color = Danger)
+            }
+        },
+    )
+}
+
+/**
+ * Import progress dialog (missão F4-LIMITS, P4): atomic 0..1000 from the
+ * engine shown as a percentage + bar, with a REAL Cancel button — the
+ * loaders unwind cleanly (all-or-nothing) and report "cancelada".
+ */
+@Composable
+private fun ImportProgressDialog(viewModel: BloneViewModel) {
+    if (!viewModel.ioBusy || viewModel.ioJobKind != BloneViewModel.IoJobKind.IMPORT) return
+    val percent = viewModel.ioProgress / 10
+    AlertDialog(
+        onDismissRequest = { /* no dismiss outside the button: the job owns it */ },
+        containerColor = ChromeSolid,
+        titleContentColor = ChromeFg,
+        textContentColor = ChromeFg,
+        title = { Text("A importar…", fontSize = 16.sp, fontWeight = FontWeight.Bold) },
+        text = {
+            Column {
+                LinearProgressIndicator(
+                    progress = { (percent / 100f).coerceIn(0f, 1f) },
+                    modifier = Modifier.fillMaxWidth(),
+                    color = Accent,
+                    trackColor = DisabledBg,
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text = "$percent% — grandes ficheiros podem demorar; pode cancelar sem danificar a cena.",
+                    color = ChromeDim,
+                    fontSize = 11.sp,
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { viewModel.cancelIoJob() }) {
+                Text("Cancelar", color = Danger)
+            }
+        },
+    )
+}
+
+/**
  * Compose chrome in FOUR zones (DECISÃO B) over the fullscreen GL viewport:
  *  A. compact TOP BAR — undo/redo, project file actions, mode chip, FPS and
  *     access to the advanced/properties panels (single scrollable row);
@@ -209,6 +368,8 @@ fun BloneOverlay(
     viewModel: BloneViewModel,
     onSaveRequest: () -> Unit,
     onLoadRequest: () -> Unit,
+    onImportRequest: () -> Unit = {},
+    onExportRequest: () -> Unit = {},
     onUsableViewportChanged: (topPx: Int, bottomPx: Int, leftPx: Int, rightPx: Int) ->
         Unit = { _, _, _, _ -> },
 ) {
@@ -235,12 +396,22 @@ fun BloneOverlay(
             var bottomEdge by remember { mutableIntStateOf(-1) }
             var leftEdge by remember { mutableIntStateOf(-1) }
             var rightEdge by remember { mutableIntStateOf(-1) }
-            LaunchedEffect(topEdge, bottomEdge, leftEdge, rightEdge) {
+            // CONTRATO Fase 2 (R9, hotfix D2): setViewportInsetsRect é
+            // reportado ao renderer SEMPRE que o retângulo medido do chrome
+            // muda — nas DUAS direções. Um painel fechado não mede nada (o
+            // onGloballyPositioned dele é descartado), por isso o seu bordo
+            // é reportado como 0 e as chaves incluem o estado dos painéis:
+            // abrir E fechar Propriedades/Avançado disparam o re-report na
+            // thread GL (via queueEvent em MainActivity -> BloneSurfaceView).
+            // Sem o re-report no fecho, o viewport ficava preso no retângulo
+            // estreito medido com o painel aberto (regressão).
+            LaunchedEffect(topEdge, bottomEdge, leftEdge, rightEdge,
+                           viewModel.propertiesOpen, viewModel.advancedOpen) {
                 onUsableViewportChanged(
                     if (topEdge > 0) topEdge else 0,
                     if (bottomEdge > 0) bottomEdge else 0,
                     if (leftEdge > 0) leftEdge else 0,
-                    if (rightEdge > 0) rightEdge else 0,
+                    if (viewModel.propertiesOpen && rightEdge > 0) rightEdge else 0,
                 )
             }
 
@@ -310,7 +481,12 @@ fun BloneOverlay(
 
                 // -------- Avançado (scene-level panel, capped + scrollable)
                 if (viewModel.advancedOpen) {
-                    AdvancedPanel(viewModel, maxHeightPx = rootHeightPx)
+                    AdvancedPanel(
+                        viewModel,
+                        maxHeightPx = rootHeightPx,
+                        onImportRequest = onImportRequest,
+                        onExportRequest = onExportRequest,
+                    )
                 }
 
                 // --------- middle band: side toolbar | viewport | properties
@@ -368,6 +544,12 @@ fun BloneOverlay(
                 }
             }
         }
+
+        // Multi-line import-failure dialog (F4-LIMITS, P1) — above everything.
+        ImportIssueDialog(viewModel)
+        NeedsFilesDialog(viewModel) // hotfix D5: buffers externos do .gltf
+        // Import progress + real cancel (F4-LIMITS, P4).
+        ImportProgressDialog(viewModel)
     }
 }
 
@@ -444,7 +626,12 @@ private fun rememberObjectLabel(index: Int): String {
 }
 
 @Composable
-private fun AdvancedPanel(viewModel: BloneViewModel, maxHeightPx: Int) {
+private fun AdvancedPanel(
+    viewModel: BloneViewModel,
+    maxHeightPx: Int,
+    onImportRequest: () -> Unit = {},
+    onExportRequest: () -> Unit = {},
+) {
     // The panel never eats the viewport: hard cap + internal scroll.
     val capDp = with(LocalDensity.current) { ((maxHeightPx * 0.40f).toInt()).toDp() }
     Column(
@@ -469,7 +656,11 @@ private fun AdvancedPanel(viewModel: BloneViewModel, maxHeightPx: Int) {
             ) { viewModel.deleteActiveObject() }
         }
         Spacer(modifier = Modifier.height(6.dp))
-        Text("Primitivas", color = ChromeDim, fontSize = 11.sp)
+        Text(
+            "Primitivas",
+            color = ChromeDim,
+            fontSize = 11.sp,
+        )
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -479,6 +670,23 @@ private fun AdvancedPanel(viewModel: BloneViewModel, maxHeightPx: Int) {
             ToolButton("Esfera", false) { viewModel.createPrimitive(1, "Esfera") }
             ToolButton("Cilindro", false) { viewModel.createPrimitive(2, "Cilindro") }
             ToolButton("Plano", false) { viewModel.createPrimitive(3, "Plano") }
+        }
+        Spacer(modifier = Modifier.height(6.dp))
+        // E/S 3D (Fase 4): real engine-backed import/export — no dead buttons.
+        // Export is pointless on an empty scene, so the button says so.
+        Text("E/S 3D", color = ChromeDim, fontSize = 11.sp)
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .horizontalScroll(rememberScrollState())
+        ) {
+            ToolButton("Importar OBJ/glTF", false, enabled = !viewModel.ioBusy) {
+                onImportRequest()
+            }
+            ToolButton(
+                "Exportar OBJ", false,
+                enabled = viewModel.objectCount > 0 && !viewModel.ioBusy,
+            ) { onExportRequest() }
         }
         Spacer(modifier = Modifier.height(6.dp))
         Text(
@@ -559,9 +767,39 @@ private fun PropertiesPanel(viewModel: BloneViewModel, modifier: Modifier = Modi
             fontSize = 11.sp,
             fontFamily = FontFamily.Monospace,
         )
+        // F4-LIMITS (P3): read-only object — honest badge, Move-only
+        // affordances and the "Tornar editável" promotion (worker + progress).
+        if (!viewModel.activeObjectEditable && viewModel.activeObject >= 0) {
+            Spacer(modifier = Modifier.height(6.dp))
+            Text(
+                text = "MODO LEITURA",
+                color = Amber,
+                fontSize = 11.sp,
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier
+                    .background(DisabledBg, RoundedCornerShape(8.dp))
+                    .padding(horizontal = 8.dp, vertical = 4.dp),
+            )
+            Text(
+                text = "Objeto grande em modo de visualização — Mover funciona; esculpir/pintar/editar exigem torná-lo editável.",
+                color = ChromeDim,
+                fontSize = 10.sp,
+            )
+            ToolButton(
+                "Tornar editável",
+                false,
+                enabled = !viewModel.ioBusy && !viewModel.busy,
+            ) { viewModel.requestPromoteActive() }
+            Spacer(modifier = Modifier.height(6.dp))
+        }
         Spacer(modifier = Modifier.height(8.dp))
 
         val canTransform = viewModel.activeObject >= 0 && !viewModel.busy
+        // Hotfix D7: rotate/scale need mesh mutation — unavailable on
+        // read-only objects (the gizmo degrades to Mover-only and a direct
+        // step would be rejected by policy; the message says modo leitura,
+        // not "topologia").
+        val canRotateScale = canTransform && viewModel.activeObjectEditable
         Text("Mover (passo 0,25)", color = ChromeDim, fontSize = 11.sp)
         StepRow("X", canTransform, { viewModel.nudgeMove(0, -0.25f) },
                 { viewModel.nudgeMove(0, 0.25f) })
@@ -571,18 +809,42 @@ private fun PropertiesPanel(viewModel: BloneViewModel, modifier: Modifier = Modi
                 { viewModel.nudgeMove(2, 0.25f) })
         Spacer(modifier = Modifier.height(6.dp))
         Text("Rodar (passo 15°)", color = ChromeDim, fontSize = 11.sp)
-        StepRow("X", canTransform, { viewModel.nudgeRotate(0, -15f) },
+        StepRow("X", canRotateScale, { viewModel.nudgeRotate(0, -15f) },
                 { viewModel.nudgeRotate(0, 15f) })
-        StepRow("Y", canTransform, { viewModel.nudgeRotate(1, -15f) },
+        StepRow("Y", canRotateScale, { viewModel.nudgeRotate(1, -15f) },
                 { viewModel.nudgeRotate(1, 15f) })
-        StepRow("Z", canTransform, { viewModel.nudgeRotate(2, -15f) },
+        StepRow("Z", canRotateScale, { viewModel.nudgeRotate(2, -15f) },
                 { viewModel.nudgeRotate(2, 15f) })
         Spacer(modifier = Modifier.height(6.dp))
         Text("Escalar", color = ChromeDim, fontSize = 11.sp)
         Row {
-            StepButton("×1,25", canTransform) { viewModel.nudgeScale(3, 1.25f) }
+            StepButton("×1,25", canRotateScale) { viewModel.nudgeScale(3, 1.25f) }
             Spacer(modifier = Modifier.width(4.dp))
-            StepButton("÷1,25", canTransform) { viewModel.nudgeScale(3, 0.8f) }
+            StepButton("÷1,25", canRotateScale) { viewModel.nudgeScale(3, 0.8f) }
+        }
+        Spacer(modifier = Modifier.height(8.dp))
+        // F4-LIMITS (P6): device limits profile — Baixo/Médio/Alto. The
+        // numbers live in the engine (GeometryLimits.h); this is the only
+        // control, inside the existing properties panel (zones and the
+        // 44 dp targets untouched).
+        Text("Limites de geometria", color = ChromeDim, fontSize = 11.sp)
+        Row {
+            ToolButton("Baixo", viewModel.limitsProfile == 0) {
+                viewModel.selectLimitsProfile(0)
+            }
+            ToolButton("Médio", viewModel.limitsProfile == 1) {
+                viewModel.selectLimitsProfile(1)
+            }
+            ToolButton("Alto", viewModel.limitsProfile == 2) {
+                viewModel.selectLimitsProfile(2)
+            }
+        }
+        if (viewModel.limitsProfile == 2) {
+            Text(
+                text = "Aviso: o perfil Alto usa mais memória — use num dispositivo com RAM suficiente.",
+                color = Amber,
+                fontSize = 10.sp,
+            )
         }
         Spacer(modifier = Modifier.height(8.dp))
         Text(

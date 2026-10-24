@@ -43,11 +43,19 @@ inline constexpr ElemId kNull = 0;
 // so unpainted meshes render exactly as before the vertex-color extension.
 inline constexpr Vec3 kDefaultVertexColor{0.58f, 0.66f, 0.78f};
 
+// HARD geometry ceiling (missão F4-LIMITS, P1): absolute safety net of the
+// engine pools, chosen so a mesh at the ceiling still fits a high-RAM device
+// and ElemId (uint32) keeps headroom. This is NOT the user-facing limit —
+// the RUNTIME limits per device profile (core/io/GeometryLimits.h) decide
+// edit vs read-only vs reject long before this ceiling is approached.
+// Memory at the ceiling is far beyond any profile budget: a build that gets
+// here is always rejected by the runtime gate first; these constants exist
+// so even a bug upstream can never run the pools unbounded.
 struct MeshLimits {
-    static constexpr size_t maxVertices  = 200000;
-    static constexpr size_t maxEdges     = 400000;
-    static constexpr size_t maxHalfEdges = 800000;
-    static constexpr size_t maxFaces     = 200000;
+    static constexpr size_t maxVertices  = 4000000;
+    static constexpr size_t maxEdges     = 12000000;
+    static constexpr size_t maxHalfEdges = 24000000;
+    static constexpr size_t maxFaces     = 8000000;
     static constexpr size_t maxFaceSides = 256;
 };
 

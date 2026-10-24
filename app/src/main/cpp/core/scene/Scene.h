@@ -3,8 +3,10 @@
 // Deliberately small — no generic framework, only what Phase 2 needs.
 
 #include "../mesh/HalfEdgeMesh.h"
+#include "../render/RenderMesh.h"
 
 #include <cstdint>
+#include <memory>
 #include <set>
 #include <string>
 #include <vector>
@@ -46,6 +48,13 @@ struct SceneObject {
     std::string name;
     Vec3 position{0.0f, 0.0f, 0.0f}; // object transform (translation, Phase 2)
     HalfEdgeMesh mesh;
+    // F4-LIMITS (P3): READ-ONLY objects carry an EMPTY HalfEdgeMesh and hold
+    // their geometry in a shared immutable RenderMesh instead (~30 B/tri
+    // instead of ~270 B/tri). editable==false objects reject sculpt/paint/
+    // selection/modeling; the object-mode MOVE (gizmo axis and properties
+    // steps) still works — it only shifts `position`, never the geometry.
+    bool editable = true;
+    std::shared_ptr<const render::RenderMesh> readMesh; // null unless !editable
     Selection sel;
 };
 

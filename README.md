@@ -3,19 +3,40 @@
 Aplicação Android nativa de modelagem 3D — gratuita, offline e pensada para
 ecrãs táteis e telemóveis com recursos limitados.
 
-**Estado atual: Fase 3** (base nativa + viewport tátil + modelagem editável
- + gizmo funcional + seleção com fonte única no motor + **pincéis de
-esculpir e pintar sobre a malha**, com desfazer/refazer por gesto e cores
-guardadas no projeto).
+**Estado atual: Fase 4** (base nativa + viewport tátil + modelagem editável
++ gizmo funcional + pincéis de esculpir e pintar sobre a malha + **I/O 3D:
+importar OBJ/glTF-GLB e exportar OBJ, com round-trip da pintura**).
 
 ## Instalação
 
 1. Descarrega o APK em *Actions → run mais recente → Artifacts*
-   (`Blone-fase3-debug-…` ou `Blone-fase3-release-assinado-…), ou numa
+   (`Blone-fase4-debug-…` ou `Blone-fase4-release-assinado-…), ou numa
    release do separador *Releases*, quando existir.
 2. No telemóvel, permite "Instalar apps de fontes desconhecidas" para este
    ficheiro e instala o APK.
 3. Requisitos: Android 8.0 (API 26) ou superior.
+
+## Funcionalidades (Fase 4)
+
+- **Importar OBJ**: parser próprio linha-a-linha (v/vn/vt/f, cantos
+  `v`, `v/vt`, `v//vn`, `v/vt/vn`, índices 1-based e negativos); cada tuplo
+  (posição, uv, normal) único é um vértice; a extensão `v x y z r g b`
+  transporta a pintura (branco por defeito). Ficheiros malformados são
+  rejeitados na íntegra — a cena viva nunca é tocada.
+- **Importar glTF 2.0 / GLB**: via cgltf v1.14 vendorizado (único parser —
+  zero-dependências preservado); POSITION obrigatório, NORMAL/TEXCOORD_0/
+  COLOR_0 opcionais (COLOR vec3/vec4); primitivas TRIANGLES concatenadas;
+  triângulos degenerados saltados.
+- **Exportar OBJ**: posições em espaço do mundo com a cor por vértice
+  (precisão %.9g — round-trip bit-exact), normais suaves área-ponderadas
+  (Newell por vértice) e `f v//vn` com dedup de tuplos partilhado pela cena.
+- **Round-trip da pintura**: pintar → exportar → importar devolve as MESMAS
+  cores (testado bit-exact na suite host).
+- **I/O assíncrono**: parse/construção/escrita em worker (`std::async`); a
+  thread GL drena os imports no ponto por-frame já existente, sob o mutex,
+  sempre através da fachada SceneOps — **um import = um passo de desfazer**
+  (undo remove o objeto, redo repõe). A UI usa o SAF (sem permissões de
+  armazenamento) e recebe o resultado por polling curto.
 
 ## Funcionalidades (Fase 2 + correção, e Fase 3)
 

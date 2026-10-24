@@ -1,11 +1,16 @@
-# Formato de Projeto Blone — "BLONEPRJ" (versão atual: 2)
+# Formato de Projeto Blone — "BLONEPRJ" (versão atual: 3)
 
-> **Versão 2 (Fase 3):** acrescenta **cor por vértice** (albedo RGB) para a
-> ferramenta Pintar. O leitor aceita ficheiros **v1 e v2**; um ficheiro v1
-> abre com a cor por vértice predefinida (idêntica ao aspeto anterior à
-> extensão). O escritor grava sempre a versão corrente (2). Uma aplicação
-> antiga (leitor v1) rejeita um ficheiro v2 com o erro `-2` e uma mensagem
-> clara — nunca interpreta às cegas.
+> **Versão 3 (F4-LIMITS):** acrescenta uma **flag `editable` por objeto**.
+> Objetos em **modo leitura** (imports acima do orçamento de edição do
+> perfil, dentro do de visualização) guardam a geometria como **malha de
+> renderização indexada** (posições + cores verbatim + índices u32) em vez
+> de estruturas half-edge. O leitor aceita **v1, v2 e v3**; v1/v2 abrem com
+> `editable = true` (comportamento antigo intacto). O escritor grava sempre
+> a versão corrente (3). Aplicações antigas rejeitam v3 com o erro `-2` e
+> uma mensagem clara — nunca interpretam às cegas.
+>
+> **Versão 2 (Fase 3):** cor por vértice (albedo RGB) para a ferramenta
+> Pintar — mantida tal como estava.
 
 Este documento define o formato binário próprio com que o Blone guarda e
 abre projetos. Implementação: `app/src/main/cpp/core/project/Project.{h,cpp}`.
@@ -51,8 +56,9 @@ repetido objectCount vezes:
     f32 × 3         posição do objeto (translação; a Fase 2 não guarda
                     rotação/escala de objeto — podem ser adicionadas numa
                     versão futura do formato)
-    mesh (ver §4)
-    seleção (ver §5)
+    v3 APENAS: u8   editable (1 = editável, 0 = modo leitura)
+    editable == 1:  mesh (ver §4) + seleção (ver §5)
+    editable == 0:  malha de leitura (ver §4-A) + seleção (sempre vazia)
 ```
 
 ## 4. Malha
@@ -81,6 +87,20 @@ u32 × 4            reservado (o leitor recalcula os contadores de id como
 
 `vertex.outgoing` é **estado derivado** e não é serializado: na abertura é
 recomputado como "o primeiro half-edge vivo com origem no vértice".
+
+## 4-A. Malha de leitura (v3, `editable == 0`)
+
+```
+u32 vertexCount
+    por vértice:  f32 x, y, z; f32 r, g, b   (posições/cores VERBATIM —
+                  não finitos → erro -8; cores fora do intervalo → [0,1])
+u32 indexCount (múltiplo de 3; senão erro -5)
+    por índice:   u32 (cada valor < vertexCount, senão erro -8)
+```
+
+A geometria reconstrói um `RenderMesh` imutável partilhado (~30 B por
+triângulo). A validação de topologia half-edge não se aplica; as contagens
+respeitam os tetos de `MeshLimits`.
 
 ## 5. Seleção
 
