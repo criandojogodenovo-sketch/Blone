@@ -599,9 +599,19 @@ Java_com_blone_app_gl_NativeLib_beginGizmoDrag(JNIEnv* /*env*/, jobject /*thiz*/
         // tip therefore belongs to the ACTIVE tool: with Escalar active an
         // axial tip is an AXIAL SCALE (kind 1) — the old hard-coded Move
         // mapping rejected it as "seleção inválida" in object mode.
-        tool = static_cast<int>(gGizmoTool == blone::GizmoTool::Scale
-                                    ? blone::GizmoTool::Scale
-                                    : blone::GizmoTool::Move);
+        // D7 (hotfix 2): READ-ONLY active object — the gizmo is MOVE-ONLY
+        // (same rule as the renderer draw/hit): a tip drag starts a Move
+        // session (obj.position) even with Rodar/Escalar selected, instead
+        // of a Scale/Rotate session that policy would reject with the
+        // misleading "topologia não suportada".
+        const bool activeReadOnly = [&] {
+            const blone::SceneObject* obj = gScene.activeObject();
+            return obj && !obj->editable;
+        }();
+        tool = static_cast<int>(
+                !activeReadOnly && gGizmoTool == blone::GizmoTool::Scale
+                        ? blone::GizmoTool::Scale
+                        : blone::GizmoTool::Move);
         kind = 1;
         axis = handle - 1;
     } else if (handle == 4) {

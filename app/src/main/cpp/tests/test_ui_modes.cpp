@@ -8,13 +8,19 @@
 //  - the shared gizmo pivot rule (gizmopivot::pivotFor) for both modes.
 #include "test_util.h"
 
+#include "../core/io/GltfLoader.h"
+#include "../core/io/MeshBuilder.h"
+#include "../core/render/RenderMesh.h"
 #include "../core/scene/GizmoPivot.h"
 #include "../core/scene/SceneOps.h"
 
 #include <cmath>
 #include <limits>
+#include <optional>
 #include <set>
 #include <tuple>
+#include <utility>
+#include <vector>
 
 namespace blone {
 namespace {
@@ -377,8 +383,177 @@ void testObjectModeEmptySelectionGizmoHit() {
     // second finger cancel path stays camera-only (TouchTracker contract).
 }
 
-// ---- shared pivot rule (renderer + JNI can never diverge) ------------------
+// ---- hotfix D7 (BLONE-HOTFIX-02): IMPORTED fixtures transform like any -----
+//
+// Contract (Fase 2, restated by the mission): whole-object transformation
+// validates ONLY finiteness + the scale clamp — topology is NEVER a criterion
+// in the transform session path (it belongs to extrude/subdivide/delete/
+// loopcut). Device regression: "Rodar/Ecalar em objeto importado -> topologia
+// não suportada". Host probes (probe evidence, mission golden rule) proved
+// the session path was already clean for editable imports on the base AND
+// the head — the misleading message came from the READ-ONLY policy gate
+// (F4-LIMITS P3) whose Rotate/Scale handles the renderer still drew/hit.
+// These regression tests pin the ENGINE half of the contract for EVERY
+// imported fixture: Move/Rotate/Scale sessions in OBJECT mode succeed with
+// exactly ONE history entry and bit-exact undo/redo, and a valid EDIT-mode
+// selection transforms too.
+void testImportedObjectTransforms() {
+    // The three fixtures the mission names; the OBJ-with-quads one is built
+    // in memory (same shapes the D5/D6 import tests use on disk).
+    std::vector<std::pair<const char*, std::optional<blone::io::RawMeshData>>> fixtures;
+    {
+        std::string err;
+        auto glb = blone::io::GltfLoader::load(
+                std::string(BLONE_TEST_DATA_DIR) + "/cube.glb", &err);
+        REQUIRE(glb.has_value());
+        fixtures.emplace_back("cube.glb", std::move(*glb));
+        auto emb = blone::io::GltfLoader::load(
+                std::string(BLONE_TEST_DATA_DIR) + "/cube_embedded.gltf", &err);
+        REQUIRE(emb.has_value());
+        fixtures.emplace_back("cube_embedded.gltf", std::move(*emb));
+        blone::io::RawMeshData quads;
+        quads.positions = {Vec3{0, 0, 0}, Vec3{1, 0, 0}, Vec3{1, 1, 0},
+                           Vec3{0, 1, 0}, Vec3{0, 0, 1}, Vec3{1, 0, 1},
+                           Vec3{1, 1, 1}, Vec3{0, 1, 1}};
+        quads.faceIndices = {{0, 3, 2, 1}, {4, 5, 6, 7}};
+        fixtures.emplace_back("OBJ quads", std::move(quads));
+    }
 
+    for (const auto& [label, rawOpt] : fixtures) {
+        REQUIRE(rawOpt.has_value());
+        auto mesh = blone::io::MeshBuilder::build(*rawOpt);
+        REQUIRE(mesh.has_value());
+
+        History h;
+        Scene s;
+        SceneObject obj;
+        obj.name = label;
+        obj.mesh = std::move(*mesh);
+        REQUIRE(sceneops::addImportedObject(s, h, std::move(obj)) ==
+                ops::Status::OK);
+        h.clear(); // the ObjAdd entry is not the subject here
+        s.editMode = false; // MODO OBJETO
+
+        const HalfEdgeMesh::Raw before = s.objects[0].mesh.captureRaw();
+        sceneops::GizmoMapping map;
+        map.axisDirX = 1.0f;
+        map.axisDirY = 0.0f;
+        map.pxPerWorld = 100.0f;
+        map.pivotScreenX = 500.0f;
+        map.pivotScreenY = 500.0f;
+        map.ringSign = 1.0f;
+
+        // Mover + Rodar + Escalar via the gizmo session: Status Ok each,
+        // exactly ONE history entry per ended drag, undo/redo bit-exact.
+        // (Rotate uses the ring + a sweep that never passes through the
+        // pivot — the documented degenerate-sweep rule of the D4 tests.)
+        struct Step {
+            sceneops::Tool tool;
+            int kind;
+            int axis;
+            float bx, by, ux, uy;
+        };
+        const Step steps[3] = {
+                {sceneops::Tool::Move, 1, 0, 500.0f, 500.0f, 600.0f, 500.0f},
+                {sceneops::Tool::Rotate, 2, 2, 600.0f, 500.0f, 500.0f, 400.0f},
+                {sceneops::Tool::Scale, 1, 0, 500.0f, 500.0f, 600.0f, 500.0f},
+        };
+        for (const Step& st : steps) {
+            const HalfEdgeMesh::Raw pre = s.objects[0].mesh.captureRaw();
+            const unsigned depthBefore = h.undoDepth();
+            sceneops::ToolSession t;
+            REQUIRE(sceneops::beginTool(s, h, t, st.tool, st.kind, st.axis,
+                                        st.bx, st.by) == ops::Status::OK);
+            REQUIRE(sceneops::updateTool(s, t, map, st.ux, st.uy) ==
+                    ops::Status::OK);
+            REQUIRE(sceneops::endTool(s, h, t) == ops::Status::OK);
+            CHECK(h.undoDepth() == depthBefore + 1); // 1 entrada por gesto
+            const HalfEdgeMesh::Raw post = s.objects[0].mesh.captureRaw();
+            CHECK(s.objects[0].mesh.validate());
+            REQUIRE(sceneops::undo(s, h) == ops::Status::OK);
+            CHECK(test::sameMesh(s.objects[0].mesh, test::meshFromRaw(pre)));
+            REQUIRE(sceneops::redo(s, h) == ops::Status::OK);
+            CHECK(test::sameMesh(s.objects[0].mesh, test::meshFromRaw(post)));
+        }
+        // The three gestures above moved/rotated/scaled the WHOLE import:
+        // the topology never changed.
+        CHECK(s.objects[0].mesh.aliveVertexCount() ==
+              test::meshFromRaw(before).aliveVertexCount());
+        CHECK(s.objects[0].mesh.aliveFaceCount() ==
+              test::meshFromRaw(before).aliveFaceCount());
+        test::assertInvariants(s.objects[0].mesh, label);
+
+        // MODO EDIÇÃO com seleção válida: the gizmo transforms the
+        // selection of an imported mesh too (triangulated or quads).
+        REQUIRE(sceneops::setEditMode(s, true) == ops::Status::OK);
+        const ElemId face = s.objects[0].mesh.aliveFaceIds().front();
+        REQUIRE(sceneops::selectFromPick(s, 3, 0, face) == ops::Status::OK);
+        CHECK(sceneops::hasValidSelection(s));
+        sceneops::ToolSession t;
+        REQUIRE(sceneops::beginTool(s, h, t, sceneops::Tool::Move, 1, 0,
+                                    500.0f, 500.0f) == ops::Status::OK);
+        REQUIRE(sceneops::updateTool(s, t, map, 560.0f, 500.0f) ==
+                ops::Status::OK);
+        REQUIRE(sceneops::endTool(s, h, t) == ops::Status::OK);
+        CHECK(s.objects[0].mesh.validate());
+        test::assertInvariants(s.objects[0].mesh, "edição importado");
+    }
+}
+
+// ---- hotfix D7: the READ-ONLY degradation stays policy-pinned --------------
+//
+// The renderer/JNI now only offer Move handles on a read-only object; the
+// SceneOps contract underneath (Rotate/Scale rejected, Move works on
+// obj.position) is what the degradation relies on — pinned here at the
+// session level for an imported read-only object (small fixture forced into
+// read mode) so the affordance and the engine can never diverge.
+void testImportedReadOnlyMoveOnlySessions() {
+    std::string err;
+    auto glb = blone::io::GltfLoader::load(
+            std::string(BLONE_TEST_DATA_DIR) + "/cube.glb", &err);
+    REQUIRE(glb.has_value());
+
+    History h;
+    Scene s;
+    SceneObject obj;
+    obj.name = "cube.glb leitura";
+    obj.editable = false;
+    obj.readMesh =
+            std::make_shared<const blone::render::RenderMesh>(blone::render::buildRenderMesh(*glb));
+    REQUIRE(sceneops::addImportedReadObject(s, h, std::move(obj)) ==
+            ops::Status::OK);
+    h.clear();
+    s.editMode = false;
+
+    sceneops::GizmoMapping map;
+    map.axisDirX = 1.0f;
+    map.axisDirY = 0.0f;
+    map.pxPerWorld = 100.0f;
+
+    // Move session on a read-only import: transforms obj.position, no mesh
+    // history entry (read-only transforms are documented as not undoable).
+    sceneops::ToolSession t;
+    REQUIRE(sceneops::beginTool(s, h, t, sceneops::Tool::Move, 1, 0,
+                                500.0f, 500.0f) == ops::Status::OK);
+    CHECK(t.readMode);
+    REQUIRE(sceneops::updateTool(s, t, map, 650.0f, 500.0f) ==
+            ops::Status::OK);
+    REQUIRE(sceneops::endTool(s, h, t) == ops::Status::OK);
+    CHECK_NEAR(s.objects[0].position.x, 1.5f, 1e-5f);
+
+    // Rotate/Scale remain policy rejections (the renderer no longer draws
+    // their handles; the engine contract stays).
+    sceneops::ToolSession r;
+    CHECK(sceneops::beginTool(s, h, r, sceneops::Tool::Rotate, 2, 2,
+                              600.0f, 500.0f) == ops::Status::ErrUnsupported);
+    CHECK(sceneops::beginTool(s, h, r, sceneops::Tool::Scale, 1, 0,
+                              500.0f, 500.0f) == ops::Status::ErrUnsupported);
+    CHECK(sceneops::transformDirect(s, h, sceneops::Tool::Rotate, 0, 15.0f) ==
+          ops::Status::ErrUnsupported);
+    CHECK(s.objects[0].mesh.empty()); // the half-edge never materialized
+}
+
+// ---- shared pivot rule (renderer + JNI can never diverge) ------------------
 void testGizmoPivotRule() {
     History h;
     Scene s = oneCubeScene(h);
@@ -420,6 +595,8 @@ namespace test {
 void runUiModeTests() {
     testObjectModeGizmoTransforms();
     testObjectModeEmptySelectionGizmoHit(); // hotfix D4
+    testImportedObjectTransforms();         // hotfix D7
+    testImportedReadOnlyMoveOnlySessions(); // hotfix D7
     testModeIdentityAcrossTransitions();
     testDuplicateActiveObject();
     testTransformDirectSteps();

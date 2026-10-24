@@ -962,12 +962,34 @@ namespace {
 // The gizmo pivot rule is SHARED with the JNI mapping (core/scene/GizmoPivot.h)
 // so drawing and hit-testing can never diverge.
 
+// D7 (hotfix 2): a READ-ONLY object has no editable half-edge — the F4-LIMITS
+// P3 contract is "gizmo Mover-only" (obj.position only; Rotate/Scale are
+// rejected by policy in SceneOps). The DRAW and HIT paths share this rule so
+// the handles shown are ALWAYS the handles that work: with Rodar/Escalar
+// selected over a read-only object the gizmo degrades to Move — rings and
+// scale handles (which could only ever fail with a misleading error) are
+// neither drawn nor hittable. The pivot RULE itself (GizmoPivot.h) is
+// untouched; this only picks WHICH handles exist.
+GizmoTool effectiveGizmoTool(const Scene& scene, int pivotObjIndex,
+                             GizmoTool tool) {
+    if (tool == GizmoTool::None || tool == GizmoTool::Move) return tool;
+    if (scene.editMode || pivotObjIndex < 0 ||
+        pivotObjIndex >= static_cast<int>(scene.objects.size())) {
+        return tool;
+    }
+    const SceneObject& obj = scene.objects[static_cast<size_t>(pivotObjIndex)];
+    if (!obj.editable) return GizmoTool::Move; // read-only: Move-only affordance
+    return tool;
+}
+
 } // namespace
 
 void Renderer::drawGizmo(const Scene& scene, const Mat4& vp, GizmoTool tool) {
     int objIndex = -1;
     Vec3 pivot{};
     if (!gizmopivot::pivotFor(scene, scene.editMode, pivot, objIndex)) return;
+    // D7 (hotfix 2): read-only object — only the Move handles exist.
+    tool = effectiveGizmoTool(scene, objIndex, tool);
 
     const Vec3 toPivot = pivot - eye_;
     const float distPivot = std::max(length(toPivot), 0.5f);
@@ -1094,6 +1116,10 @@ Renderer::GizmoHit Renderer::gizmoHitAt(float xPx, float yPx, const Scene& scene
     Vec3 pivot{};
     if (!gizmopivot::pivotFor(scene, scene.editMode, pivot, objIndex)) return out;
     if (objIndex < 0) return out;
+    // D7 (hotfix 2): read-only object — same degradation as the drawing
+    // (shared rule): the Move tips are the only hittable handles, so a drag
+    // can never start a session that policy must reject.
+    tool = effectiveGizmoTool(scene, objIndex, tool);
 
     float psx = 0.0f, psy = 0.0f;
     if (!projectToScreenPx(pivot, psx, psy)) return out;

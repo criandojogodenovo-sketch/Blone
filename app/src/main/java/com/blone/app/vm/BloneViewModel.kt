@@ -353,7 +353,14 @@ class BloneViewModel : ViewModel() {
         )
         gizmoDragActive = code == NativeLib.Status.OK
         if (!gizmoDragActive) {
-            statusText = StatusMessages.forCode(code, "Gizmo")
+            // Hotfix D7: a rejeição de Rodar/Escalar num objeto em modo
+            // leitura é POLÍTICA (não topologia) — a mensagem diz a verdade
+            // (R8) e aponta para o caminho certo.
+            statusText = if (!activeObjectEditable) {
+                "Objeto em modo leitura: só Mover está disponível — use “Tornar editável” para Rodar/Escalar."
+            } else {
+                StatusMessages.forCode(code, "Gizmo")
+            }
         }
     }
 

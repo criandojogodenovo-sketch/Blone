@@ -732,8 +732,10 @@ private fun PropertiesPanel(viewModel: BloneViewModel, modifier: Modifier = Modi
         Spacer(modifier = Modifier.height(8.dp))
 
         val canTransform = viewModel.activeObject >= 0 && !viewModel.busy
-        // Rotate/Scale need mesh mutation: unavailable on read-only objects
-        // (the native layer would reject with "topologia não suportada").
+        // Hotfix D7: rotate/scale need mesh mutation — unavailable on
+        // read-only objects (the gizmo degrades to Mover-only and a direct
+        // step would be rejected by policy; the message says modo leitura,
+        // not "topologia").
         val canRotateScale = canTransform && viewModel.activeObjectEditable
         Text("Mover (passo 0,25)", color = ChromeDim, fontSize = 11.sp)
         StepRow("X", canTransform, { viewModel.nudgeMove(0, -0.25f) },
