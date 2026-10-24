@@ -91,12 +91,14 @@ object StatusMessages {
 class BloneViewModel : ViewModel() {
 
     /**
-     * Import-failure details for the multi-line dialog (F4-LIMITS, P1).
-     * The old truncated toast hid the numbers; the dialog shows the file
-     * counts, the ACTIVE profile limits and the 3 suggestions. Counts are
-     * -1 when the failure happened before the file was parsed.
+     * Import-failure details for the multi-line dialog (F4-LIMITS, P1; D6
+     * hotfix: EVERY IMPORT_FAIL/EXPORT_FAIL/PROMOTE_FAIL opens it — the old
+     * truncated toast is gone for good). The motivo carries the FULL reason
+     * (never truncated); the counts/profile block is shown only when the
+     * engine could report them (fileVerts >= 0; -1 = pre-parse failure).
      */
-    data class ImportIssue(
+    data class IoFailureDetail(
+        val title: String,
         val motivo: String,
         val fileVerts: Long,
         val fileTris: Long,
@@ -106,11 +108,34 @@ class BloneViewModel : ViewModel() {
         val viewTris: Long,
     )
 
-    var importIssue by mutableStateOf<ImportIssue?>(null)
+    var importIssue by mutableStateOf<IoFailureDetail?>(null)
         private set
 
     fun dismissImportIssue() {
         importIssue = null
+    }
+
+    /** D6: the one dialog constructor for every I/O failure kind (R8). */
+    private fun reportIoFailure(
+        title: String,
+        motivo: String,
+        fileVerts: Long = -1,
+        fileTris: Long = -1,
+        profileName: String = "",
+        editVerts: Long = 0,
+        editTris: Long = 0,
+        viewTris: Long = 0,
+    ) {
+        importIssue = IoFailureDetail(
+            title = title,
+            motivo = motivo,
+            fileVerts = fileVerts,
+            fileTris = fileTris,
+            profileName = profileName,
+            editVerts = editVerts,
+            editTris = editTris,
+            viewTris = viewTris,
+        )
     }
 
     /**
@@ -638,20 +663,19 @@ class BloneViewModel : ViewModel() {
                 val motivo = ev.motivo
                 statusText = if (motivo.isEmpty()) "Falha na importação"
                              else "Falha na importação: $motivo"
-                // Dialog whenever the file counts were reportable (parsed
-                // or drained). Open/parser failures keep the full reason in
-                // the status line (never a bare message, R8).
-                if (ev.fileVerts >= 0) {
-                    importIssue = ImportIssue(
-                        motivo = motivo.ifEmpty { "falha na importação" },
-                        fileVerts = ev.fileVerts,
-                        fileTris = ev.fileTris,
-                        profileName = ev.profileName.ifEmpty { "Médio" },
-                        editVerts = ev.editVerts,
-                        editTris = ev.editTris,
-                        viewTris = ev.viewTris,
-                    )
-                }
+                // D6: EVERY import failure opens the full-reason dialog —
+                // pre-parse failures included (counts -1 => no numbers
+                // block, the motivo alone is complete, never truncated).
+                reportIoFailure(
+                    title = "Falha na importação",
+                    motivo = motivo.ifEmpty { "falha na importação" },
+                    fileVerts = ev.fileVerts,
+                    fileTris = ev.fileTris,
+                    profileName = ev.profileName,
+                    editVerts = ev.editVerts,
+                    editTris = ev.editTris,
+                    viewTris = ev.viewTris,
+                )
                 ioBusy = false
                 cleanupTemp()
                 refresh()
@@ -659,7 +683,9 @@ class BloneViewModel : ViewModel() {
             is IoStatusParser.Event.ImportNeedsFiles -> {
                 // D5: dois tempos — pedir a pasta que contém os .bin. O
                 // .gltf em cache TEM de sobreviver para o retry (sem
-                // cleanupTemp aqui); o motivo completo fica no diálogo.
+                // cleanupTemp aqui). D6: o diálogo dedicado É o diálogo do
+                // motivo — mostra a lista completa + o motivo integral
+                // (multi-linha com scroll, nada cortado).
                 needsFiles = NeedsExternalFiles(ev.files, ev.motivo)
                 statusText = "Ficheiros externos em falta: " +
                     ev.files.joinToString(", ")
@@ -678,6 +704,11 @@ class BloneViewModel : ViewModel() {
                 val motivo = ev.motivo
                 statusText = if (motivo.isEmpty()) "Falha na exportação"
                              else "Falha na exportação: $motivo"
+                // D6: export failures get the same full-reason dialog.
+                reportIoFailure(
+                    title = "Falha na exportação",
+                    motivo = motivo.ifEmpty { "falha na exportação" },
+                )
                 ioBusy = false
                 cleanupTemp()
             }
@@ -690,6 +721,12 @@ class BloneViewModel : ViewModel() {
                 val motivo = ev.motivo
                 statusText = if (motivo.isEmpty()) "Falha ao tornar editável"
                              else "Falha ao tornar editável: $motivo"
+                // D6: promotion failures join the full-reason dialog too
+                // (same R8 contract — no bare/truncated failure messages).
+                reportIoFailure(
+                    title = "Falha ao tornar editável",
+                    motivo = motivo.ifEmpty { "falha ao tornar editável" },
+                )
                 ioBusy = false
                 refresh()
             }

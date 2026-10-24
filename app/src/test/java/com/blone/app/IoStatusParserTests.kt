@@ -88,4 +88,47 @@ class IoStatusParserTests {
         assertTrue(IoStatusParser.parse("KIND_NOVA|x") is IoStatusParser.Event.Unknown)
     }
 
+    // ---- D6: long failure reasons reach the DIALOG state, never cut -------
+
+    /** The VM opens the full-reason dialog for these kinds — ALWAYS. */
+    private fun opensFailureDialog(ev: IoStatusParser.Event): Boolean =
+        ev is IoStatusParser.Event.ImportFail ||
+            ev is IoStatusParser.Event.ExportFail ||
+            ev is IoStatusParser.Event.PromoteFail ||
+            ev is IoStatusParser.Event.ImportNeedsFiles
+
+    @Test
+    fun longImportFailMotivoProducesDialogStateUncut() {
+        val reason = "ficheiro acima do limite de edição do perfil Médio " +
+            "(150.000 triângulos / 75.000 vértices); o ficheiro tem " +
+            "1.250.400 triângulos e 640.120 vértices — " + "x".repeat(2400)
+        val status = "IMPORT_FAIL|/cache/io-import-1.gltf|$reason|-1|-1"
+        val ev = IoStatusParser.parse(status)
+        // D6: the failure produces DIALOG state (not only a statusText line)
+        // even with unknown counts, and the motivo arrives COMPLETE.
+        assertTrue(opensFailureDialog(ev))
+        ev as IoStatusParser.Event.ImportFail
+        assertEquals(-1L, ev.fileVerts) // pre-parse failure: no numbers block
+        assertEquals(reason, ev.motivo) // NOTHING truncated
+        assertEquals(reason.length, ev.motivo.length)
+    }
+
+    @Test
+    fun longExportFailMotivoProducesDialogStateUncut() {
+        val reason = "erro inesperado durante a exportação: " + "y".repeat(1500)
+        val ev = IoStatusParser.parse("EXPORT_FAIL|/cache/io-export-1.obj|$reason")
+        assertTrue(opensFailureDialog(ev))
+        assertEquals(reason, (ev as IoStatusParser.Event.ExportFail).motivo)
+    }
+
+    @Test
+    fun needsFilesIsDialogStateWithFullMotivo() {
+        val motivo = "o modelo referencia ficheiros externos que não foram " +
+            "encontrados junto do documento — " + "z".repeat(900)
+        val ev = IoStatusParser.parse("IMPORT_NEEDS_FILES|modelo.bin;extra.bin|$motivo")
+        assertTrue(opensFailureDialog(ev)) // D6: NEEDS_FILES opens a dialog too
+        ev as IoStatusParser.Event.ImportNeedsFiles
+        assertEquals(listOf("modelo.bin", "extra.bin"), ev.files)
+        assertEquals(motivo, ev.motivo)
+    }
 }

@@ -185,50 +185,60 @@ private fun StepButton(label: String, enabled: Boolean, onClick: () -> Unit) {
 }
 
 /**
- * Multi-line import-failure dialog (missão F4-LIMITS, P1). Replaces the old
- * truncated toast: the reason carries the numbers, the file counts, the
- * ACTIVE profile limits and the 3 suggestions — every line in PT, nothing
- * truncated. Shown whenever the engine reports a parseable-file failure
- * (fields 4..9 of the IMPORT_FAIL protocol present).
+ * Multi-line FAILURE dialog (missão F4-LIMITS, P1; hotfix D6: fires for
+ * EVERY IMPORT_FAIL / EXPORT_FAIL / PROMOTE_FAIL — the old truncated toast
+ * is gone). The motivo is the COMPLETE engine reason, multi-line with
+ * vertical scroll — nothing can be cut. When the engine could report the
+ * file counts (fields 4..9 of the IMPORT_FAIL protocol), the numbers, the
+ * ACTIVE profile limits and the 3 suggestions are shown as well.
  */
 @Composable
 private fun ImportIssueDialog(viewModel: BloneViewModel) {
     val issue = viewModel.importIssue ?: return
+    val hasCounts = issue.fileVerts >= 0
     AlertDialog(
         onDismissRequest = { viewModel.dismissImportIssue() },
         containerColor = ChromeSolid,
         titleContentColor = ChromeFg,
         textContentColor = ChromeFg,
-        title = { Text("Falha na importação", fontSize = 16.sp, fontWeight = FontWeight.Bold) },
+        title = { Text(issue.title, fontSize = 16.sp, fontWeight = FontWeight.Bold) },
         text = {
-            Column {
+            // D6: the reason itself scrolls — a long PT reason is NEVER
+            // truncated, whatever the screen size.
+            Column(
+                modifier = Modifier
+                    .heightIn(max = 420.dp)
+                    .verticalScroll(rememberScrollState())
+            ) {
                 Text(
                     text = issue.motivo,
                     color = ChromeFg,
                     fontSize = 12.sp,
                 )
-                Spacer(modifier = Modifier.height(8.dp))
-                Text(
-                    text = "Ficheiro: ${com.blone.app.vm.StatusMessages.formatCount(issue.fileVerts)} vértices · " +
-                        "${com.blone.app.vm.StatusMessages.formatCount(issue.fileTris)} triângulos",
-                    color = ChromeDim,
-                    fontSize = 11.sp,
-                    fontFamily = FontFamily.Monospace,
-                )
-                Text(
-                    text = "Perfil ativo: ${issue.profileName} — edição: " +
-                        "${com.blone.app.vm.StatusMessages.formatCount(issue.editVerts)} vértices / " +
-                        "${com.blone.app.vm.StatusMessages.formatCount(issue.editTris)} triângulos · " +
-                        "leitura: ${com.blone.app.vm.StatusMessages.formatCount(issue.viewTris)} triângulos",
-                    color = ChromeDim,
-                    fontSize = 11.sp,
-                    fontFamily = FontFamily.Monospace,
-                )
-                Spacer(modifier = Modifier.height(8.dp))
-                Text("Sugestões:", color = Accent, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
-                Text("1. Escolha um ficheiro mais leve (menos triângulos).", color = ChromeDim, fontSize = 11.sp)
-                Text("2. Mude o perfil de limites para Alto em Propriedades (dispositivos com RAM suficiente).", color = ChromeDim, fontSize = 11.sp)
-                Text("3. Simplifique o modelo noutro programa (decimação) antes de importar.", color = ChromeDim, fontSize = 11.sp)
+                if (hasCounts) {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text = "Ficheiro: ${com.blone.app.vm.StatusMessages.formatCount(issue.fileVerts)} vértices · " +
+                            "${com.blone.app.vm.StatusMessages.formatCount(issue.fileTris)} triângulos",
+                        color = ChromeDim,
+                        fontSize = 11.sp,
+                        fontFamily = FontFamily.Monospace,
+                    )
+                    Text(
+                        text = "Perfil ativo: ${issue.profileName.ifEmpty { "Médio" }} — edição: " +
+                            "${com.blone.app.vm.StatusMessages.formatCount(issue.editVerts)} vértices / " +
+                            "${com.blone.app.vm.StatusMessages.formatCount(issue.editTris)} triângulos · " +
+                            "leitura: ${com.blone.app.vm.StatusMessages.formatCount(issue.viewTris)} triângulos",
+                        color = ChromeDim,
+                        fontSize = 11.sp,
+                        fontFamily = FontFamily.Monospace,
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text("Sugestões:", color = Accent, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+                    Text("1. Escolha um ficheiro mais leve (menos triângulos).", color = ChromeDim, fontSize = 11.sp)
+                    Text("2. Mude o perfil de limites para Alto em Propriedades (dispositivos com RAM suficiente).", color = ChromeDim, fontSize = 11.sp)
+                    Text("3. Simplifique o modelo noutro programa (decimação) antes de importar.", color = ChromeDim, fontSize = 11.sp)
+                }
             }
         },
         confirmButton = {
