@@ -4,8 +4,12 @@
 #include "test_util.h"
 
 #include "../core/history/History.h"
+#include "../core/io/MeshBuilder.h"
+#include "../core/io/ObjExporter.h"
+#include "../core/io/ObjLoader.h"
 #include "../core/mesh/Primitives.h"
 #include "../core/project/Project.h"
+#include "../core/render/RenderMesh.h"
 #include "../core/scene/SceneOps.h"
 
 using namespace blone;
@@ -280,6 +284,108 @@ void testMasterAcceptanceSequence() {
 } // namespace
 
 namespace blone::test {
+// ------------------------------------------------ F4-LIMITS P5 ------------
+void testProjectV3ReadObjectRoundTrip() {
+    using blone::io::MeshBuilder;
+    using blone::io::RawMeshData;
+    Scene s;
+    History h;
+    // One EDITABLE object + one READ-ONLY object in the same scene.
+    CHECK(sceneops::createPrimitive(s, h, PrimType::Cube, 0, 0) >= 0);
+    RawMeshData raw;
+    raw.positions = {Vec3{0, 0, 0}, Vec3{1, 0, 0}, Vec3{1, 1, 0},
+                     Vec3{0, 1, 0}};
+    raw.colors = {Vec3{1, 0, 0}, Vec3{0, 1, 0}, Vec3{0, 0, 1},
+                  Vec3{1, 1, 0}};
+    raw.faceIndices.push_back({0, 1, 2});
+    raw.faceIndices.push_back({0, 2, 3});
+    auto mesh = MeshBuilder::build(raw);
+    REQUIRE(mesh.has_value());
+    SceneObject readObj;
+    readObj.name = "leitura";
+    readObj.position = Vec3{3.0f, 0.0f, 0.0f};
+    readObj.editable = false;
+    readObj.readMesh =
+            std::make_shared<const blone::render::RenderMesh>(
+                    blone::render::buildRenderMesh(raw));
+    (void)mesh;
+    s.objects.push_back(std::move(readObj));
+    s.active = 1;
+    s.bump();
+
+    // v3 save -> load: the read object survives with its geometry intact.
+    const std::vector<uint8_t> bytes = project::save(s);
+    REQUIRE(!bytes.empty());
+    Scene loaded;
+    REQUIRE(project::load(bytes, loaded) == project::Ok);
+    REQUIRE(loaded.objects.size() == 2);
+    CHECK(loaded.objects[0].editable);
+    CHECK(loaded.objects[0].readMesh == nullptr);
+    CHECK(test::sameMesh(loaded.objects[0].mesh, s.objects[0].mesh));
+    REQUIRE(loaded.objects[1].readMesh != nullptr);
+    CHECK(!loaded.objects[1].editable);
+    CHECK(loaded.objects[1].mesh.empty());
+    CHECK(loaded.objects[1].name == "leitura");
+    CHECK(loaded.objects[1].position.x == 3.0f);
+    const auto& rm = *loaded.objects[1].readMesh;
+    CHECK(rm.positions.size() == 4);
+    CHECK(rm.triangleCount == 2);
+    CHECK(rm.indices.size() == 6);
+    // Bit-exact positions/colors through the serialization.
+    for (size_t i = 0; i < raw.positions.size(); ++i) {
+        CHECK(rm.positions[i].x == raw.positions[i].x);
+        CHECK(rm.positions[i].y == raw.positions[i].y);
+        CHECK(rm.positions[i].z == raw.positions[i].z);
+        CHECK(rm.colors[i].x == raw.colors[i].x);
+        CHECK(rm.colors[i].y == raw.colors[i].y);
+        CHECK(rm.colors[i].z == raw.colors[i].z);
+    }
+    CHECK(loaded.active == 1);
+}
+
+void testExportIncludesReadObjects() {
+    using blone::io::MeshBuilder;
+    using blone::io::ObjExporter;
+    using blone::io::ObjLoader;
+    using blone::io::RawMeshData;
+    Scene s;
+    History h;
+    CHECK(sceneops::createPrimitive(s, h, PrimType::Cube, 0, 0) >= 0);
+    h.clear();
+    // A read-only object offset from the editable one.
+    RawMeshData raw;
+    raw.positions = {Vec3{0, 0, 0}, Vec3{1, 0, 0}, Vec3{1, 1, 0}};
+    raw.faceIndices.push_back({0, 1, 2});
+    auto readObj = SceneObject{};
+    readObj.name = "leitura";
+    readObj.position = Vec3{5.0f, 0.0f, 0.0f};
+    readObj.editable = false;
+    readObj.readMesh =
+            std::make_shared<const blone::render::RenderMesh>(
+                    blone::render::buildRenderMesh(raw));
+    s.objects.push_back(std::move(readObj));
+    s.bump();
+
+    // Export: the read-only object's triangle must appear in world space.
+    const std::string path = "blone_test_read_export.obj";
+    REQUIRE(ObjExporter::exportScene(s, path));
+    std::string err;
+    const auto back = ObjLoader::load(path, &err);
+    REQUIRE(back.has_value());
+    // Cube (8 verts) + read triangle expanded (3 corners) — the read
+    // triangle is DISJOINT from the cube so it survives dedup.
+    bool foundTranslated = false;
+    for (const Vec3& p : back->positions) {
+        if (p.x > 4.9f && p.x < 5.1f && p.y > -0.1f && p.z > -0.1f) {
+            foundTranslated = true; // a vertex of the offset read triangle
+        }
+    }
+    CHECK(foundTranslated);
+    // 6 cube quads + 1 read triangle -> 13 triangles after re-import.
+    CHECK(blone::io::rawTriangleCount(*back) >= 13);
+    std::remove(path.c_str());
+}
+
 void runHistoryProjectTests() {
     testHistoryReservationAndBudget();
     testHistoryEviction();
@@ -287,5 +393,7 @@ void runHistoryProjectTests() {
     testProjectRoundTrip();
     testProjectRejections();
     testMasterAcceptanceSequence();
+    testProjectV3ReadObjectRoundTrip(); // F4-LIMITS P5
+    testExportIncludesReadObjects();    // F4-LIMITS P5
 }
 } // namespace blone::test

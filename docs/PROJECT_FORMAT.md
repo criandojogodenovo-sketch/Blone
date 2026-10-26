@@ -1,11 +1,22 @@
-# Formato de Projeto Blone — "BLONEPRJ" (versão atual: 2)
+# Formato de Projeto Blone — "BLONEPRJ" (versão atual: 4)
 
-> **Versão 2 (Fase 3):** acrescenta **cor por vértice** (albedo RGB) para a
-> ferramenta Pintar. O leitor aceita ficheiros **v1 e v2**; um ficheiro v1
-> abre com a cor por vértice predefinida (idêntica ao aspeto anterior à
-> extensão). O escritor grava sempre a versão corrente (2). Uma aplicação
-> antiga (leitor v1) rejeita um ficheiro v2 com o erro `-2` e uma mensagem
-> clara — nunca interpreta às cegas.
+> **Versão 4 (Fase 5.1):** acrescenta uma secção **esparsa de UVs por
+> canto** à malha half-edge — um triplo `(heId, u, v)` por half-edge vivo
+> com UV armazenado. O UV de um canto vive no half-edge do lado da face,
+> portanto **costuras UV sobrevivem**: um vértice geométrico partilhado
+> pode ter valores diferentes por face adjacente. O leitor aceita **v1,
+> v2, v3 e v4**; v1/v2/v3 abrem sem UVs (comportamento antigo intacto).
+> O escritor grava sempre a versão corrente (4). Aplicações antigas
+> rejeitam v4 com o erro `-2` e uma mensagem clara — nunca interpretam às
+> cegas.
+>
+> **Versão 3 (F4-LIMITS):** flag `editable` por objeto. Objetos em **modo
+> leitura** (imports acima do orçamento de edição do perfil, dentro do de
+> visualização) guardam a geometria como **malha de renderização indexada**
+> (posições + cores verbatim + índices u32) em vez de estruturas half-edge.
+>
+> **Versão 2 (Fase 3):** cor por vértice (albedo RGB) para a ferramenta
+> Pintar — mantida tal como estava.
 
 Este documento define o formato binário próprio com que o Blone guarda e
 abre projetos. Implementação: `app/src/main/cpp/core/project/Project.{h,cpp}`.
@@ -13,7 +24,7 @@ abre projetos. Implementação: `app/src/main/cpp/core/project/Project.{h,cpp}`.
 ## 1. Garantias
 
 - **Versionado**: o cabeçalho contém `formatVersion`. O leitor aceita as
-  versões que conhece (1 e 2); versões mais recentes produzem o erro `-2`
+  versões que conhece (1 a 4); versões mais recentes produzem o erro `-2`
   com mensagem clara — nunca são interpretadas às cegas.
 - **Integridade**: CRC32 (IEEE, polinómio 0xEDB88320) sobre o payload.
   Ficheiros corrompidos são rejeitados com o erro `-4`.
@@ -30,7 +41,7 @@ abre projetos. Implementação: `app/src/main/cpp/core/project/Project.{h,cpp}`.
 ```
 Deslocamento  Tamanho  Campo
 0             8        Magic "BLONEPRJ"
-8             4        formatVersion (u32; atualmente 2 — v1 continua a abrir)
+8             4        formatVersion (u32; atualmente 4 — v1/v2/v3 continuam a abrir)
 12            8        payloadLength (u64)
 20            4        CRC32 (u32) do payload
 24            ...      payload
@@ -51,8 +62,9 @@ repetido objectCount vezes:
     f32 × 3         posição do objeto (translação; a Fase 2 não guarda
                     rotação/escala de objeto — podem ser adicionadas numa
                     versão futura do formato)
-    mesh (ver §4)
-    seleção (ver §5)
+    v3 APENAS: u8   editable (1 = editável, 0 = modo leitura)
+    editable == 1:  mesh (ver §4) + seleção (ver §5)
+    editable == 0:  malha de leitura (ver §4-A) + seleção (sempre vazia)
 ```
 
 ## 4. Malha
@@ -71,6 +83,14 @@ u32 vertexCount
                   recebem a cor predefinida kDefaultVertexColor)
 u32 halfEdgeCount
     por half-edge: u32 id, origin, twin, next, prev, face (0 = fronteira), edge
+v4 APENAS: u32 uvCount
+    por entrada:  u32 heId; f32 u, v   (ESPARSO — só half-edges vivos com UV
+                  armazenado; o array no motor é preguiçoso e indexado por id.
+                  Na abertura é reconstruído até (maior heId gravado)+1, logo
+                  «tem UV» ⇔ heId dentro desse intervalo; cantos fora dele
+                  devolvem (0,0). Malhas sem UVs gravam uvCount = 0.
+                  heId inválido ou valor não finito → erro -8;
+                  uvCount > halfEdgeCount → erro -5)
 u32 edgeCount
     por aresta:    u32 id, he
 u32 faceCount
@@ -81,6 +101,20 @@ u32 × 4            reservado (o leitor recalcula os contadores de id como
 
 `vertex.outgoing` é **estado derivado** e não é serializado: na abertura é
 recomputado como "o primeiro half-edge vivo com origem no vértice".
+
+## 4-A. Malha de leitura (v3, `editable == 0`)
+
+```
+u32 vertexCount
+    por vértice:  f32 x, y, z; f32 r, g, b   (posições/cores VERBATIM —
+                  não finitos → erro -8; cores fora do intervalo → [0,1])
+u32 indexCount (múltiplo de 3; senão erro -5)
+    por índice:   u32 (cada valor < vertexCount, senão erro -8)
+```
+
+A geometria reconstrói um `RenderMesh` imutável partilhado (~30 B por
+triângulo). A validação de topologia half-edge não se aplica; as contagens
+respeitam os tetos de `MeshLimits`.
 
 ## 5. Seleção
 

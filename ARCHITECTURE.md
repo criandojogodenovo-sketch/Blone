@@ -66,6 +66,14 @@ genéricas além do que as fases exigem.
   nunca é "apenas triângulos".
 - Índice dirigido `(origem, destino) → half-edge` (hash map) para
   resolução O(1) em `addFace`.
+- **UVs por canto** (Fase 5.1): um `Vec2` por half-edge, num array
+  **preguiçoso indexado por id** (vazio até uma face ser criada COM UVs —
+  malhas sem UV pagam zero bytes e comportam-se como antes). O UV de um
+  canto vive no half-edge **do lado da face**, logo um vértice geométrico
+  partilhado por duas faces pode ter valores diferentes (costura UV). O
+  `addFace` com UVs é o único caminho que faz crescer o array; o
+  `splitEdge` mantém-no paralelo (transferência do canto que morre +
+  interpolação a meio das arestas).
 
 **Invariantes** (verificados por `validate()` e pela suíte de testes, após
 cada operação):
@@ -79,7 +87,9 @@ cada operação):
 5. sem referências pendentes (tudo aponta para elementos vivos ou 0);
 6. sem órfãos (vértice vivo ⇒ `outgoing` válido; face/aresta vivas ⇒ `he`
    válido);
-7. loops de face com 3..256 vértices distintos.
+7. loops de face com 3..256 vértices distintos;
+8. o array de UVs nunca excede o espaço de ids de half-edges
+   (Fase 5.1; `uvs.size() ≤ nextHid`).
 
 ### 2.2 Primitivas (`core/mesh/Primitives`)
 
@@ -316,18 +326,38 @@ temporária; erro algum destrói o projeto aberto. Ver tabela de erros em
 
 ## 5. Limites de geometria e memória
 
+Dois níveis (F4-LIMITS):
+
+**Teto HARD** (`MeshLimits`, HalfEdgeMesh.h) — rede de segurança absoluta
+dos pools; nenhum caminho consegue passar disto:
+
 | Limite | Valor |
 |---|---|
-| Vértices por objeto | 200 000 |
-| Arestas por objeto | 400 000 |
-| Half-edges por objeto | 800 000 |
-| Faces por objeto | 200 000 |
+| Vértices por objeto (teto) | 4 000 000 |
+| Arestas por objeto (teto) | 12 000 000 |
+| Half-edges por objeto (teto) | 24 000 000 |
+| Faces por objeto (teto) | 8 000 000 |
 | Lados por face | 256 |
 | Objetos por cena | 32 |
 | Segmentos U (cilindro/esfera) | 3..96 |
 | Bandas V (esfera) | 2..48 |
 | Tamanho das primitivas | 0,01..64 unidades |
-| Orçamento do histórico | 24 MB / 64 entradas (o que chegar primeiro) |
+
+**Limites RUNTIME por perfil** (`core/io/GeometryLimits.h`) — decidem
+edição vs modo leitura vs rejeição ANTES de qualquer alocação pesada
+(classificação no worker de I/O; o usuário escolhe o perfil em
+Propriedades, persistido em SharedPreferences, default por RAM):
+
+| Perfil | editVerts | editTris | viewTris (leitura) | historyBytes |
+|---|---|---|---|---|
+| Baixo  |  40 000 |  80 000 |   500 000 | 32 MB |
+| Médio  |  75 000 | 150 000 | 1 000 000 | 48 MB |
+| Alto   | 150 000 | 300 000 | 2 000 000 | 96 MB |
+
+O `historyBytes` é dimensionado para caber a entrada ObjAdd do MAIOR
+import editável do perfil (~270 B por triângulo editável) + margem;
+a eviction mantém a utilização <= orçamento. Objetos acima do orçamento
+de edição mas dentro de `viewTris` entram em MODO LEITURA (§10).
 
 Verificações de limites (com margem conservadora para o pior caso) correm
 ANTES das alocações; extrapolação devolve `ErrLimit`/`ErrBudget` com a malha
@@ -502,9 +532,165 @@ sistema de geometria:
 - Teste físico pendente: latência e sensação do traço em hardware real
   (os testes host cobrem a lógica, não a ergonomia tátil).
 
-## 9. Fases futuras (não implementadas aqui)
+## 9. Fase 4 — I/O 3D (OBJ + glTF/GLB, round-trip de pintura)
 
-Importação/exportação: tinygltf (glTF 2.0/GLB) com versão fixada e licença
-verificada, importador OBJ, exportação GLB/glTF, stb_image para texturas,
-xatlas para UV. Nenhuma destas dependências ou funcionalidades foi
-integrada — `core/io/` continua vazio de propósito.
+### 9.1 Arquitetura e contratos (`core/io/`)
+
+O módulo `core/io/` é a ÚNICA porta entre ficheiros e a cena viva. Quatro
+pares `.h/.cpp`:
+
+- **`MeshBuilder`** — `RawMeshData` (geometria flat agnóstica de formato:
+  `positions` + arrays paralelos opcionais `normals/colors/uvs` +
+  `faceIndices`) → `std::optional<HalfEdgeMesh>`, construído pelo pipeline
+  EXISTENTE (`addVertex → addFace → relinkBoundaryLoops → validate`).
+  Rejeita (nullopt, zero efeitos): listas vazias, limites `MeshLimits`,
+  arrays paralelos inconsistentes, posições não finitas, índices fora de
+  range, vértice duplicado num laço, faces <3 ou >256 lados, `addFace`
+  falhado (non-manifold). `colors` vazio = tudo branco; presente = aplicado
+  por vértice (com clamp [0,1], mesma política do carregador de projetos).
+  **Não é um segundo sistema de geometria** — é a ponte para o existente.
+- **`ObjLoader`** — parser linha-a-linha próprio (sem libs): `v/vn/vt/f`,
+  cantos `v`, `v/vt`, `v//vn`, `v/vt/vn`, índices 1-based E negativos
+  relativos; expansão de cantos (cada tuplo (pos,uv,normal) único = 1
+  vértice do RawMeshData, arrays paralelos mantidos); cor da extensão
+  `v x y z r g b` (branco por defeito); diretivas desconhecidas ignoradas;
+  qualquer linha malformada rejeita o ficheiro INTEIRO (nullopt).
+- **`ObjExporter`** — `exportScene(const Scene&, path) -> bool`, READ-ONLY
+  sobre um snapshot: `o <nome sanitizado>`, `v x y z r g b` em espaço do
+  mundo (aplica `obj.position`; PONTO DE EXTENSÃO MARCADO no código para
+  rotação/escala), `vn` suaves área-ponderadas (Newell não normalizado
+  acumulado por vértice, normalizado uma vez no fim) e `f v//vn` com dedup
+  de tuplos (pos,uv,normal) via `unordered_map` partilhado pela cena inteira
+  (slot de uv = 0 até existir storage por canto — o mecanismo já está
+  completo). Floats com `%.9g` (round-trip bit-exact de float32).
+- **`GltfLoader`** — cgltf v1.14 vendorizado é o ÚNICO parser (proibido
+  JSON/binário à mão); `cgltf_parse_file → cgltf_load_buffers (uri_root=
+  path) → cgltf_validate`, guard RAII com `cgltf_free` em TODOS os
+  caminhos. POSITION obrigatório; NORMAL/TEXCOORD_0/COLOR_0 opcionais
+  (COLOR vec3/vec4); primitivas TRIANGLES concatenadas com offset;
+  índices u8/u16/u32 e atributos SEMPRE via `cgltf_accessor_read_index/
+  read_float` (nunca ponteiros crus); triângulos degenerados saltados (não
+  fatais); paralelismo de cores com a regra
+  `if (colAcc || !out.colors.empty()) resize(base+count, branco)`.
+
+Vendoring: `third_party/cgltf/` — `cgltf.h` e `LICENSE` oficiais v1.14
+intactos; desde a v1.14 o cgltf é single-header, pelo que `cgltf.c` local é
+a instanciação canónica de uma única TU (`#define CGLTF_IMPLEMENTATION` +
+`#include "cgltf.h"`), documentada no README do diretório. O CMake passou a
+`project(blone LANGUAGES C CXX)`.
+
+### 9.2 Threading de I/O (Regra 3: GL e UI nunca bloqueiam em disco)
+
+```text
+UI thread (Kotlin)                    GL thread (drawFrame, por frame)
+--------------------                  -------------------------------
+SAF: URI -> cacheDir (IO dispatcher)        lock gMutex
+requestImport(cachePath,…)                    |
+  \_ NativeLib.importMesh                     |
+       \_ std::async(worker)                  |
+            parse + MeshBuilder::build        |
+            fila gPendingImports (gIoMutex)   v
+                                     drainPendingImportsLocked():
+                                       troca da fila (gIoMutex)
+                                       addImportedObject() POR OBJETO:
+                                         kMaxObjects + reserva +
+                                         1 entrada ObjAdd + prune + bump
+exportObj(cachePath)                                 
+  \_ NativeLib.exportObj                             
+       \_ std::async(worker)                         
+            snapshot profundo sob gMutex             
+            (captureRaw/restoreRaw por objeto)       
+            ObjExporter::exportScene(snapshot)       
+            gIoStatus = EXPORT_OK|FAIL               
+```
+
+- **Estado atómico para o Kotlin**: `gIoStatus` (mutex próprio) com o
+  protocolo `"" idle | "IMPORT_OK|<nome>" | "IMPORT_FAIL|<path>" |
+  "EXPORT_OK|<cachepath>" | "EXPORT_FAIL|<path>"`; escrito por
+  workers/drenagem, lido/consumido (`ioStatus`/`ioStatusConsume`) pelo
+  Kotlin FORA da thread GL — o ViewModel faz polling de 400 ms APENAS
+  enquanto há operação pendente.
+- **Armadilha dos futures**: destruir um `std::future` de `std::async`
+  sem o terminado BLOQUEIA a thread que o destrói; os futures ficam num
+  vector global e são PODADOS só quando terminados (`is_ready()`), antes
+  de cada novo lançamento.
+- A malha NUNCA cruza a ponte JNI: o Kotlin envia caminhos e nomes; o
+  worker devolve só o estado textual.
+
+### 9.3 Representação e histórico
+
+- O import entra na cena EXCLUSIVamente pela fachada
+  `SceneOps::addImportedObject` (mesmo contrato de `createPrimitive`):
+  `kMaxObjects`, reserva de orçamento ANTES da mutação, UMA entrada
+  ObjectAdded (undo remove o import; redo repõe), prune de seleção e
+  `Scene::bump()` para o resync do renderer.
+- O snapshot de exportação usa `captureRaw/restoreRaw` — o `Raw` guarda
+  `Vertex` completos (posição + COR, herdado da Fase 3), pelo que a
+  pintura sobrevive ao ciclo exportar → importar (testado bit-exact).
+
+### 9.4 Limitações conhecidas (Fase 4)
+
+- **OBJ é mono-malha**: o export funde posições coincidentes entre
+  objetos num só par v/vn e o import reconstrói UMA malha — objetos
+  sobrepostos podem fundir-se no round-trip.
+- **UVs por canto** (Fase 5.1): OBJ lê `vt`/escreve `vt` + `f v/vt/vn`
+  (bit-exato `%.9g`, round-trip eps 1e-6); glTF lê `TEXCOORD_0` e o
+  `MeshBuilder` guarda por canto; BLONEPRJ v4 persiste (leitor v1–v4).
+  Custo/limitações: malhas **sem** UV continuam a exportar `f v//vn`
+  (formato histórico intacto); objetos em **modo leitura** (RenderMesh)
+  não guardam UVs — reexportam sem `vt` (o RenderMesh não tem storage de
+  UV por decisão de memória do F4-LIMITS); UVs de cantos criados por
+  operações sem UV (extruder/subdivide em malhas não-UV) ficam (0,0).
+- **Export glTF** adiado; **materiais PBR/texturas** = Fase 5.
+- Accessors **sparse** do glTF falham limpo (`cgltf_accessor_read_float`
+  devolve 0 → nullopt) — raros, rejeitados em vez de adivinhados.
+- Normais/uvs de cantos sem `vn`/`vt` ficam com placeholder (0,0,0)/(0,0)
+  quando o ficheiro mistura cantos com e sem atributo — documentado no
+  header; o motor recalcula normais de qualquer forma.
+
+## 10. Modo leitura (RenderMesh, F4-LIMITS)
+
+Imports acima do orçamento de edição do perfil mas dentro de `viewTris`
+tornam-se objetos READ-ONLY: nenhuma half-edge é construída (exatamente a
+memória que estourava). A geometria vive num `RenderMesh` imutável e
+partilhado (`std::shared_ptr`) — sopa de triângulos indexada, ~30 B por
+triângulo vs ~270 B por triângulo editável (pools + slot maps + pairMap +
+histórico). números medidos pelo suite: 1M triângulos = 17 MB de
+render mesh + ~56 MB de OBJ exportado.
+
+- **Renderização**: mesmo layout FillVertex; a normal da face vem de
+  `dFdx/dFdy` no fragment shader (`uFlatDeriv`) — ES 3.0 core, sem
+  duplicação de vértices. Sem overlays (wireframe/pontos/seleção).
+- **IBO por objeto** (P2): uint16 quando <= 65 535 vértices duplicados
+  (metade da memória), uint32 acima — malhas de 70k+ vértices desenham
+  com o caminho uint32 (nativo ES 3.0).
+- **Picking**: objetos de leitura são selecionáveis/movíveis em Modo
+  Objeto (raycast direto nos índices); em Edição são ignorados. O pincel
+  NUNCA mira objetos de leitura.
+- **Gizmo**: Mover funciona (só `obj.position`); Rodar/Escalar são
+  recusados (`ErrUnsupported`). Transformações de objetos de leitura não
+  são undoable (documentado).
+- **Promoção "Tornar editável"** (Propriedades): worker constrói a malha
+  editável fora da cena (classificada contra o orçamento de edição) e a
+  drenagem troca com UMA entrada `ObjectSwap` — undo devolve o objeto de
+  leitura, redo o editável, geometria bit-exact nos dois sentidos.
+- **Export/projeto**: objetos de leitura exportam do RenderMesh; o
+  formato BLONEPRJ v3 guarda a flag `editable` e a geometria verbatim.
+
+Otimizações (P7): frustum culling por AABB (Math3D::aabbInFrustum,
+Gribb-Hartmann — objeto inteiro fora do frustum salta todas as passadas)
+e pool de buffers GPU (até 8 entrados retirados com nomes GL vivos;
+glBufferData recarrega sem churn de alocação). Pré-contagem anti-crash
+(P4): OBJ conta diretivas numa passada barata e o glTF lê as contagens do
+JSON — ficheiros acima do teto são recusados ANTES de alocar; progresso
+0..1000 atómico + cancelamento limpo; `std::bad_alloc` é apanhado na
+fronteira das workers e vira IMPORT_FAIL com motivo PT.
+
+## 11. Fases futuras (não implementadas aqui)
+
+Exportação GLB/glTF, stb_image para texturas, xatlas para UV (unwrap
+automático), materiais PBR. O storage de UV por canto JÁ existe (Fase
+5.1: half-edge + OBJ round-trip + TEXCOORD_0 + BLONEPRJ v4); falta a
+amostragem de texturas no shader. Nenhuma destas dependências foi
+integrada além do parsing (cgltf vendorizado, usado só para importação
+de geometria).

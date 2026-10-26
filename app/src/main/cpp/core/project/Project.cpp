@@ -1,6 +1,7 @@
 #include "Project.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 
 namespace blone::project {
@@ -87,6 +88,22 @@ void writeMesh(Writer& w, const HalfEdgeMesh& m) {
         w.u32(h->face);
         w.u32(h->edge);
     }
+    // v4 (Fase 5.1): per-corner uvs, SPARSE — one entry per ALIVE half-edge
+    // whose id has an entry in the lazy id-indexed uv array (the writer side
+    // of the "id < size means stored" contract, HalfEdgeMesh.h). Meshes
+    // without uv data write a zero count and stay byte-lean.
+    uint32_t uvCount = 0;
+    for (const auto* h : hs) {
+        if (h->id < m.uvs().size()) ++uvCount;
+    }
+    w.u32(uvCount);
+    for (const auto* h : hs) {
+        if (h->id >= m.uvs().size()) continue;
+        const Vec2 t = m.uv(h->id);
+        w.u32(h->id);
+        w.f32(t.x);
+        w.f32(t.y);
+    }
     w.u32(static_cast<uint32_t>(es.size()));
     for (const auto* e : es) {
         w.u32(e->id);
@@ -103,6 +120,24 @@ void writeMesh(Writer& w, const HalfEdgeMesh& m) {
     w.u32(0);
     w.u32(0);
     w.u32(0);
+}
+
+// v3 (F4-LIMITS): the READ-ONLY render-mesh payload (see the header layout).
+void writeRenderMesh(Writer& w, const render::RenderMesh& rm) {
+    w.u32(static_cast<uint32_t>(rm.positions.size()));
+    const bool hasColors = rm.colors.size() == rm.positions.size();
+    for (size_t i = 0; i < rm.positions.size(); ++i) {
+        const Vec3& p = rm.positions[i];
+        w.f32(p.x);
+        w.f32(p.y);
+        w.f32(p.z);
+        const Vec3 c = hasColors ? rm.colors[i] : Vec3{1.0f, 1.0f, 1.0f};
+        w.f32(c.x);
+        w.f32(c.y);
+        w.f32(c.z);
+    }
+    w.u32(static_cast<uint32_t>(rm.indices.size()));
+    for (const uint32_t idx : rm.indices) w.u32(idx);
 }
 
 void writeSelection(Writer& w, const Selection& sel) {
@@ -200,6 +235,25 @@ int readMesh(Reader& r, HalfEdgeMesh& m, uint32_t fmtVersion) {
         }
         h.alive = true;
     }
+    // v4 (Fase 5.1): the SPARSE per-corner uv section sits right after the
+    // half-edges (mirroring writeMesh). v1/v2/v3 files simply do not have
+    // it. Entries are validated in place (finite values, bounded count) and
+    // applied after the slot maps exist — every id must belong to an alive
+    // half-edge of THIS mesh.
+    std::vector<std::pair<uint32_t, Vec2>> uvEntries;
+    if (fmtVersion >= 4) {
+        uint32_t uvCount = 0;
+        if (!r.u32(uvCount)) return ErrTruncated;
+        if (uvCount > n) return ErrLimits; // one per alive he at most
+        uvEntries.reserve(uvCount);
+        for (uint32_t i = 0; i < uvCount; ++i) {
+            uint32_t heId;
+            Vec2 t;
+            if (!r.u32(heId) || !r.f32(t.x) || !r.f32(t.y)) return ErrTruncated;
+            if (!std::isfinite(t.x) || !std::isfinite(t.y)) return ErrIndex;
+            uvEntries.emplace_back(heId, t);
+        }
+    }
     if (!r.u32(n)) return ErrTruncated;
     if (n > MeshLimits::maxEdges) return ErrLimits;
     raw.edges.resize(n);
@@ -271,11 +325,89 @@ int readMesh(Reader& r, HalfEdgeMesh& m, uint32_t fmtVersion) {
         if (v.outgoing == kNull) v.outgoing = h.id;
     }
 
+    // v4 (Fase 5.1): apply the sparse uvs now that id -> slot exists. The
+    // lazy array grows to the highest written id + 1 (verbatim restore keeps
+    // the mesh exactly as frugal as the writer left it).
+    if (!uvEntries.empty()) {
+        ElemId maxUvId = 0;
+        for (const auto& e : uvEntries) {
+            if (e.first >= raw.hSlot.size()) return ErrIndex;
+            if (raw.hes[raw.hSlot[e.first]].id != e.first) return ErrIndex;
+            maxUvId = std::max(maxUvId, e.first);
+        }
+        raw.uvs.resize(static_cast<size_t>(maxUvId) + 1);
+        for (const auto& e : uvEntries) raw.uvs[e.first] = e.second;
+    }
+
     m.restoreRaw(raw);
     if (!m.validate()) return ErrTopology;
     return Ok;
 }
 
+int readRenderMesh(Reader& r, SceneObject& obj) {
+    // v3 READ-ONLY payload -> a shared immutable RenderMesh.
+    uint32_t n = 0;
+    if (!r.u32(n)) return ErrTruncated;
+    if (n > MeshLimits::maxVertices) return ErrLimits;
+    std::vector<Vec3> positions(n);
+    std::vector<Vec3> colors(n);
+    for (uint32_t i = 0; i < n; ++i) {
+        if (!r.f32(positions[i].x) || !r.f32(positions[i].y) ||
+            !r.f32(positions[i].z) || !r.f32(colors[i].x) ||
+            !r.f32(colors[i].y) || !r.f32(colors[i].z)) {
+            return ErrTruncated;
+        }
+        if (!std::isfinite(positions[i].x) || !std::isfinite(positions[i].y) ||
+            !std::isfinite(positions[i].z) || !std::isfinite(colors[i].x) ||
+            !std::isfinite(colors[i].y) || !std::isfinite(colors[i].z)) {
+            return ErrIndex;
+        }
+        colors[i].x = std::min(1.0f, std::max(0.0f, colors[i].x));
+        colors[i].y = std::min(1.0f, std::max(0.0f, colors[i].y));
+        colors[i].z = std::min(1.0f, std::max(0.0f, colors[i].z));
+    }
+    if (!r.u32(n)) return ErrTruncated;
+    // Indices: 3 per triangle, every value inside the vertex pool.
+    if (n % 3 != 0 || n / 3 > MeshLimits::maxFaces) return ErrLimits;
+    std::vector<uint32_t> indices(n);
+    for (uint32_t i = 0; i < n; ++i) {
+        if (!r.u32(indices[i])) return ErrTruncated;
+        if (positions.empty() || indices[i] >= positions.size()) {
+            return ErrIndex;
+        }
+    }
+
+    blone::render::RenderMesh rm;
+    rm.positions = std::move(positions);
+    rm.colors = std::move(colors);
+    rm.indices = std::move(indices);
+    rm.triangleCount = rm.indices.size() / 3;
+    Vec3 acc{};
+    size_t count = 0;
+    if (!rm.positions.empty()) {
+        Aabb b;
+        b.minX = b.maxX = rm.positions[0].x;
+        b.minY = b.maxY = rm.positions[0].y;
+        b.minZ = b.maxZ = rm.positions[0].z;
+        for (const Vec3& p : rm.positions) {
+            b.minX = std::min(b.minX, p.x);
+            b.minY = std::min(b.minY, p.y);
+            b.minZ = std::min(b.minZ, p.z);
+            b.maxX = std::max(b.maxX, p.x);
+            b.maxY = std::max(b.maxY, p.y);
+            b.maxZ = std::max(b.maxZ, p.z);
+            acc = acc + p;
+            ++count;
+        }
+        rm.bounds = b;
+    }
+    if (count > 0) rm.centroid = acc * (1.0f / static_cast<float>(count));
+
+    obj.editable = false;
+    obj.readMesh = std::make_shared<const blone::render::RenderMesh>(
+            std::move(rm));
+    return Ok;
+}
 int readSelection(Reader& r, HalfEdgeMesh& m, Selection& sel) {
     auto readSet = [&](Selection::Set& out, bool (HalfEdgeMesh::*alive)(ElemId) const) -> int {
         uint32_t n;
@@ -321,8 +453,17 @@ std::vector<uint8_t> save(const Scene& scene) {
         w.f32(obj.position.x);
         w.f32(obj.position.y);
         w.f32(obj.position.z);
-        writeMesh(w, obj.mesh);
-        writeSelection(w, obj.sel);
+        // v3 (F4-LIMITS): the per-object editable flag decides the payload.
+        w.u8(obj.editable ? 1 : 0);
+        if (!obj.editable && obj.readMesh) {
+            writeRenderMesh(w, *obj.readMesh);
+            // Selection is always empty on read-only objects; keep the
+            // section for layout regularity.
+            writeSelection(w, obj.sel);
+        } else {
+            writeMesh(w, obj.mesh);
+            writeSelection(w, obj.sel);
+        }
     }
     const size_t payloadEnd = w.buf.size();
     const size_t payloadLen = payloadEnd - payloadStart;
@@ -378,7 +519,23 @@ int load(const std::vector<uint8_t>& bytes, Scene& out) {
         if (!r.f32(obj.position.x) || !r.f32(obj.position.y) || !r.f32(obj.position.z)) {
             return ErrTruncated;
         }
-        int rc = readMesh(r, obj.mesh, version);
+        int rc = 0;
+        if (version >= 3) {
+            uint8_t editable = 1;
+            if (!r.u8(editable)) return ErrTruncated;
+            if (editable == 0) {
+                // v3 READ-ONLY object: render-mesh payload, empty selection
+                // section for layout regularity.
+                rc = readRenderMesh(r, obj);
+                if (rc != Ok) return rc;
+                Selection sel;
+                rc = readSelection(r, obj.mesh, sel);
+                if (rc != Ok) return rc;
+                tmp.objects.push_back(std::move(obj));
+                continue;
+            }
+        }
+        rc = readMesh(r, obj.mesh, version);
         if (rc != Ok) return rc;
         rc = readSelection(r, obj.mesh, obj.sel);
         if (rc != Ok) return rc;

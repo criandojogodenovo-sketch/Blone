@@ -18,8 +18,8 @@ android {
         applicationId = "com.blone.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 6
-        versionName = "0.4.0-fase3"
+        versionCode = 9
+        versionName = "0.6.0-uvs"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables { useSupportLibrary = true }
@@ -114,6 +114,9 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.7")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
     implementation("androidx.activity:activity-compose:1.9.3")
+    // Hotfix D5: DocumentFile.findFile on the user-picked folder — the two-
+    // step import copies the missing external .bin buffers from there.
+    implementation("androidx.documentfile:documentfile:1.0.1")
 
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-graphics")

@@ -12,6 +12,13 @@ struct Aabb {
     float maxX = 0, maxY = 0, maxZ = 0;
 };
 
+// 2D vector (Fase 5.1: per-corner texture coordinates stored on the
+// half-edges). Kept dependency-free like everything else here.
+struct Vec2 {
+    float x = 0.0f;
+    float y = 0.0f;
+};
+
 struct Vec3 {
     float x = 0.0f;
     float y = 0.0f;
@@ -135,6 +142,50 @@ inline Mat4 operator*(const Mat4& a, const Mat4& b) {
         }
     }
     return r;
+}
+
+// ---- frustum vs AABB (missão F4-LIMITS, P7: frustum culling) ---------------
+//
+// Gribb-Hartmann plane extraction from the column-major VIEW*PROJECTION
+// matrix (OpenGL clip convention: clip.x = m[0]x + m[4]y + m[8]z + m[12],
+// clip.w = m[3]x + m[7]y + m[11]z + m[15]). An AABB is VISIBLE when at
+// least one of its 8 corners passes EVERY plane; if any plane rejects all
+// 8 corners the box is entirely outside and the object can be culled.
+// Pure math (no GL) so the host tests pin it; the renderer uses it to skip
+// whole-object draw passes (overlays included) — the gizmo is independent.
+inline bool aabbInFrustum(const Aabb& b, const Mat4& vp) {
+    const float corners[8][3] = {
+            {b.minX, b.minY, b.minZ}, {b.maxX, b.minY, b.minZ},
+            {b.minX, b.maxY, b.minZ}, {b.maxX, b.maxY, b.minZ},
+            {b.minX, b.minY, b.maxZ}, {b.maxX, b.minY, b.maxZ},
+            {b.minX, b.maxY, b.maxZ}, {b.maxX, b.maxY, b.maxZ},
+    };
+    // The 6 planes (a, b, c, d) — each rejects the half-space outside it.
+    const float planes[6][4] = {
+            {vp.m[3] + vp.m[0], vp.m[7] + vp.m[4],
+             vp.m[11] + vp.m[8], vp.m[15] + vp.m[12]},  // left
+            {vp.m[3] - vp.m[0], vp.m[7] - vp.m[4],
+             vp.m[11] - vp.m[8], vp.m[15] - vp.m[12]},  // right
+            {vp.m[3] + vp.m[1], vp.m[7] + vp.m[5],
+             vp.m[11] + vp.m[9], vp.m[15] + vp.m[13]},  // bottom
+            {vp.m[3] - vp.m[1], vp.m[7] - vp.m[5],
+             vp.m[11] - vp.m[9], vp.m[15] - vp.m[13]},  // top
+            {vp.m[3] + vp.m[2], vp.m[7] + vp.m[6],
+             vp.m[11] + vp.m[10], vp.m[15] + vp.m[14]}, // near
+            {vp.m[3] - vp.m[2], vp.m[7] - vp.m[6],
+             vp.m[11] - vp.m[10], vp.m[15] - vp.m[14]}, // far
+    };
+    for (const auto& pl : planes) {
+        bool allOut = true;
+        for (const auto& c : corners) {
+            if (pl[0] * c[0] + pl[1] * c[1] + pl[2] * c[2] + pl[3] >= 0.0f) {
+                allOut = false;
+                break;
+            }
+        }
+        if (allOut) return false; // entirely outside this plane
+    }
+    return true;
 }
 
 } // namespace blone

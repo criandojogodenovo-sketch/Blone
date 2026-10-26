@@ -4,6 +4,7 @@
 #include "test_util.h"
 
 #include "../core/mesh/Primitives.h"
+#include "../core/io/MeshBuilder.h"
 #include "../core/operations/TransformMath.h"
 #include "../core/render/RenderData.h"
 #include "../core/scene/SceneOps.h"
@@ -344,6 +345,143 @@ void testRingRotationSign() {
     CHECK(after.x > before.x - 1e-4f); // still on the right side
 }
 
+// ------------------------------------------------ F4-LIMITS P7 ------------
+void testFrustumCullingAabb() {
+    // Camera at distance 8 on +Z looking at the origin (orbit convention:
+    // forward = -Z), 60 deg vertical FOV, near 0.1 / far 200.
+    OrbitCamera cam;
+    cam.azimuthDeg = 0.0f;
+    cam.elevationDeg = 0.0f;
+    cam.distance = 8.0f;
+    cam.target = Vec3{0, 0, 0};
+    const Mat4 vp = Mat4::perspective(60.0f, 1.0f, 0.1f, 200.0f) *
+                    cam.viewMatrix();
+
+    // Unit box at the look-at point: inside the frustum.
+    Aabb center;
+    center.minX = -1; center.minY = -1; center.minZ = -1;
+    center.maxX =  1; center.maxY =  1; center.maxZ =  1;
+    CHECK(aabbInFrustum(center, vp));
+
+    // Box straddling a frustum plane: still visible (conservative test).
+    Aabb straddle;
+    straddle.minX = -1; straddle.minY = -1; straddle.minZ = -1;
+    straddle.maxX =  1; straddle.maxY =  1; straddle.maxZ = 20;
+    CHECK(aabbInFrustum(straddle, vp));
+
+    // Box BEHIND the camera (camera sits at z = +8; box spans z 9..12):
+    // every corner fails the near plane -> culled.
+    Aabb behind;
+    behind.minX = -1; behind.minY = -1; behind.minZ = 9;
+    behind.maxX =  1; behind.maxY =  1; behind.maxZ = 12;
+    CHECK(!aabbInFrustum(behind, vp));
+
+    // Box far outside the horizontal FOV (x ~ +200): culled.
+    Aabb side;
+    side.minX = 199; side.minY = -1; side.minZ = -1;
+    side.maxX = 201; side.maxY =  1; side.maxZ =  1;
+    CHECK(!aabbInFrustum(side, vp));
+
+    // Box beyond the far plane (z = -300): culled.
+    Aabb farBox;
+    farBox.minX = -1; farBox.minY = -1; farBox.minZ = -310;
+    farBox.maxX =  1; farBox.maxY =  1; farBox.maxZ = -300;
+    CHECK(!aabbInFrustum(farBox, vp));
+}
+
+void testIndexTypeChoicePerObject() {
+    using renderdata::buildObject;
+    using renderdata::fitsUint16Index;
+    using renderdata::downcastIndices16;
+
+    // Threshold contract: 65.535 stays 16-bit, 65.536 needs uint32.
+    CHECK(fitsUint16Index(0));
+    CHECK(fitsUint16Index(65535));
+    CHECK(!fitsUint16Index(65536));
+    CHECK(!fitsUint16Index(70000)); // "objeto com 70k vértices" -> uint32
+
+    // Conversion preserves the index values.
+    {
+        std::vector<uint32_t> src{0, 1, 2, 65534, 65535};
+        std::vector<uint16_t> out;
+        downcastIndices16(src, out);
+        REQUIRE(out.size() == src.size());
+        for (size_t i = 0; i < src.size(); ++i) {
+            CHECK(static_cast<uint32_t>(out[i]) == src[i]);
+        }
+    }
+    // Misuse (index beyond 16 bits) -> EMPTY output, never truncated data
+    // (the renderer checks the size and falls back to uint32).
+    {
+        std::vector<uint32_t> src{0, 65536, 2};
+        std::vector<uint16_t> out;
+        downcastIndices16(src, out);
+        CHECK(out.empty());
+    }
+
+    // Real object below the threshold (cube: 24 duplicated fill vertices)
+    // -> the decision function picks the 16-bit path.
+    {
+        Scene scene;
+        History h;
+        const int idx = sceneops::createPrimitive(scene, h, PrimType::Cube, 0, 0);
+        REQUIRE(idx == 0);
+        renderdata::RenderData rd;
+        buildObject(scene.objects[0], rd);
+        CHECK(rd.fillVertexCount == 24);
+        CHECK(fitsUint16Index(rd.fillVertexCount));
+        bool inRange = true;
+        for (const uint32_t i : rd.fillIdx) {
+            if (i >= rd.fillVertexCount) inRange = false;
+        }
+        CHECK(inRange);
+    }
+
+    // Real object beyond the threshold, built through the IMPORT path
+    // (MeshBuilder — primitives cap at 96x48 segments and cannot exceed
+    // 16-bit buffers): a 300x300 quad grid has 90601 positions and 360000
+    // duplicated fill vertices -> uint32 path, indices beyond 16 bits.
+    {
+        const int kN = 300;
+        blone::io::RawMeshData grid;
+        grid.positions.reserve(static_cast<size_t>(kN + 1) * (kN + 1));
+        for (int y = 0; y <= kN; ++y) {
+            for (int x = 0; x <= kN; ++x) {
+                grid.positions.push_back(Vec3{static_cast<float>(x),
+                                              0.0f, static_cast<float>(y)});
+            }
+        }
+        grid.faceIndices.reserve(static_cast<size_t>(kN) * kN);
+        for (int y = 0; y < kN; ++y) {
+            for (int x = 0; x < kN; ++x) {
+                const int v0 = y * (kN + 1) + x;
+                grid.faceIndices.push_back({v0, v0 + 1, v0 + kN + 2,
+                                            v0 + kN + 1});
+            }
+        }
+        auto mesh = blone::io::MeshBuilder::build(grid);
+        REQUIRE(mesh.has_value());
+        SceneObject obj;
+        obj.name = "grade";
+        obj.mesh = std::move(*mesh);
+        renderdata::RenderData rd;
+        buildObject(obj, rd);
+        CHECK(rd.fillVertexCount ==
+              static_cast<size_t>(kN) * kN * 4u); // 360000
+        CHECK(!fitsUint16Index(rd.fillVertexCount));
+        bool beyond16 = false;
+        for (const uint32_t i : rd.fillIdx) {
+            if (i > 65535u) { beyond16 = true; break; }
+        }
+        CHECK(beyond16);
+        bool inRange = true;
+        for (const uint32_t i : rd.fillIdx) {
+            if (i >= rd.fillVertexCount) inRange = false;
+        }
+        CHECK(inRange);
+    }
+}
+
 } // namespace
 
 namespace blone::test {
@@ -355,5 +493,7 @@ void runRenderGizmoTests() {
     testSelectionLifecycle();
     testGizmoTransformsWithHistory();
     testRingRotationSign();
+    testIndexTypeChoicePerObject(); // F4-LIMITS P2
+    testFrustumCullingAabb();       // F4-LIMITS P7
 }
 } // namespace blone::test

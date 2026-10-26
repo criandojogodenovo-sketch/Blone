@@ -16,7 +16,13 @@ uint64_t History::meshRawBytes(const HalfEdgeMesh::Raw& r) {
 }
 
 uint64_t History::objectBytes(const SceneObject& o) {
-    return meshRawBytes(o.mesh.captureRaw()) + o.name.capacity() + sizeof(SceneObject);
+    // F4-LIMITS (P3): read-only objects hold no half-edge pool; their
+    // geometry lives in the shared RenderMesh and MUST be counted (entries
+    // referencing it keep the mesh alive — the budget stays honest).
+    uint64_t bytes = meshRawBytes(o.mesh.captureRaw()) + o.name.capacity() +
+                     sizeof(SceneObject);
+    if (o.readMesh) bytes += o.readMesh->memoryBytes();
+    return bytes;
 }
 
 void History::dropOldestUndo() {
@@ -160,6 +166,24 @@ bool History::pushObjectRemoved(uint32_t index, const SceneObject& data) {
     return true;
 }
 
+bool History::pushObjectSwap(uint32_t index, const SceneObject& before,
+                             const SceneObject& after) {
+    if (pending_ == 0) return false;
+    Entry e;
+    e.kind = Entry::Kind::ObjectSwap;
+    e.objIndex = index;
+    e.beforeObj = before;
+    e.afterObj = after;
+    e.bytes = objectBytes(e.beforeObj) + objectBytes(e.afterObj) +
+              sizeof(Entry);
+    undo_.push_back(std::move(e));
+    used_ += undo_.back().bytes; // exact cost replaces the reserved bound
+    pending_ = 0;
+    lastEntryBytes_ = undo_.back().bytes;
+    while (undo_.size() > kMaxEntries) dropOldestUndo();
+    return true;
+}
+
 bool History::applyUndoToScene(Scene& scene, Entry& e) {
     if (e.objIndex >= scene.objects.size()) return false;
     SceneObject& obj = scene.objects[e.objIndex];
@@ -185,6 +209,14 @@ bool History::applyUndoToScene(Scene& scene, Entry& e) {
         case Entry::Kind::ObjRemove:
             scene.objects.insert(scene.objects.begin() + e.objIndex, std::move(e.object));
             break;
+        case Entry::Kind::ObjectSwap: {
+            // Promotion: the scene's post-state moves into the entry (for
+            // redo) and the stored pre-state moves back into the scene.
+            SceneObject afterState = std::move(obj);
+            obj = std::move(e.beforeObj);
+            e.beforeObj = std::move(afterState);
+            break;
+        }
     }
     return true;
 }
@@ -225,6 +257,15 @@ bool History::applyRedoToScene(Scene& scene, Entry& e) {
             if (e.objIndex >= scene.objects.size()) return false;
             e.object = std::move(scene.objects[e.objIndex]);
             scene.objects.erase(scene.objects.begin() + e.objIndex);
+            break;
+        }
+        case Entry::Kind::ObjectSwap: {
+            if (e.objIndex >= scene.objects.size()) return false;
+            // Reverse of undo: the scene's pre-state moves back into the
+            // entry and the stored post-state returns to the scene.
+            SceneObject beforeState = std::move(scene.objects[e.objIndex]);
+            scene.objects[e.objIndex] = std::move(e.beforeObj);
+            e.beforeObj = std::move(beforeState);
             break;
         }
     }

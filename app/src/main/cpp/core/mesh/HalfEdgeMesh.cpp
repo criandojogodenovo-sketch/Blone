@@ -62,9 +62,20 @@ ElemId HalfEdgeMesh::findDirectedHalfEdge(ElemId a, ElemId b) const {
 }
 
 ElemId HalfEdgeMesh::addFace(const std::vector<ElemId>& loop) {
+    // No-UV path (every Fase 2-4 caller): delegates with an EMPTY uv list —
+    // the lazy array is never grown, so meshes without UV data keep paying
+    // zero bytes and behave exactly as before Fase 5.1.
+    return addFace(loop, std::vector<Vec2>{});
+}
+
+ElemId HalfEdgeMesh::addFace(const std::vector<ElemId>& loop,
+                             const std::vector<Vec2>& cornerUvs) {
     const size_t n = loop.size();
     if (n < 3 || n > MeshLimits::maxFaceSides) return kNull;
     if (aliveF_ >= MeshLimits::maxFaces) return kNull;
+    // Fase 5.1: a non-empty uv list must be EXACTLY parallel to the loop.
+    // Checked up front with every other rejection — the call fails clean.
+    if (!cornerUvs.empty() && cornerUvs.size() != n) return kNull;
 
     // Validate vertices: alive and distinct.
     for (size_t i = 0; i < n; ++i) {
@@ -189,6 +200,17 @@ ElemId HalfEdgeMesh::addFace(const std::vector<ElemId>& loop) {
         ++aliveE_;
 
         claimed[i] = h.id;
+    }
+
+    // Fase 5.1 (uv pass): every face-side half-edge id is final now —
+    // claimed[i] holds the corner carrier of loop[i] (created or reused).
+    // Grow the lazy array ONCE to cover the new ids (created boundary twins
+    // default to (0,0)) and copy the corner UVs in.
+    if (!cornerUvs.empty()) {
+        if (uvs_.size() < static_cast<size_t>(nextHid_)) {
+            uvs_.resize(static_cast<size_t>(nextHid_));
+        }
+        for (size_t i = 0; i < n; ++i) uvs_[claimed[i]] = cornerUvs[i];
     }
 
     // Pass 3: assign the face, link the loop, fix vertex.outgoing.
@@ -338,6 +360,25 @@ bool HalfEdgeMesh::splitEdge(ElemId edgeId, ElemId& midVert, ElemId& edgeA,
     repairOutgoing(a);
     repairOutgoing(b);
     if (vrt(m).outgoing == kNull) vrt(m).outgoing = hMB;
+
+    // Fase 5.1: keep the per-corner uv array parallel on this topological
+    // split (data maintenance only — the rewiring above is untouched).
+    // Runs ONLY when the mesh already carries uv data. F2's corner-at-b uv
+    // moves from the dying h2 to hBA (same corner, new half-edge); the two
+    // new mid corners get the midpoint of their face's edge endpoints —
+    // the standard subdivide rule, so uv continuity survives the split.
+    if (!uvs_.empty()) {
+        const Vec2 f1a = uv(h1); // F1 corner at a (h1 survives)
+        const Vec2 f1b = uv(n1); // F1 corner at b (n1 survives)
+        const Vec2 f2b = uv(h2); // F2 corner at b (h2 dies -> hBA)
+        const Vec2 f2a = uv(n2); // F2 corner at a (n2 survives)
+        if (uvs_.size() < static_cast<size_t>(nextHid_)) {
+            uvs_.resize(static_cast<size_t>(nextHid_));
+        }
+        uvs_[hBA] = f2b;
+        uvs_[hMB] = Vec2{(f1a.x + f1b.x) * 0.5f, (f1a.y + f1b.y) * 0.5f};
+        uvs_[hMA] = Vec2{(f2b.x + f2a.x) * 0.5f, (f2b.y + f2a.y) * 0.5f};
+    }
 
     midVert = m;
     edgeA = e1;
@@ -690,6 +731,12 @@ bool HalfEdgeMesh::validate() const {
         BLONE_LOGE("validate: limits exceeded");
         return false;
     }
+    // I8 (Fase 5.1): the lazy per-corner uv array never leaves the
+    // half-edge id space (ids are monotonic; entries are id-indexed).
+    if (uvs_.size() > static_cast<size_t>(nextHid_)) {
+        BLONE_LOGE("validate: uv array exceeds the half-edge id space");
+        return false;
+    }
     // I1, I2 (local), I5 for half-edges.
     for (const auto& h : hes_) {
         if (!h.alive) continue;
@@ -778,6 +825,7 @@ HalfEdgeMesh::Raw HalfEdgeMesh::captureRaw() const {
     r.hes = hes_;
     r.edges = edges_;
     r.faces = faces_;
+    r.uvs = uvs_; // Fase 5.1: verbatim lazy array (empty == no uv data)
     r.vSlot = vSlot_;
     r.hSlot = hSlot_;
     r.eSlot = eSlot_;
@@ -802,6 +850,11 @@ void HalfEdgeMesh::restoreRaw(const Raw& r) {
     hes_ = r.hes;
     edges_ = r.edges;
     faces_ = r.faces;
+    // Fase 5.1: verbatim — never resized here. A Raw from a v1/v2/v3
+    // project file (or any pre-uv snapshot) carries an EMPTY array, which
+    // keeps the mesh exactly as frugal as before; uv() then answers the
+    // (0,0) default for every corner.
+    uvs_ = r.uvs;
     vSlot_ = r.vSlot;
     hSlot_ = r.hSlot;
     eSlot_ = r.eSlot;
@@ -836,6 +889,7 @@ uint64_t HalfEdgeMesh::rawBytes() const {
     };
     uint64_t total = 0;
     total += bytes(verts_) + bytes(hes_) + bytes(edges_) + bytes(faces_);
+    total += bytes(uvs_); // Fase 5.1 (0 for meshes without uv data)
     total += bytes(vSlot_) + bytes(hSlot_) + bytes(eSlot_) + bytes(fSlot_);
     total += bytes(vFree_) + bytes(hFree_) + bytes(eFree_) + bytes(fFree_);
     // Pair map: ~2 nodes worth of overhead per entry (conservative estimate).

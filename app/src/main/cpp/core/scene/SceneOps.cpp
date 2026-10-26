@@ -79,11 +79,100 @@ int createPrimitive(Scene& s, History& h, PrimType type, int segsU, int segsV) {
     return index;
 }
 
+Status addImportedObject(Scene& s, History& h, SceneObject&& obj) {
+    if (s.objects.size() >= Scene::kMaxObjects) return Status::ErrLimit;
+    if (obj.mesh.empty()) return Status::ErrInvalidArg;
+
+    // History reservation BEFORE the scene changes (same contract as
+    // createPrimitive). One ObjectAdded entry: undo removes the import.
+    // F4-LIMITS: the bound is the EXACT upper cost (ONE object copy goes
+    // into the entry — the old *2 made big-but-legal imports fail against
+    // the per-profile budget even when the entry itself would fit).
+    const uint64_t cost = obj.mesh.rawBytes() +
+                          (obj.readMesh ? obj.readMesh->memoryBytes() : 0) +
+                          4096;
+    if (!h.reserve(cost)) return Status::ErrBudget;
+
+    obj.position = Vec3{0.0f, 0.0f, 0.0f}; // files carry world coordinates
+    obj.sel.clear();
+    s.objects.push_back(std::move(obj));
+    const uint32_t index = static_cast<uint32_t>(s.objects.size() - 1);
+    if (!h.pushObjectAdded(index, s.objects[index])) {
+        // Push failed: restore the pre-mutation state exactly (stricter
+        // than createPrimitive — the object leaves the scene again).
+        h.rollbackReservation();
+        s.objects.pop_back();
+        return Status::ErrInternal;
+    }
+    s.active = static_cast<int>(index);
+    pruneAllSelections(s); // defensive hygiene, mirrors the JNI drain
+    s.bump();              // renderer resync on the next frame
+    return Status::OK;
+}
+
+Status addImportedReadObject(Scene& s, History& h, SceneObject&& obj) {
+    if (s.objects.size() >= Scene::kMaxObjects) return Status::ErrLimit;
+    if (obj.editable || !obj.readMesh || obj.readMesh->empty()) {
+        return Status::ErrInvalidArg;
+    }
+    // Entry cost = objectBytes (counts the shared RenderMesh — see History).
+    const uint64_t cost = obj.readMesh->memoryBytes() + 4096;
+    if (!h.reserve(cost)) return Status::ErrBudget;
+
+    obj.position = Vec3{0.0f, 0.0f, 0.0f};
+    obj.sel.clear();
+    s.objects.push_back(std::move(obj));
+    const uint32_t index = static_cast<uint32_t>(s.objects.size() - 1);
+    if (!h.pushObjectAdded(index, s.objects[index])) {
+        h.rollbackReservation();
+        s.objects.pop_back();
+        return Status::ErrInternal;
+    }
+    s.active = static_cast<int>(index);
+    pruneAllSelections(s);
+    s.bump();
+    return Status::OK;
+}
+
+Status replaceWithEditable(Scene& s, History& h, int index,
+                           SceneObject&& replacement) {
+    if (index < 0 || index >= static_cast<int>(s.objects.size())) {
+        return Status::ErrInvalidArg;
+    }
+    if (!replacement.editable || replacement.mesh.empty()) {
+        return Status::ErrInvalidArg;
+    }
+    SceneObject& current = s.objects[static_cast<size_t>(index)];
+    if (current.editable) return Status::ErrInvalidArg; // only read -> editable
+
+    // ONE ObjectSwap entry: undo restores the read-only object, redo the
+    // editable one. Bound = both object copies + slack.
+    const SceneObject before = current; // copy (shares the RenderMesh)
+    const uint64_t cost = before.mesh.rawBytes() +
+                          (before.readMesh ? before.readMesh->memoryBytes()
+                                           : 0) +
+                          replacement.mesh.rawBytes() + 4096;
+    if (!h.reserve(cost)) return Status::ErrBudget;
+    if (!h.pushObjectSwap(static_cast<uint32_t>(index), before, replacement)) {
+        h.rollbackReservation();
+        return Status::ErrInternal;
+    }
+    s.objects[static_cast<size_t>(index)] = std::move(replacement);
+    s.active = index; // the promoted object stays active
+    pruneAllSelections(s);
+    s.bump();
+    return Status::OK;
+}
+
 Status deleteActiveObject(Scene& s, History& h) {
     SceneObject* obj = s.activeObject();
     if (!obj) return Status::ErrNoActiveObject;
     const int index = s.active;
-    const uint64_t cost = obj->mesh.rawBytes() * 2 + 256;
+    // Exact entry bound (one object copy; read-only objects count their
+    // shared RenderMesh — see History::objectBytes).
+    const uint64_t cost = obj->mesh.rawBytes() +
+                          (obj->readMesh ? obj->readMesh->memoryBytes() : 0) +
+                          4096;
     if (!h.reserve(cost)) return Status::ErrBudget;
     SceneObject copy = std::move(*obj);
     s.objects.erase(s.objects.begin() + index);
@@ -108,10 +197,17 @@ int duplicateActiveObject(Scene& s, History& h) {
     // Visible offset so the copy is distinguishable from the original.
     clone.position = obj->position + Vec3{1.5f, 0.0f, 0.0f};
     clone.mesh.restoreRaw(obj->mesh.captureRaw());
+    // F4-LIMITS (P3): duplicating a READ-ONLY object yields another read-
+    // only object sharing the same immutable geometry (no pool copy).
+    clone.editable = obj->editable;
+    clone.readMesh = obj->readMesh;
     clone.sel.clear();
 
-    // History reservation BEFORE the scene changes (condition 3).
-    const uint64_t cost = clone.mesh.rawBytes() * 2 + 256;
+    // History reservation BEFORE the scene changes (condition 3). Exact
+    // entry bound (one object copy).
+    const uint64_t cost = clone.mesh.rawBytes() +
+                          (clone.readMesh ? clone.readMesh->memoryBytes() : 0) +
+                          4096;
     if (!h.reserve(cost)) return -static_cast<int>(Status::ErrBudget);
 
     s.objects.push_back(std::move(clone));
@@ -373,10 +469,38 @@ Status beginTool(Scene& s, History& h, ToolSession& t, Tool tool, int kind,
     if (t.active) cancelTool(s, h, t);
     SceneObject* obj = s.activeObject();
     if (!obj) return Status::ErrNoActiveObject;
+    if (kind < 1 || kind > 3 || axis < 0 || axis > 3) return Status::ErrInvalidArg;
+
+    // F4-LIMITS (P3): READ-ONLY object — only the Move gizmo works (axis
+    // tips of the Move tool), transforming obj.position. Rotate/Scale
+    // would need geometry mutation (or a rotation field): rejected.
+    if (!obj->editable) {
+        if (tool != Tool::Move || kind != 1) return Status::ErrUnsupported;
+        ToolSession session;
+        session.active = true;
+        session.tool = tool;
+        session.objIndex = s.active;
+        session.kind = kind;
+        session.axis = axis;
+        session.beginTouchX = touchX;
+        session.beginTouchY = touchY;
+        session.lastTouchX = touchX;
+        session.lastTouchY = touchY;
+        session.lastTouchValid = true;
+        session.readMode = true;
+        session.startPosObj = obj->position;
+        session.pivot = (obj->readMesh ? obj->readMesh->centroid
+                                       : Vec3{}) +
+                        obj->position;
+        // Minimal reservation, released at end/cancel (nothing commits).
+        if (!h.reserve(256)) return Status::ErrBudget;
+        t = std::move(session);
+        return Status::OK;
+    }
+
     // OBJECT mode transforms the WHOLE object (interface reorganization:
     // DECISÃO C — the user can move/rotate/scale a full object without
     // entering edit mode). EDIT mode keeps the selection-based target.
-    if (kind < 1 || kind > 3 || axis < 0 || axis > 3) return Status::ErrInvalidArg;
 
     // Deduplicated vertex set from the current selection.
     std::set<ElemId> verts;
@@ -454,6 +578,21 @@ Status updateTool(Scene& s, ToolSession& t, const GizmoMapping& map,
     t.lastTouchY = touchY;
     if (dx == 0.0f && dy == 0.0f) return Status::OK;
 
+    // F4-LIMITS (P3): read-object session — Move shifts obj.position only.
+    if (t.readMode) {
+        if (t.tool != Tool::Move) return Status::ErrUnsupported; // defensive
+        const ops::AxisScreen as{map.axisDirX, map.axisDirY, map.pxPerWorld};
+        const float world = ops::dragAlongAxisWorld(as, dx, dy);
+        t.accumMove = t.accumMove + axisUnit(t.axis) * world;
+        const Vec3 next = t.startPosObj + t.accumMove;
+        if (!ops::isFiniteVec(next.x, next.y, next.z)) {
+            return Status::ErrInvalidArg; // state untouched
+        }
+        obj.position = next;
+        s.bump();
+        return Status::OK;
+    }
+
     switch (t.tool) {
         case Tool::Move: {
             // Axis drag: absolute offset from the start positions.
@@ -527,6 +666,15 @@ Status endTool(Scene& s, History& h, ToolSession& t) {
         return Status::ErrNoActiveObject;
     }
     SceneObject& obj = s.objects[static_cast<size_t>(t.objIndex)];
+    // F4-LIMITS (P3): read-object session — position-only move, NO history
+    // entry (read-only transforms are not undoable; documented). The
+    // reservation is simply released.
+    if (t.readMode) {
+        h.rollbackReservation();
+        s.bump();
+        t = ToolSession{};
+        return Status::OK;
+    }
     std::vector<std::pair<ElemId, Vec3>> before, after;
     before.reserve(t.verts.size());
     after.reserve(t.verts.size());
@@ -583,9 +731,13 @@ void cancelTool(Scene& s, History& h, ToolSession& t) {
     if (!t.active) return;
     if (t.objIndex >= 0 && t.objIndex < static_cast<int>(s.objects.size())) {
         SceneObject& obj = s.objects[static_cast<size_t>(t.objIndex)];
-        for (size_t i = 0; i < t.verts.size(); ++i) {
-            if (obj.mesh.vertexAlive(t.verts[i])) {
-                obj.mesh.vrt(t.verts[i]).pos = t.startPos[i];
+        if (t.readMode) {
+            obj.position = t.startPosObj; // restore the pre-drag position
+        } else {
+            for (size_t i = 0; i < t.verts.size(); ++i) {
+                if (obj.mesh.vertexAlive(t.verts[i])) {
+                    obj.mesh.vrt(t.verts[i]).pos = t.startPos[i];
+                }
             }
         }
     }
@@ -606,6 +758,17 @@ Status transformDirect(Scene& s, History& h, Tool tool, int axis, float amount) 
     // Non-finite amounts are rejected BEFORE anything changes (same policy
     // as the gizmo path — stability correction).
     if (!std::isfinite(amount)) return Status::ErrInvalidArg;
+
+    // F4-LIMITS (P3): READ-ONLY object — Move shifts obj.position (no mesh
+    // mutation, no history entry); Rotate/Scale are rejected.
+    if (!obj->editable) {
+        if (tool != Tool::Move || axis > 2) return Status::ErrUnsupported;
+        const Vec3 next = obj->position + axisUnit(axis) * amount;
+        if (!ops::isFiniteVec(next.x, next.y, next.z)) return Status::ErrInvalidArg;
+        obj->position = next;
+        s.bump();
+        return Status::OK;
+    }
 
     // Target: EDIT mode valid selection, otherwise the whole active object.
     std::set<ElemId> verts;

@@ -117,6 +117,14 @@ private:
     struct ObjectGpu {
         GLuint vao = 0, vbo = 0, ebo = 0;
         GLsizei indexCount = 0;
+        // Per-object index type (missão F4-LIMITS, P2): GL_UNSIGNED_SHORT
+        // when the fill buffer fits 16-bit indices (half-size IBO),
+        // GL_UNSIGNED_INT otherwise (70k+ vertex meshes keep the uint32
+        // path — native in ES 3.0, verified against the old behaviour).
+        GLenum indexType = GL_UNSIGNED_INT;
+        // READ-MODE (P3): identity of the uploaded RenderMesh (re-upload
+        // skip when the shared geometry is unchanged).
+        const void* readUploaded = nullptr;
         GLuint wireVao = 0, wireVbo = 0;
         GLsizei wireCount = 0;
         GLuint ptVao = 0, ptVbo = 0;
@@ -138,8 +146,18 @@ private:
     void buildSceneLines();
     void syncObjects(const Scene& scene);
     void destroyObjectGpu(ObjectGpu& g);
+    // F4-LIMITS (P7) buffer pool: retired ObjectGpu entries keep their live
+    // GL names for reuse (glBufferData refills them) — the per-edit full
+    // resync no longer churns GL allocations. Capped; overflow is destroyed.
+    static constexpr size_t kGpuPoolMax = 8;
+    void retireObjectGpu(ObjectGpu& g);
+    void acquireObjectGpu(ObjectGpu& g);
     void buildObjectGeometry(ObjectGpu& g, const SceneObject& obj);
     void buildSelectionOverlays(ObjectGpu& g, const SceneObject& obj);
+    // READ-MODE upload (F4-LIMITS P3): indexed unique-vertex buffers from
+    // the shared RenderMesh (flat shading via uFlatDeriv; no overlays).
+    // Skips the re-upload while the same RenderMesh pointer is resident.
+    void buildReadGeometry(ObjectGpu& g, const SceneObject& obj);
 
     // Shared ray builder for picking AND the brush surface hit (single
     // projection source — they can never diverge).
@@ -158,7 +176,7 @@ private:
     GLuint fillProgram_ = 0, lineProgram_ = 0, pointProgram_ = 0;
     GLint fillMvpLoc_ = -1, fillModelLoc_ = -1, fillLightLoc_ = -1;
     GLint fillEyeLoc_ = -1, fillTintLoc_ = -1, fillTintMixLoc_ = -1;
-    GLint fillUseVColLoc_ = -1;
+    GLint fillUseVColLoc_ = -1, fillFlatDerivLoc_ = -1;
     GLint lineMvpLoc_ = -1, lineOverrideLoc_ = -1, lineUseOverrideLoc_ = -1;
     GLint pointMvpLoc_ = -1, pointColorLoc_ = -1, pointSizeLoc_ = -1;
 
@@ -166,6 +184,7 @@ private:
     GLsizei sceneVertexCount_ = 0;
 
     std::vector<ObjectGpu> gpu_;
+    std::vector<ObjectGpu> gpuPool_; // retired entries with live GL names (P7)
     uint32_t sceneVersion_ = 0;
 
     // Gizmo GPU resources + reused scratch (no per-frame allocation).
