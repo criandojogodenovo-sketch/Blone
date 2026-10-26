@@ -38,9 +38,12 @@
 // BloneIO). The default nullptr keeps the previous signature and every
 // existing caller working.
 //
-// Normals/uvs are validated for parallelism only (they are NOT stored in
-// the HalfEdgeMesh — the engine computes smooth normals itself and UV
-// storage is a documented Fase 5 extension point).
+// Normals are validated for parallelism only (they are NOT stored in the
+// HalfEdgeMesh — the engine computes smooth normals itself). UVS ARE STORED
+// since Fase 5.1: every corner's uv lands on the face-side half-edge of the
+// built face (addFace overload), so seams survive and the OBJ exporter /
+// BLONEPRJ v4 can round-trip them. Non-finite uvs are rejected like any
+// other corrupt data (never guessed at).
 
 #include "../mesh/HalfEdgeMesh.h"
 

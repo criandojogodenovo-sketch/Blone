@@ -14,6 +14,17 @@
 //    order maintained on purpose: incident-face queries scan faces, which is
 //    fine for user-triggered operations and picking at Blone's scale).
 //
+// Per-corner texture coordinates (Fase 5.1): a Vec2 per half-edge, indexed
+// by the half-edge ElemId (the id space is monotonic and never reused, so
+// the array is "parallel to the half-edges" without following the slot
+// recycling of the pools). STORAGE IS LAZY: the array stays EMPTY until a
+// face is added WITH UVs (addFace overload below) — meshes without UV data
+// (every Fase 2-4 construction path) pay zero bytes and behave exactly as
+// before. A half-edge whose id is outside the array carries the default
+// (0,0); the FACE-SIDE half-edge of a corner holds that corner's UV, so a
+// geometric vertex shared by two faces with different UVs (a UV seam) keeps
+// one value per face — impossible with per-vertex storage.
+//
 // Invariants enforced by validate() and preserved by every operation:
 //  I1  twin symmetry: he.twin.twin == he
 //  I2  next/prev consistency inside every loop (face loops and boundary loops)
@@ -99,6 +110,14 @@ public:
     // creates the missing ones. Returns 0 on failure WITHOUT mutating
     // (non-manifold request, duplicate vertices, size limits).
     ElemId addFace(const std::vector<ElemId>& loop);
+    // Fase 5.1: same construction, plus one UV per corner. cornerUvs must
+    // be EXACTLY parallel to loop (else 0, no mutation — same fail-clean
+    // contract). cornerUvs[i] is the UV of the corner AT loop[i] and is
+    // stored on the face-side half-edge leaving loop[i]; created boundary
+    // twins get the (0,0) default until a face claims them. This is the
+    // ONLY path that grows the uv array (splitEdge interpolates within it).
+    ElemId addFace(const std::vector<ElemId>& loop,
+                   const std::vector<Vec2>& cornerUvs);
     // Splits an edge at its midpoint: creates the mid vertex and two edges.
     // Adjacent face loops (and boundary loop) are rewired in place.
     bool splitEdge(ElemId edgeId, ElemId& midVert, ElemId& edgeA, ElemId& edgeB);
@@ -120,6 +139,19 @@ public:
 
     // Destination vertex of a half-edge (origin of next).
     ElemId heDest(ElemId heId) const { return heg(heg(heId).next).origin; }
+
+    // ---------- per-corner UVs (Fase 5.1) ----------
+    // UV of a half-edge corner. Half-edges without stored data (mesh never
+    // given UVs, or corner created by a no-UV path) return {0,0}.
+    Vec2 uv(ElemId heId) const {
+        return heId < uvs_.size() ? uvs_[heId] : Vec2{0.0f, 0.0f};
+    }
+    // True once any UV was stored — decides whether the OBJ exporter emits
+    // `vt` lines / `f v/vt/vn` corners or keeps the historical `f v//vn`.
+    bool hasUvs() const { return !uvs_.empty(); }
+    // Read-only access for serialization (Project v4) and debug tools;
+    // indexed by half-edge id, size() <= nextHid (see header comment).
+    const std::vector<Vec2>& uvs() const { return uvs_; }
 
     // Returns an alive directed half-edge a -> b, or 0. O(1) via pairMap_.
     ElemId findDirectedHalfEdge(ElemId a, ElemId b) const;
@@ -186,6 +218,7 @@ public:
         std::vector<HalfEdge> hes;
         std::vector<Edge> edges;
         std::vector<Face> faces;
+        std::vector<Vec2> uvs; // Fase 5.1: verbatim lazy array (id-indexed)
         std::vector<ElemId> vSlot, hSlot, eSlot, fSlot;
         std::vector<ElemId> vFree, hFree, eFree, fFree;
         ElemId nextVid = 1, nextHid = 1, nextEid = 1, nextFid = 1;
@@ -209,6 +242,11 @@ private:
     // (origin,dest) -> half-edge id, for O(1) directed half-edge lookup.
     // Derived state: rebuilt by restoreRaw(); kept in sync on create/kill.
     std::unordered_map<uint64_t, ElemId> pairMap_;
+
+    // Per-corner UVs (Fase 5.1): LAZY, indexed by half-edge id, size() is
+    // 0 or <= nextHid_. Grown only by the addFace overload with UVs and by
+    // splitEdge's interpolation (which never runs while empty).
+    std::vector<Vec2> uvs_;
 
     void killEdge(ElemId edgeId);  // marks edge + its 2 half-edges dead
     void repairOutgoing(ElemId v); // rescan or isolate-kill

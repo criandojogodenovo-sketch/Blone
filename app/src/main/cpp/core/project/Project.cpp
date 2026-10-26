@@ -88,6 +88,22 @@ void writeMesh(Writer& w, const HalfEdgeMesh& m) {
         w.u32(h->face);
         w.u32(h->edge);
     }
+    // v4 (Fase 5.1): per-corner uvs, SPARSE — one entry per ALIVE half-edge
+    // whose id has an entry in the lazy id-indexed uv array (the writer side
+    // of the "id < size means stored" contract, HalfEdgeMesh.h). Meshes
+    // without uv data write a zero count and stay byte-lean.
+    uint32_t uvCount = 0;
+    for (const auto* h : hs) {
+        if (h->id < m.uvs().size()) ++uvCount;
+    }
+    w.u32(uvCount);
+    for (const auto* h : hs) {
+        if (h->id >= m.uvs().size()) continue;
+        const Vec2 t = m.uv(h->id);
+        w.u32(h->id);
+        w.f32(t.x);
+        w.f32(t.y);
+    }
     w.u32(static_cast<uint32_t>(es.size()));
     for (const auto* e : es) {
         w.u32(e->id);
@@ -219,6 +235,25 @@ int readMesh(Reader& r, HalfEdgeMesh& m, uint32_t fmtVersion) {
         }
         h.alive = true;
     }
+    // v4 (Fase 5.1): the SPARSE per-corner uv section sits right after the
+    // half-edges (mirroring writeMesh). v1/v2/v3 files simply do not have
+    // it. Entries are validated in place (finite values, bounded count) and
+    // applied after the slot maps exist — every id must belong to an alive
+    // half-edge of THIS mesh.
+    std::vector<std::pair<uint32_t, Vec2>> uvEntries;
+    if (fmtVersion >= 4) {
+        uint32_t uvCount = 0;
+        if (!r.u32(uvCount)) return ErrTruncated;
+        if (uvCount > n) return ErrLimits; // one per alive he at most
+        uvEntries.reserve(uvCount);
+        for (uint32_t i = 0; i < uvCount; ++i) {
+            uint32_t heId;
+            Vec2 t;
+            if (!r.u32(heId) || !r.f32(t.x) || !r.f32(t.y)) return ErrTruncated;
+            if (!std::isfinite(t.x) || !std::isfinite(t.y)) return ErrIndex;
+            uvEntries.emplace_back(heId, t);
+        }
+    }
     if (!r.u32(n)) return ErrTruncated;
     if (n > MeshLimits::maxEdges) return ErrLimits;
     raw.edges.resize(n);
@@ -288,6 +323,20 @@ int readMesh(Reader& r, HalfEdgeMesh& m, uint32_t fmtVersion) {
         if (h.origin >= raw.vSlot.size()) return ErrIndex;
         auto& v = raw.verts[raw.vSlot[h.origin]];
         if (v.outgoing == kNull) v.outgoing = h.id;
+    }
+
+    // v4 (Fase 5.1): apply the sparse uvs now that id -> slot exists. The
+    // lazy array grows to the highest written id + 1 (verbatim restore keeps
+    // the mesh exactly as frugal as the writer left it).
+    if (!uvEntries.empty()) {
+        ElemId maxUvId = 0;
+        for (const auto& e : uvEntries) {
+            if (e.first >= raw.hSlot.size()) return ErrIndex;
+            if (raw.hes[raw.hSlot[e.first]].id != e.first) return ErrIndex;
+            maxUvId = std::max(maxUvId, e.first);
+        }
+        raw.uvs.resize(static_cast<size_t>(maxUvId) + 1);
+        for (const auto& e : uvEntries) raw.uvs[e.first] = e.second;
     }
 
     m.restoreRaw(raw);

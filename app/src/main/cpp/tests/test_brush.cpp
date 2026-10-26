@@ -572,11 +572,12 @@ void testPersistenceV2RoundTrip() {
     CHECK(!bytes.empty());
     CHECK(bytes.size() > 24);
     // The saved header must advertise the CURRENT format version
-    // (F4-LIMITS P5: v3 — per-object editable flag).
+    // (Fase 5.1: v4 — sparse per-corner uv section; mandated bump, same
+    // pattern as the v2->v3 bump in F4-LIMITS P5).
     uint32_t savedVersion = 0;
     std::memcpy(&savedVersion, bytes.data() + 8, 4);
     CHECK(savedVersion == project::kFormatVersion);
-    CHECK(savedVersion == 3u);
+    CHECK(savedVersion == 4u);
 
     Scene loaded;
     REQUIRE(project::load(bytes, loaded) == project::Ok);
@@ -718,8 +719,9 @@ void testV1FileCompatibility() {
     CHECK(!v3.empty());
     uint32_t version = 0;
     std::memcpy(&version, v3.data() + 8, 4);
-    // F4-LIMITS P5: the writer emits the CURRENT version (3).
-    CHECK(version == 3u);
+    // Fase 5.1: the writer emits the CURRENT version (4 — sparse per-corner
+    // uv section); same mandated bump as the v2->v3 one in F4-LIMITS P5.
+    CHECK(version == 4u);
 }
 
 // -------------------------------------------------------- budget + misc --

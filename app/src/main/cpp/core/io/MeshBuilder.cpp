@@ -66,7 +66,10 @@ std::optional<HalfEdgeMesh> MeshBuilder::build(const RawMeshData& data,
 
     // 4) Positions must be finite. Colors must be finite too (out-of-range
     //    finite components are clamped — same policy as the project loader;
-    //    non-finite colors are corrupt data, never guessed at).
+    //    non-finite colors are corrupt data, never guessed at). Fase 5.1:
+    //    uvs follow the SAME rule — non-finite uvs are corrupt data (the
+    //    loaders already reject NaN/Inf at parse time; this covers direct
+    //    RawMeshData producers such as tests and future generators).
     for (const Vec3& p : data.positions) {
         if (!finite3(p.x, p.y, p.z)) {
             if (err) *err = "posição não finita (NaN/Inf)";
@@ -76,6 +79,12 @@ std::optional<HalfEdgeMesh> MeshBuilder::build(const RawMeshData& data,
     for (const Vec3& c : data.colors) {
         if (!finite3(c.x, c.y, c.z)) {
             if (err) *err = "cor não finita (NaN/Inf)";
+            return std::nullopt;
+        }
+    }
+    for (const Vec2& t : data.uvs) {
+        if (!finite3(t.x, t.y, 0.0f)) {
+            if (err) *err = "uv não finita (NaN/Inf)";
             return std::nullopt;
         }
     }
@@ -145,6 +154,7 @@ std::optional<HalfEdgeMesh> MeshBuilder::build(const RawMeshData& data,
         ids.push_back(id);
     }
     size_t faced = 0;
+    const bool hasUvs = !data.uvs.empty(); // Fase 5.1: parallel to positions
     for (const std::vector<int>& loop : data.faceIndices) {
         // P4: cancel check in the face pass (owns 950..1000).
         if (progress) {
@@ -161,7 +171,21 @@ std::optional<HalfEdgeMesh> MeshBuilder::build(const RawMeshData& data,
         std::vector<ElemId> face;
         face.reserve(loop.size());
         for (const int idx : loop) face.push_back(ids[static_cast<size_t>(idx)]);
-        if (mesh.addFace(face) == kNull) {
+        // Fase 5.1: the uv of corner i is data.uvs[loop[i]] (positions are
+        // the per-corner EXPANDED pool, so the index IS the corner). The
+        // mesh stores them on the face-side half-edges — one geometric
+        // vertex may carry different uvs per face (UV seams survive).
+        // io::Vec2 (RawMeshData) and blone::Vec2 (engine) are distinct
+        // types by design; the explicit field copy is the single bridge.
+        std::vector<blone::Vec2> cornerUvs;
+        if (hasUvs) {
+            cornerUvs.reserve(loop.size());
+            for (const int idx : loop) {
+                cornerUvs.push_back(blone::Vec2{data.uvs[static_cast<size_t>(idx)].x,
+                                                data.uvs[static_cast<size_t>(idx)].y});
+            }
+        }
+        if (mesh.addFace(face, cornerUvs) == kNull) {
             if (err) *err = "face não construída (topologia não suportada)";
             return std::nullopt;
         }

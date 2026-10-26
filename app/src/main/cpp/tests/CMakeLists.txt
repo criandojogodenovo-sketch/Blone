@@ -22,6 +22,7 @@ add_executable(blone_tests
         test_ui_modes.cpp
         test_brush.cpp
         test_io.cpp
+        test_uv.cpp
         ${CPP_DIR}/core/brush/Brush.cpp
         ${CPP_DIR}/core/io/MeshBuilder.cpp
         ${CPP_DIR}/core/io/ObjLoader.cpp

@@ -12,6 +12,13 @@ struct Aabb {
     float maxX = 0, maxY = 0, maxZ = 0;
 };
 
+// 2D vector (Fase 5.1: per-corner texture coordinates stored on the
+// half-edges). Kept dependency-free like everything else here.
+struct Vec2 {
+    float x = 0.0f;
+    float y = 0.0f;
+};
+
 struct Vec3 {
     float x = 0.0f;
     float y = 0.0f;

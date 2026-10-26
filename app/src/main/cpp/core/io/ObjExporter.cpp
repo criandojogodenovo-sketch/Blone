@@ -31,10 +31,11 @@ struct PosKeyHash {
     }
 };
 
-// Corner tuple (position index, uv index, normal index). The uv slot is the
-// constant 0 placeholder until per-corner UV storage exists (Fase 5) — the
-// mechanism itself is complete: identical (pos, uv, normal) tuples dedup
-// through one map shared by the WHOLE scene.
+// Corner tuple (position index, uv index, normal index). Fase 5.1: the uv
+// slot is REAL for uv-bearing meshes (the scene-wide vt id); meshes without
+// uv data keep the constant 0 placeholder — a loop never mixes the two, so
+// the dedup stays exact. Identical (pos, uv, normal) tuples dedup through
+// one map shared by the WHOLE scene.
 struct CornerKey {
     uint32_t pos, uv, nrm;
     bool operator==(const CornerKey& o) const {
@@ -46,6 +47,24 @@ struct CornerKeyHash {
         return (static_cast<size_t>(k.pos) * 73856093u) ^
                (static_cast<size_t>(k.uv) * 19349663u) ^
                (static_cast<size_t>(k.nrm) * 83492791u);
+    }
+};
+
+// Fase 5.1: bitwise-exact uv dedup (same rule as PosKey — the exporter
+// writes what the mesh holds, no epsilon merging, so a round-trip is
+// bit-exact).
+struct UvKey {
+    float u, v;
+    bool operator==(const UvKey& o) const { return u == o.u && v == o.v; }
+};
+struct UvKeyHash {
+    size_t operator()(const UvKey& k) const {
+        auto mix = [](float f) {
+            uint32_t u = 0;
+            std::memcpy(&u, &f, sizeof(u));
+            return static_cast<size_t>(u) * 0x9E3779B9u;
+        };
+        return mix(k.u) ^ (mix(k.v) << 1);
     }
 };
 
@@ -80,6 +99,15 @@ bool ObjExporter::exportScene(const Scene& scene, const std::string& path) {
     std::vector<std::vector<uint32_t>> posOfObject(scene.objects.size());
     std::vector<std::vector<std::vector<uint32_t>>> facesOfObject(
             scene.objects.size()); // object -> face -> position-index loop
+
+    // Fase 5.1: scene-wide vt table + per-corner vt ids (only for EDITABLE
+    // meshes that carry uv data; read-only render meshes hold no uvs).
+    std::vector<blone::Vec2> uvTable;
+    std::unordered_map<UvKey, uint32_t, UvKeyHash> uvIndex;
+    std::vector<std::vector<uint32_t>> uvOfObject(scene.objects.size());
+    std::vector<std::vector<std::vector<uint32_t>>> uvCornersOfObject(
+            scene.objects.size()); // object -> face -> vt-index loop (uv meshes)
+    bool sceneHasUvCorners = false;
 
     size_t totalFaces = 0;
     for (const SceneObject& obj : scene.objects) {
@@ -142,12 +170,26 @@ bool ObjExporter::exportScene(const Scene& scene, const std::string& path) {
         if (obj.mesh.empty()) continue;
         std::vector<std::vector<uint32_t>>& objFaces = facesOfObject[oi];
         objFaces.reserve(obj.mesh.aliveFaceCount());
+        // Fase 5.1: uv corners ride along when the mesh carries uv data.
+        const bool meshHasUvs = obj.mesh.hasUvs();
+        std::vector<std::vector<uint32_t>>* objUvFaces = nullptr;
+        if (meshHasUvs) {
+            sceneHasUvCorners = true;
+            objUvFaces = &uvCornersOfObject[oi];
+            objUvFaces->reserve(obj.mesh.aliveFaceCount());
+        }
         for (const ElemId f : obj.mesh.aliveFaceIds()) {
-            const std::vector<ElemId> loop = obj.mesh.faceVertices(f);
-            if (loop.size() < 3) continue; // defensive; validate() forbids
+            // Half-edge loop (same order as faceVertices): element i is the
+            // face-side half-edge whose ORIGIN is corner i — the carrier of
+            // the corner's uv (Fase 5.1).
+            const std::vector<ElemId> loopHes = obj.mesh.faceHalfEdges(f);
+            if (loopHes.size() < 3) continue; // defensive; validate() forbids
             std::vector<uint32_t> faceLoop;
-            faceLoop.reserve(loop.size());
-            for (const ElemId v : loop) {
+            faceLoop.reserve(loopHes.size());
+            std::vector<uint32_t> uvLoop;
+            if (objUvFaces) uvLoop.reserve(loopHes.size());
+            for (const ElemId heId : loopHes) {
+                const ElemId v = obj.mesh.heg(heId).origin;
                 const Vec3 world{obj.mesh.vrt(v).pos.x + obj.position.x,
                                  obj.mesh.vrt(v).pos.y + obj.position.y,
                                  obj.mesh.vrt(v).pos.z + obj.position.z};
@@ -162,8 +204,23 @@ bool ObjExporter::exportScene(const Scene& scene, const std::string& path) {
                 }
                 const uint32_t pid = it->second;
                 faceLoop.push_back(pid);
+                if (objUvFaces) {
+                    // Scene-wide bitwise-exact vt dedup; first owner emits
+                    // the vt line (same rule as positions).
+                    const blone::Vec2 cuv = obj.mesh.uv(heId);
+                    auto uit = uvIndex.find(UvKey{cuv.x, cuv.y});
+                    if (uit == uvIndex.end()) {
+                        const uint32_t uid =
+                                static_cast<uint32_t>(uvTable.size());
+                        uvTable.push_back(cuv);
+                        uvOfObject[oi].push_back(uid);
+                        uit = uvIndex.emplace(UvKey{cuv.x, cuv.y}, uid).first;
+                    }
+                    uvLoop.push_back(uit->second);
+                }
             }
             objFaces.push_back(std::move(faceLoop));
+            if (objUvFaces) objUvFaces->push_back(std::move(uvLoop));
         }
     }
     if (worldPos.empty()) return false; // nothing exportable
@@ -247,23 +304,53 @@ bool ObjExporter::exportScene(const Scene& scene, const std::string& path) {
                 return fail();
             }
         }
-        for (const std::vector<uint32_t>& loop : facesOfObject[oi]) {
+        // Fase 5.1: vt lines for the uv values first used by this object
+        // (scene-wide dedup, %.9g bit-exact — same rule as v/vn). Only
+        // written when the scene actually carries uv corners.
+        if (sceneHasUvCorners) {
+            for (const uint32_t uid : uvOfObject[oi]) {
+                const blone::Vec2& t = uvTable[uid];
+                if (std::fprintf(out, "vt %.9g %.9g\n",
+                                 static_cast<double>(t.x),
+                                 static_cast<double>(t.y)) < 0) {
+                    return fail();
+                }
+            }
+        }
+        for (size_t fi = 0; fi < facesOfObject[oi].size(); ++fi) {
+            const std::vector<uint32_t>& loop = facesOfObject[oi][fi];
+            // Fase 5.1: uv-bearing meshes carry a parallel vt loop (built
+            // in pass A from the face-side half-edges); meshes without uv
+            // data have none and keep the historical v//vn form.
+            const std::vector<uint32_t>* uvLoop =
+                    uvCornersOfObject[oi].empty()
+                            ? nullptr
+                            : &uvCornersOfObject[oi][fi];
             if (std::fprintf(out, "f") < 0) return fail();
             ++loopGlobalId;
             size_t emitted = 0;
-            for (const uint32_t pid : loop) {
-                const CornerKey ck{pid, 0u, pid}; // uv slot 0 until Fase 5
+            for (size_t ci = 0; ci < loop.size(); ++ci) {
+                const uint32_t pid = loop[ci];
+                const uint32_t vt = uvLoop ? (*uvLoop)[ci] : 0u;
+                const CornerKey ck{pid, vt, pid};
                 auto [it, inserted] = cornerDedup.emplace(ck, loopGlobalId);
                 if (!inserted && it->second == loopGlobalId) {
                     continue; // tuple repeated inside this loop: skip
                 }
                 it->second = loopGlobalId;
-                // OBJ is 1-based: v//vn (vn index == position index today,
-                // one smooth normal per unique position).
-                if (std::fprintf(out, " %u//%u", static_cast<unsigned>(pid + 1),
-                                 static_cast<unsigned>(pid + 1)) < 0) {
-                    return fail();
-                }
+                // OBJ is 1-based: v/vt/vn for uv corners (vt index from the
+                // scene-wide table), v//vn otherwise (vn index == position
+                // index, one smooth normal per unique position).
+                const bool ok =
+                        uvLoop
+                                ? std::fprintf(out, " %u/%u/%u",
+                                               static_cast<unsigned>(pid + 1),
+                                               static_cast<unsigned>(vt + 1),
+                                               static_cast<unsigned>(pid + 1)) >= 0
+                                : std::fprintf(out, " %u//%u",
+                                               static_cast<unsigned>(pid + 1),
+                                               static_cast<unsigned>(pid + 1)) >= 0;
+                if (!ok) return fail();
                 ++emitted;
             }
             if (std::fprintf(out, "\n") < 0) return fail();

@@ -13,15 +13,22 @@
 //                     SceneObject ever gains rotation/scale) with the
 //                     vertex paint color; floats use %.9g so a float32
 //                     round-trips bit-exactly through any correct parser.
+//   vt u v            Fase 5.1: texture coordinates, ONE scene-wide dedup
+//                     space (same rule as v/vn; %.9g bit-exact). Emitted
+//                     only when at least one EDITABLE mesh carries uv
+//                     data; read-only render meshes hold no uvs and an
+//                     uv-less mesh keeps emitting plain v//vn corners.
 //   vn x y z          SMOOTH area-weighted vertex normals: Newell's method
 //                     accumulated NON-normalized per face and added to
 //                     every vertex of that face, normalized once at the
 //                     end. One vn per unique position.
-//   f v//vn           faces (the mesh is polygonal — quads stay quads).
+//   f v/vt/vn         faces (the mesh is polygonal — quads stay quads).
+//                     Fase 5.1: corners of uv-bearing meshes emit the full
+//                     v/vt/vn form (the corner's uv comes from the
+//                     face-side half-edge, so seams round-trip); meshes
+//                     without uv data keep the historical v//vn form.
 //                     Corners go through the tuple dedup map below so the
-//                     UV mechanism is already complete for when per-corner
-//                     UV storage arrives (Fase 5): until then the uv slot
-//                     is the constant 0 placeholder and faces emit v//vn.
+//                     same (position, uv, normal) tuple dedups scene-wide.
 //
 // Scene-wide dedup: positions and corner tuples share ONE index space for
 // the whole scene (unordered_map keyed by exact float values). Consequence
