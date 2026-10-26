@@ -66,6 +66,14 @@ genéricas além do que as fases exigem.
   nunca é "apenas triângulos".
 - Índice dirigido `(origem, destino) → half-edge` (hash map) para
   resolução O(1) em `addFace`.
+- **UVs por canto** (Fase 5.1): um `Vec2` por half-edge, num array
+  **preguiçoso indexado por id** (vazio até uma face ser criada COM UVs —
+  malhas sem UV pagam zero bytes e comportam-se como antes). O UV de um
+  canto vive no half-edge **do lado da face**, logo um vértice geométrico
+  partilhado por duas faces pode ter valores diferentes (costura UV). O
+  `addFace` com UVs é o único caminho que faz crescer o array; o
+  `splitEdge` mantém-no paralelo (transferência do canto que morre +
+  interpolação a meio das arestas).
 
 **Invariantes** (verificados por `validate()` e pela suíte de testes, após
 cada operação):
@@ -79,7 +87,9 @@ cada operação):
 5. sem referências pendentes (tudo aponta para elementos vivos ou 0);
 6. sem órfãos (vértice vivo ⇒ `outgoing` válido; face/aresta vivas ⇒ `he`
    válido);
-7. loops de face com 3..256 vértices distintos.
+7. loops de face com 3..256 vértices distintos;
+8. o array de UVs nunca excede o espaço de ids de half-edges
+   (Fase 5.1; `uvs.size() ≤ nextHid`).
 
 ### 2.2 Primitivas (`core/mesh/Primitives`)
 
@@ -623,8 +633,14 @@ exportObj(cachePath)
 - **OBJ é mono-malha**: o export funde posições coincidentes entre
   objetos num só par v/vn e o import reconstrói UMA malha — objetos
   sobrepostos podem fundir-se no round-trip.
-- **Sem UV por canto** (faces saem `f v//vn`); TEXCOORD_0 de glTF é lido
-  mas ainda não armazenado — mecanismo de tuplos já preparado (Fase 5).
+- **UVs por canto** (Fase 5.1): OBJ lê `vt`/escreve `vt` + `f v/vt/vn`
+  (bit-exato `%.9g`, round-trip eps 1e-6); glTF lê `TEXCOORD_0` e o
+  `MeshBuilder` guarda por canto; BLONEPRJ v4 persiste (leitor v1–v4).
+  Custo/limitações: malhas **sem** UV continuam a exportar `f v//vn`
+  (formato histórico intacto); objetos em **modo leitura** (RenderMesh)
+  não guardam UVs — reexportam sem `vt` (o RenderMesh não tem storage de
+  UV por decisão de memória do F4-LIMITS); UVs de cantos criados por
+  operações sem UV (extruder/subdivide em malhas não-UV) ficam (0,0).
 - **Export glTF** adiado; **materiais PBR/texturas** = Fase 5.
 - Accessors **sparse** do glTF falham limpo (`cgltf_accessor_read_float`
   devolve 0 → nullopt) — raros, rejeitados em vez de adivinhados.
@@ -672,7 +688,9 @@ fronteira das workers e vira IMPORT_FAIL com motivo PT.
 
 ## 11. Fases futuras (não implementadas aqui)
 
-Exportação GLB/glTF, storage de UV por canto, stb_image para texturas,
-xatlas para UV, materiais PBR. Nenhuma destas dependências ou
-funcionalidades foi integrada além do parsing (cgltf vendorizado, usado
-só para importação de geometria).
+Exportação GLB/glTF, stb_image para texturas, xatlas para UV (unwrap
+automático), materiais PBR. O storage de UV por canto JÁ existe (Fase
+5.1: half-edge + OBJ round-trip + TEXCOORD_0 + BLONEPRJ v4); falta a
+amostragem de texturas no shader. Nenhuma destas dependências foi
+integrada além do parsing (cgltf vendorizado, usado só para importação
+de geometria).
